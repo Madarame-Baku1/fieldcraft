@@ -13,14 +13,17 @@
 
 pub mod control;
 pub mod gpu;
+pub mod icons;
 pub mod panels;
 pub mod scene;
 pub mod theme;
+pub mod toolbar;
 pub mod viewport;
 
 use std::sync::mpsc::{Receiver, Sender};
 
 use modelcraft_engine::Session;
+use modelcraft_engine::catalogue::{self, Tab};
 use modelcraft_render::{Camera, DisplayMesh, Scene, StandardView};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -41,11 +44,21 @@ pub struct UiState {
     pub dark: bool,
     pub show_tree: bool,
     pub show_commands: bool,
+    /// The toolbar tab shown.
+    pub tab: Tab,
 }
 
 impl Default for UiState {
     fn default() -> Self {
-        UiState { style: Style::ShadedEdges, show_nodes: false, perspective: false, dark: true, show_tree: true, show_commands: true }
+        UiState {
+            style: Style::ShadedEdges,
+            show_nodes: false,
+            perspective: false,
+            dark: true,
+            show_tree: true,
+            show_commands: true,
+            tab: Tab::default(),
+        }
     }
 }
 
@@ -102,6 +115,9 @@ pub struct ModelApp {
     pub status: Option<Status>,
     pub dialog: Option<ParamsDialog>,
     pub viewport: Viewport,
+    pub icons: icons::IconCache,
+    /// The toolbar's buttons drawn last frame, by catalogue id (for the control channel).
+    pub toolbar_rects: Vec<(&'static str, egui::Rect, toolbar::Fit)>,
     /// The GPU adapter, for the status bar and diagnostics.
     pub gpu_info: Option<String>,
     /// Bumped whenever the model may have changed.
@@ -131,6 +147,8 @@ impl ModelApp {
             status: None,
             dialog: None,
             viewport: Viewport::default(),
+            icons: icons::IconCache::default(),
+            toolbar_rects: Vec::new(),
             gpu_info: None,
             revision: 0,
             display: (None, DisplayMesh::default()),
@@ -200,15 +218,29 @@ impl ModelApp {
         r
     }
 
-    /// What clicking a command in the Commands panel does: a command without parameters runs,
-    /// one with parameters opens its form. Programmatic calls use [`ModelApp::run`] instead.
+    /// What clicking a toolbar entry or a command in the Commands panel does: a command without
+    /// parameters runs, one with parameters opens its form. `id` is a command or a catalogue
+    /// entry; an entry that is coming soon does nothing and says when it comes. Programmatic calls
+    /// use [`ModelApp::run`] instead.
     pub fn start(&mut self, id: &str) -> Result<(), String> {
-        let spec = modelcraft_engine::find_command(id).ok_or_else(|| format!("unknown command `{id}`"))?;
+        let (command, preset) = match catalogue::find(id) {
+            Some(c) => match c.command() {
+                Some(command) => (command, c.preset()),
+                None => {
+                    let e = format!("{} is coming soon ({})", c.label, c.milestone().unwrap_or("later"));
+                    self.set_status(e.clone(), false);
+                    return Err(e);
+                }
+            },
+            None => (id, json!({})),
+        };
+        let spec = modelcraft_engine::find_command(command).ok_or_else(|| format!("unknown command `{command}`"))?;
         if spec.params.trim() == "{}" {
             self.dialog = None;
             self.run(spec.id, json!({})).map(|_| ())
         } else {
-            self.dialog = Some(ParamsDialog { command: spec.id, text: "{}".into(), error: None });
+            // The form starts with the entry's preset; the rest (a path…) is filled in there.
+            self.dialog = Some(ParamsDialog { command: spec.id, text: preset.to_string(), error: None });
             Ok(())
         }
     }
@@ -360,6 +392,7 @@ impl ModelApp {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         self.show_gpu_errors();
         panels::menu_bar(self, ui);
+        toolbar::toolbar(self, ui);
         panels::status_bar(self, ui);
         if self.ui.show_tree {
             panels::model_tree(self, ui);
@@ -478,6 +511,24 @@ mod tests {
         assert!(app.dialog.is_none());
         assert!(app.session.model.node(7).is_some());
         assert!(app.start("no.such").is_err());
+    }
+
+    #[test]
+    fn toolbar_entries_start_their_command_and_planned_ones_do_nothing() {
+        let mut app = ModelApp::new(Session::default());
+        app.start("model.material.create").unwrap();
+        assert_eq!(app.dialog.as_ref().map(|d| d.command), Some("model.material.create"));
+        app.dialog = None;
+        let journal = app.session.journal.len();
+        let err = app.start("mesh.tet.generate").unwrap_err();
+        assert_eq!(err, "Tet Mesh is coming soon (M2)");
+        assert!(app.dialog.is_none());
+        assert_eq!(app.session.journal.len(), journal);
+        assert_eq!(app.status.as_ref().map(|s| s.error), Some(false));
+        // A deck entry opens deck.write's form with its format filled in.
+        app.start("deck.write.abaqus").unwrap();
+        let d = app.dialog.as_ref().unwrap();
+        assert_eq!((d.command, d.text.as_str()), ("deck.write", r#"{"format":"abaqus"}"#));
     }
 
     #[test]
