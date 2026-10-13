@@ -1860,10 +1860,19 @@ dependencies = [
  "modelcraft-io",
  "modelcraft-mesh",
  "modelcraft-model",
+ "modelcraft-solver",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "zip",
+]
+
+[[package]]
+name = "modelcraft-fem"
+version = "0.1.0"
+dependencies = [
+ "modelcraft-model",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -1924,6 +1933,16 @@ dependencies = [
  "png",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "modelcraft-solver"
+version = "0.1.0"
+dependencies = [
+ "modelcraft-fem",
+ "modelcraft-model",
+ "serde",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
