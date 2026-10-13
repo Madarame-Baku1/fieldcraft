@@ -1846,6 +1846,7 @@ name = "modelcraft-decks"
 version = "0.1.0"
 dependencies = [
  "modelcraft-model",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 
@@ -1854,6 +1855,7 @@ name = "modelcraft-engine"
 version = "0.1.0"
 dependencies = [
  "log",
+ "modelcraft-decks",
  "modelcraft-geometry",
  "modelcraft-io",
  "modelcraft-mesh",
