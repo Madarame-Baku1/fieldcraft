@@ -1,22 +1,63 @@
 //! The solver-neutral finite element model.
 //!
-//! A [`Model`] holds what every solver deck describes: nodes and elements addressed by the
-//! positive integer labels the decks use. Materials, sections, sets, boundary conditions, loads
-//! and steps join it as their tasks land (plan/architecture.md §4). Solver formats (Abaqus input,
-//! Nastran bulk data, LS-DYNA keyword) translate to and from this model; nothing here knows any
-//! of them.
+//! A [`Model`] holds what every solver deck describes, in no solver's vocabulary:
+//! - the mesh: nodes and elements addressed by the positive integer labels the decks use
+//!   ([`mesh`]), and how the mesh lies on the geometry ([`geometry`]: each element, element face,
+//!   element edge and node tagged with the persistent name of the body, face, edge or vertex it
+//!   was meshed on);
+//! - named sets ([`sets`]) defined by geometry names or explicit labels, resolved to nodes,
+//!   elements and element faces against the current mesh, so they survive remeshing;
+//! - materials and the unit system ([`materials`], [`units`]), sections with their element
+//!   formulation ([`sections`]), reference points and couplings ([`constraints`]);
+//! - boundary conditions ([`bcs`]), loads ([`loads`]) and steps with an explicit table of which
+//!   boundary conditions and loads are active in each step ([`steps`]);
+//! - the check that names every missing or bad item, and the resolved view the deck writers and
+//!   the solver read ([`check`]).
+//!
+//! Solver formats (Abaqus input, Nastran bulk data, LS-DYNA keyword) translate to and from this
+//! model; nothing here knows any of them.
 //!
 //! The model is unit-consistent: it stores numbers in whatever consistent system the user chose
-//! (for example mm, tonne, s, N, MPa) and never converts them.
+//! (for example mm, tonne, s, N, MPa), never converts them, and only warns when a magnitude looks
+//! wrong for the chosen system.
 //!
-//! Every mutation validates its input, because labels and coordinates come from files, scripts
-//! and the control channel: a bad value is an [`Error`], never a panic.
+//! Every mutation validates its input, because labels, names and numbers come from files, scripts
+//! and the control channel: a bad value is an [`Error`], never a panic. Definitions that refer to
+//! other definitions (a section to its set and material, a load to its set) must refer to ones
+//! that exist, and a definition still referred to cannot be deleted. What depends on the mesh (a
+//! set's geometry names and labels) is checked when the model is resolved, because remeshing
+//! replaces the mesh under the definitions.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
+
+pub mod bcs;
+pub mod check;
+pub mod constraints;
+pub mod geometry;
+pub mod loads;
+pub mod materials;
+mod mesh;
+pub mod nodal;
+pub mod sections;
+pub mod sets;
+pub mod steps;
+pub mod units;
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+
+pub use bcs::{BoundaryCondition, Dofs, Symmetry, Target};
+pub use check::{Diagnostic, Resolved, ResolvedSet, Severity};
+pub use constraints::{Coupling, CouplingKind, ReferencePoint};
+pub use geometry::{Classification, Entity, GeometryRef};
+pub use loads::{Distribution, Load};
+pub use materials::{Elastic, Material};
+pub use mesh::{Element, ElementFace, ElementKind, Node, check_coordinates};
+pub use sections::{BeamProfile, Formulation, Integration, Section, SectionKind};
+pub use sets::Set;
+pub use steps::{OutputVariable, Procedure, Step};
+pub use units::UnitSystem;
 
 /// The largest node or element label. Nastran's GRID and element ids stop at 99 999 999 (eight
 /// digits in a small field), the tightest of the three formats.
@@ -29,6 +70,13 @@ pub const MAX_ELEMENTS: usize = 50_000_000;
 /// Coordinates beyond this magnitude are rejected (1e9 model units).
 pub const MAX_COORD: f64 = 1e9;
 
+/// Most definitions of one kind (sets, materials, sections, …) a model holds.
+pub const MAX_DEFINITIONS: usize = 100_000;
+
+/// Longest name of a definition. Names are ASCII: a letter, then letters, digits, `_` or `-`, so
+/// every deck format can carry them unquoted.
+pub const MAX_NAME_LEN: usize = 64;
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum Error {
     #[error("invalid input: {0}")]
@@ -37,267 +85,214 @@ pub enum Error {
     NotFound(String),
     #[error("limit reached: {0}")]
     Limit(String),
+    /// A definition cannot be deleted while another refers to it.
+    #[error("in use: {0}")]
+    InUse(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// A node: a point in model space.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct Node {
-    pub xyz: [f64; 3],
-}
-
-/// Element topology. Node order is corners first, then mid-side nodes, with positive volume for
-/// a right-handed ordering:
-/// - tet10: mid-side nodes 5–10 on edges 1-2, 2-3, 3-1, 1-4, 2-4, 3-4;
-/// - wedge6: triangle 1-2-3, then 4-5-6 on the side its right-hand normal points to;
-/// - hex8/hex20: face 1-2-3-4, then 5-6-7-8 above it; hex20's mid-side nodes 9–12 lie on the
-///   edges of 1-2-3-4, 13–16 on those of 5-6-7-8, and 17–20 on edges 1-5, 2-6, 3-7, 4-8.
+/// The finite element model.
 ///
-/// This is the Abaqus (and VTK) order. Formats that order nodes differently, such as Nastran's
-/// CHEXA with 20 nodes (vertical edges before the top face's edges), are reordered by their deck
-/// readers and writers; the model never stores another order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ElementKind {
-    /// Two-node axial member.
-    Rod2,
-    /// Two-node beam.
-    Beam2,
-    /// Three-node triangle (shell or membrane).
-    Tri3,
-    /// Six-node triangle.
-    Tri6,
-    /// Four-node quadrilateral.
-    Quad4,
-    /// Eight-node quadrilateral.
-    Quad8,
-    /// Four-node tetrahedron.
-    Tet4,
-    /// Ten-node tetrahedron.
-    Tet10,
-    /// Six-node wedge (pentahedron).
-    Wedge6,
-    /// Eight-node hexahedron.
-    Hex8,
-    /// Twenty-node hexahedron.
-    Hex20,
-}
-
-impl ElementKind {
-    pub const ALL: [ElementKind; 11] = [
-        ElementKind::Rod2,
-        ElementKind::Beam2,
-        ElementKind::Tri3,
-        ElementKind::Tri6,
-        ElementKind::Quad4,
-        ElementKind::Quad8,
-        ElementKind::Tet4,
-        ElementKind::Tet10,
-        ElementKind::Wedge6,
-        ElementKind::Hex8,
-        ElementKind::Hex20,
-    ];
-
-    pub fn node_count(self) -> usize {
-        match self {
-            ElementKind::Rod2 | ElementKind::Beam2 => 2,
-            ElementKind::Tri3 => 3,
-            ElementKind::Quad4 | ElementKind::Tet4 => 4,
-            ElementKind::Tri6 | ElementKind::Wedge6 => 6,
-            ElementKind::Quad8 | ElementKind::Hex8 => 8,
-            ElementKind::Tet10 => 10,
-            ElementKind::Hex20 => 20,
-        }
-    }
-
-    /// Topological dimension: 1 for line elements, 2 for shells, 3 for solids.
-    pub fn dimension(self) -> u8 {
-        match self {
-            ElementKind::Rod2 | ElementKind::Beam2 => 1,
-            ElementKind::Tri3 | ElementKind::Tri6 | ElementKind::Quad4 | ElementKind::Quad8 => 2,
-            ElementKind::Tet4 | ElementKind::Tet10 | ElementKind::Wedge6 | ElementKind::Hex8 | ElementKind::Hex20 => 3,
-        }
-    }
-
-    /// The name used in commands and `.modelcraft` files (`hex8`, `tet10`, …).
-    pub fn name(self) -> &'static str {
-        match self {
-            ElementKind::Rod2 => "rod2",
-            ElementKind::Beam2 => "beam2",
-            ElementKind::Tri3 => "tri3",
-            ElementKind::Tri6 => "tri6",
-            ElementKind::Quad4 => "quad4",
-            ElementKind::Quad8 => "quad8",
-            ElementKind::Tet4 => "tet4",
-            ElementKind::Tet10 => "tet10",
-            ElementKind::Wedge6 => "wedge6",
-            ElementKind::Hex8 => "hex8",
-            ElementKind::Hex20 => "hex20",
-        }
-    }
-
-    pub fn from_name(name: &str) -> Option<ElementKind> {
-        ElementKind::ALL.into_iter().find(|k| k.name() == name)
-    }
-}
-
-/// An element: a topology and its node labels.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Element {
-    pub kind: ElementKind,
-    pub nodes: Vec<u32>,
-}
-
-/// Nodes and elements by label.
+/// It deserializes by replaying what it reads through the same checked methods commands use, so
+/// a model read from a file holds the same invariants as one built by commands.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "ModelData")]
 pub struct Model {
     nodes: BTreeMap<u32, Node>,
     elements: BTreeMap<u32, Element>,
+    classification: Classification,
+    units: UnitSystem,
+    sets: BTreeMap<String, Set>,
+    materials: BTreeMap<String, Material>,
+    sections: BTreeMap<String, Section>,
+    reference_points: BTreeMap<String, ReferencePoint>,
+    couplings: BTreeMap<String, Coupling>,
+    boundary_conditions: BTreeMap<String, BoundaryCondition>,
+    loads: BTreeMap<String, Load>,
+    /// In analysis order.
+    steps: Vec<Step>,
 }
 
-/// Check that every coordinate is a finite number within ±[`MAX_COORD`] (the rule for nodes,
-/// shared by everything that takes coordinates from outside).
-pub fn check_coordinates(xyz: &[f64]) -> Result<()> {
-    match xyz.iter().find(|c| !(c.abs() <= MAX_COORD)) {
-        Some(c) => Err(Error::Invalid(format!("coordinate {c} is not a finite number within ±{MAX_COORD}"))),
-        None => Ok(()),
+/// A [`Model`] as stored, before it is checked.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ModelData {
+    #[serde(default)]
+    nodes: BTreeMap<u32, Node>,
+    #[serde(default)]
+    elements: BTreeMap<u32, Element>,
+    #[serde(default)]
+    classification: geometry::ClassificationData,
+    #[serde(default)]
+    units: UnitSystem,
+    #[serde(default)]
+    sets: BTreeMap<String, Set>,
+    #[serde(default)]
+    materials: BTreeMap<String, Material>,
+    #[serde(default)]
+    sections: BTreeMap<String, Section>,
+    #[serde(default)]
+    reference_points: BTreeMap<String, ReferencePoint>,
+    #[serde(default)]
+    couplings: BTreeMap<String, Coupling>,
+    #[serde(default)]
+    boundary_conditions: BTreeMap<String, BoundaryCondition>,
+    #[serde(default)]
+    loads: BTreeMap<String, Load>,
+    #[serde(default)]
+    steps: Vec<Step>,
+}
+
+impl TryFrom<ModelData> for Model {
+    type Error = Error;
+
+    fn try_from(d: ModelData) -> Result<Model> {
+        let mut m = Model { units: d.units, ..Model::default() };
+        for (label, node) in d.nodes {
+            m.set_node(label, node.xyz)?;
+        }
+        for (label, e) in d.elements {
+            m.set_element(label, e.kind, e.nodes)?;
+        }
+        for (i, entity) in d.classification.entities.iter().enumerate() {
+            if usize::try_from(m.geometry_tag(entity)?).ok() != Some(i) {
+                return Err(Error::Invalid(format!("{entity} is listed twice among the geometry tags")));
+            }
+        }
+        for (element, tags) in d.classification.elements {
+            if let Some(t) = tags.region {
+                m.tag_element(element, t)?;
+            }
+            for (face, t) in tags.faces {
+                m.tag_element_face(element, face, t)?;
+            }
+            for (edge, t) in tags.edges {
+                m.tag_element_edge(element, edge, t)?;
+            }
+        }
+        for (node, t) in d.classification.nodes {
+            m.tag_node(node, t)?;
+        }
+        for (n, v) in d.sets {
+            m.add_set(&n, v)?;
+        }
+        for (n, v) in d.materials {
+            m.add_material(&n, v)?;
+        }
+        for (n, v) in d.sections {
+            m.add_section(&n, v)?;
+        }
+        for (n, v) in d.reference_points {
+            m.add_reference_point(&n, v)?;
+        }
+        for (n, v) in d.couplings {
+            m.add_coupling(&n, v)?;
+        }
+        for (n, v) in d.boundary_conditions {
+            m.add_boundary_condition(&n, v)?;
+        }
+        for (n, v) in d.loads {
+            m.add_load(&n, v)?;
+        }
+        for s in d.steps {
+            m.add_step(s, None)?;
+        }
+        Ok(m)
     }
 }
 
-fn check_label(what: &str, label: u32) -> Result<()> {
-    if label == 0 || label > MAX_LABEL {
-        return Err(Error::Invalid(format!("{what} label {label} is outside 1..={MAX_LABEL}")));
+/// Check a definition's name: 1..=[`MAX_NAME_LEN`] ASCII characters, a letter first, then
+/// letters, digits, `_` or `-`.
+pub fn check_name(what: &str, name: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let ok = name.len() <= MAX_NAME_LEN
+        && chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+    if ok {
+        Ok(())
+    } else {
+        let shown: String = name.chars().take(MAX_NAME_LEN).collect();
+        Err(Error::Invalid(format!("{what} name `{shown}` must be 1 to {MAX_NAME_LEN} characters: a letter, then letters, digits, `_` or `-`")))
     }
+}
+
+/// Check that a value is a finite number, naming it in the error.
+pub(crate) fn finite(what: &str, v: f64) -> Result<f64> {
+    if v.is_finite() { Ok(v) } else { Err(Error::Invalid(format!("{what} must be a finite number, got {v}"))) }
+}
+
+/// Check that a value is a finite number above zero, naming it in the error.
+pub(crate) fn positive(what: &str, v: f64) -> Result<f64> {
+    if v > 0.0 && v.is_finite() { Ok(v) } else { Err(Error::Invalid(format!("{what} must be a positive number, got {v}"))) }
+}
+
+/// Add a new definition under a fresh, valid name.
+fn insert_new<T>(map: &mut BTreeMap<String, T>, what: &str, name: &str, value: T) -> Result<()> {
+    check_name(what, name)?;
+    if map.contains_key(name) {
+        return Err(Error::Invalid(format!("{what} `{name}` already exists")));
+    }
+    if map.len() >= MAX_DEFINITIONS {
+        return Err(Error::Limit(format!("a model holds at most {MAX_DEFINITIONS} of each kind of definition")));
+    }
+    map.insert(name.to_string(), value);
     Ok(())
 }
 
-impl Model {
-    pub fn nodes(&self) -> &BTreeMap<u32, Node> {
-        &self.nodes
-    }
+/// Replace an existing definition.
+fn replace_existing<T>(map: &mut BTreeMap<String, T>, what: &str, name: &str, value: T) -> Result<()> {
+    let slot = map.get_mut(name).ok_or_else(|| Error::NotFound(format!("{what} `{name}`")))?;
+    *slot = value;
+    Ok(())
+}
 
-    pub fn elements(&self) -> &BTreeMap<u32, Element> {
-        &self.elements
-    }
-
-    pub fn node(&self, label: u32) -> Option<&Node> {
-        self.nodes.get(&label)
-    }
-
-    pub fn element(&self, label: u32) -> Option<&Element> {
-        self.elements.get(&label)
-    }
-
-    /// Add a node, or move an existing one (decks redefine nodes the same way).
-    pub fn set_node(&mut self, label: u32, xyz: [f64; 3]) -> Result<()> {
-        check_label("node", label)?;
-        check_coordinates(&xyz).map_err(|e| match e {
-            Error::Invalid(m) => Error::Invalid(format!("node {label}: {m}")),
-            e => e,
-        })?;
-        if !self.nodes.contains_key(&label) && self.nodes.len() >= MAX_NODES {
-            return Err(Error::Limit(format!("a model holds at most {MAX_NODES} nodes")));
-        }
-        self.nodes.insert(label, Node { xyz });
-        Ok(())
-    }
-
-    /// Add an element, or replace an existing one. Its nodes must exist and be distinct.
-    pub fn set_element(&mut self, label: u32, kind: ElementKind, nodes: Vec<u32>) -> Result<()> {
-        check_label("element", label)?;
-        if nodes.len() != kind.node_count() {
-            return Err(Error::Invalid(format!("element {label}: {} needs {} nodes, got {}", kind.name(), kind.node_count(), nodes.len())));
-        }
-        for (i, n) in nodes.iter().enumerate() {
-            if !self.nodes.contains_key(n) {
-                return Err(Error::NotFound(format!("element {label}: node {n}")));
-            }
-            if nodes.get(..i).is_some_and(|before| before.contains(n)) {
-                return Err(Error::Invalid(format!("element {label}: node {n} appears twice")));
-            }
-        }
-        if !self.elements.contains_key(&label) && self.elements.len() >= MAX_ELEMENTS {
-            return Err(Error::Limit(format!("a model holds at most {MAX_ELEMENTS} elements")));
-        }
-        self.elements.insert(label, Element { kind, nodes });
-        Ok(())
-    }
-
-    /// Remove a node that no element uses.
-    pub fn remove_node(&mut self, label: u32) -> Result<()> {
-        if let Some((e, _)) = self.elements.iter().find(|(_, e)| e.nodes.contains(&label)) {
-            return Err(Error::Invalid(format!("node {label} is used by element {e}")));
-        }
-        self.nodes.remove(&label).map(|_| ()).ok_or_else(|| Error::NotFound(format!("node {label}")))
-    }
-
-    pub fn remove_element(&mut self, label: u32) -> Result<()> {
-        self.elements.remove(&label).map(|_| ()).ok_or_else(|| Error::NotFound(format!("element {label}")))
-    }
-
-    /// Element counts by kind, in [`ElementKind::ALL`] order, kinds with none left out.
-    pub fn element_counts(&self) -> Vec<(ElementKind, usize)> {
-        ElementKind::ALL.into_iter().map(|k| (k, self.elements.values().filter(|e| e.kind == k).count())).filter(|(_, n)| *n > 0).collect()
+/// Prefix an error with the definition it is about.
+pub(crate) fn context(what: &str, name: &str, e: Error) -> Error {
+    let shown: String = name.chars().take(MAX_NAME_LEN).collect();
+    match e {
+        Error::Invalid(m) => Error::Invalid(format!("{what} `{shown}`: {m}")),
+        Error::NotFound(m) => Error::NotFound(format!("{what} `{shown}`: {m}")),
+        Error::Limit(m) => Error::Limit(format!("{what} `{shown}`: {m}")),
+        Error::InUse(m) => Error::InUse(format!("{what} `{shown}`: {m}")),
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Remove an existing definition.
+fn remove_existing<T>(map: &mut BTreeMap<String, T>, what: &str, name: &str) -> Result<T> {
+    map.remove(name).ok_or_else(|| Error::NotFound(format!("{what} `{name}`")))
+}
 
-    fn cube() -> Model {
-        let mut m = Model::default();
-        let corners = [[0., 0., 0.], [1., 0., 0.], [1., 1., 0.], [0., 1., 0.], [0., 0., 1.], [1., 0., 1.], [1., 1., 1.], [0., 1., 1.]];
-        for (i, c) in corners.into_iter().enumerate() {
-            m.set_node(i as u32 + 1, c).unwrap();
-        }
-        m.set_element(1, ElementKind::Hex8, (1..=8).collect()).unwrap();
-        m
+/// Fail with [`Error::InUse`] when any referrer is listed.
+fn not_in_use(what: &str, name: &str, referrers: Vec<String>) -> Result<()> {
+    if referrers.is_empty() { Ok(()) } else { Err(Error::InUse(format!("{what} `{name}` is used by {}", referrers.join(", ")))) }
+}
+
+fn require<T>(map: &BTreeMap<String, T>, what: &str, name: &str) -> Result<()> {
+    if map.contains_key(name) { Ok(()) } else { Err(Error::NotFound(format!("{what} `{name}`"))) }
+}
+
+impl Model {
+    pub fn units(&self) -> UnitSystem {
+        self.units
     }
 
-    #[test]
-    fn builds_a_hex() {
-        let m = cube();
-        assert_eq!(m.nodes().len(), 8);
-        assert_eq!(m.element_counts(), vec![(ElementKind::Hex8, 1)]);
+    /// Label the unit system the model's numbers are in (nothing is converted).
+    pub fn set_units(&mut self, units: UnitSystem) {
+        self.units = units;
     }
 
-    #[test]
-    fn rejects_bad_labels_and_coordinates() {
-        let mut m = Model::default();
-        assert!(m.set_node(0, [0.; 3]).is_err());
-        assert!(m.set_node(MAX_LABEL + 1, [0.; 3]).is_err());
-        assert!(m.set_node(1, [f64::NAN, 0., 0.]).is_err());
-        assert!(m.set_node(1, [f64::INFINITY, 0., 0.]).is_err());
-        assert!(m.set_node(1, [2e9, 0., 0.]).is_err());
-        assert!(m.nodes().is_empty());
-    }
-
-    #[test]
-    fn rejects_bad_connectivity() {
-        let mut m = cube();
-        assert!(matches!(m.set_element(2, ElementKind::Tet4, vec![1, 2, 3]), Err(Error::Invalid(_))));
-        assert!(matches!(m.set_element(2, ElementKind::Tet4, vec![1, 2, 3, 99]), Err(Error::NotFound(_))));
-        assert!(matches!(m.set_element(2, ElementKind::Tet4, vec![1, 2, 3, 3]), Err(Error::Invalid(_))));
-        assert_eq!(m.elements().len(), 1);
-    }
-
-    #[test]
-    fn used_nodes_cannot_be_removed() {
-        let mut m = cube();
-        assert!(m.remove_node(1).is_err());
-        m.remove_element(1).unwrap();
-        m.remove_node(1).unwrap();
-        assert!(m.remove_node(1).is_err());
-    }
-
-    #[test]
-    fn kind_names_round_trip() {
-        for k in ElementKind::ALL {
-            assert_eq!(ElementKind::from_name(k.name()), Some(k));
-            assert_eq!(serde_json::to_value(k).unwrap(), serde_json::json!(k.name()));
-        }
-        assert_eq!(ElementKind::from_name("C3D8"), None);
+    /// Counts of each kind of definition, for summaries.
+    pub fn definition_counts(&self) -> [(&'static str, usize); 8] {
+        [
+            ("sets", self.sets.len()),
+            ("materials", self.materials.len()),
+            ("sections", self.sections.len()),
+            ("reference_points", self.reference_points.len()),
+            ("couplings", self.couplings.len()),
+            ("boundary_conditions", self.boundary_conditions.len()),
+            ("loads", self.loads.len()),
+            ("steps", self.steps.len()),
+        ]
     }
 }
