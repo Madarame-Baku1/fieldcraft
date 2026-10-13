@@ -50,6 +50,7 @@
 
 use std::collections::BTreeMap;
 
+use modelcraft_fem::DofKind;
 use modelcraft_fem::dense::inverse3;
 use modelcraft_model::{CouplingKind, Model, Resolved};
 
@@ -94,7 +95,10 @@ pub fn coupling_rows<'m>(model: &'m Model, resolved: &Resolved, mesh: &Mesh) -> 
     for (name, c) in model.couplings() {
         let point = mesh.point(&c.reference_point).ok_or_else(|| Error::Internal(format!("reference point `{}`", c.reference_point)))?;
         let xr = mesh.points.get(point).map(|p| p.xyz).ok_or_else(|| Error::Internal("reference point index".into()))?;
-        let rp = mesh.point_dof(point, 0);
+        let slot = mesh.layout.point_slot(point);
+        // Reference point direction c (0–5), and translation k of mesh node n.
+        let rp = |c: usize| DofKind::from_direction(c).ok_or_else(|| Error::Internal("direction".into())).and_then(|kind| mesh.dof(slot, kind));
+        let u = |n: usize, k: usize| DofKind::translation(k).ok_or_else(|| Error::Internal("axis".into())).and_then(|kind| mesh.dof(n, kind));
         let set = resolved.sets.get(&c.set).ok_or_else(|| Error::Invalid(format!("coupling `{name}`: set `{}` is not resolved", c.set)))?;
         if set.nodes.is_empty() {
             return Err(Error::Invalid(format!("coupling `{name}`: set `{}` has no nodes", c.set)));
@@ -119,14 +123,15 @@ pub fn coupling_rows<'m>(model: &'m Model, resolved: &Resolved, mesh: &Mesh) -> 
                     for k in coupled(0..3) {
                         // u_s,k − u_r,k − (θ × r)_k = 0, (θ × r)_k = θ_a r_b − θ_b r_a.
                         let (a, b) = ((k + 1) % 3, (k + 2) % 3);
-                        let mut terms = vec![(3 * n + k, 1.0), (rp + k, -1.0)];
+                        let pivot = u(n, k)?;
+                        let mut terms = vec![(pivot, 1.0), (rp(k)?, -1.0)];
                         if r[b] != 0.0 {
-                            terms.push((rp + 3 + a, -r[b]));
+                            terms.push((rp(3 + a)?, -r[b]));
                         }
                         if r[a] != 0.0 {
-                            terms.push((rp + 3 + b, r[a]));
+                            terms.push((rp(3 + b)?, r[a]));
                         }
-                        rows.push(Row { terms, pivot: 3 * n + k, coupling: name });
+                        rows.push(Row { terms, pivot, coupling: name });
                     }
                 }
             }
@@ -162,7 +167,8 @@ pub fn coupling_rows<'m>(model: &'m Model, resolved: &Resolved, mesh: &Mesh) -> 
                 let g: Vec<[[f64; 3]; 3]> = arms.iter().map(|r| inverse.map_or([[0.0; 3]; 3], |inv| mat_mul(&inv, &cross_matrix(*r)))).collect();
                 for k in coupled(0..6) {
                     let mut terms = Vec::with_capacity(1 + 3 * nodes.len());
-                    terms.push((rp + k, 1.0));
+                    let pivot = rp(k)?;
+                    terms.push((pivot, 1.0));
                     for (&n, gi) in nodes.iter().zip(&g) {
                         for comp in 0..3 {
                             let a = if k < 3 {
@@ -172,11 +178,11 @@ pub fn coupling_rows<'m>(model: &'m Model, resolved: &Resolved, mesh: &Mesh) -> 
                                 gi[k - 3][comp]
                             };
                             if a != 0.0 {
-                                terms.push((3 * n + comp, -a));
+                                terms.push((u(n, comp)?, -a));
                             }
                         }
                     }
-                    rows.push(Row { terms, pivot: rp + k, coupling: name });
+                    rows.push(Row { terms, pivot, coupling: name });
                 }
             }
         }
@@ -184,8 +190,8 @@ pub fn coupling_rows<'m>(model: &'m Model, resolved: &Resolved, mesh: &Mesh) -> 
     Ok(rows)
 }
 
-/// The degrees of freedom that exist: every mesh translation, and the reference point
-/// directions some coupling row involves.
+/// The degrees of freedom that exist: every mesh node's, and the reference point directions
+/// some coupling row involves.
 fn active_dofs(mesh: &Mesh, rows: &[Row]) -> Vec<bool> {
     let mut active = vec![false; mesh.dofs()];
     active.iter_mut().take(mesh.mesh_dofs()).for_each(|a| *a = true);
@@ -288,8 +294,8 @@ fn combine(mut terms: Vec<(usize, f64)>) -> Vec<(usize, f64)> {
 pub struct Reduction {
     /// The degree of freedom of each free equation.
     pub eq_dof: Vec<usize>,
-    /// Whether a degree of freedom exists (mesh translations, and the reference point
-    /// directions some coupling ties).
+    /// Whether a degree of freedom exists (the mesh nodes', and the reference point directions
+    /// some coupling ties).
     pub active: Vec<bool>,
     /// T_f: per degree of freedom, (equation, coefficient).
     free: Terms,
@@ -376,7 +382,7 @@ impl Reduction {
         for (name, mut dofs) in coupled {
             dofs.sort_unstable();
             dofs.dedup();
-            let mut nodes: Vec<usize> = dofs.iter().map(|d| d / 3).collect();
+            let mut nodes: Vec<usize> = dofs.iter().filter_map(|d| mesh.layout.locate(*d).map(|(slot, _)| slot)).collect();
             nodes.dedup();
             blocks.push((name, nodes.len(), dofs.len().saturating_mul(dofs.len())));
         }
@@ -456,7 +462,7 @@ impl Reduction {
         // Equations: free mesh degrees of freedom in node order, then reference point ones.
         let mut eq = vec![usize::MAX; n];
         let mut eq_dof = Vec::new();
-        let mesh_order = order.iter().flat_map(|node| (0..3).map(move |c| 3 * node + c));
+        let mesh_order = order.iter().flat_map(|node| mesh.layout.range(*node));
         for dof in mesh_order.chain(mesh.mesh_dofs()..n) {
             if state.get(dof) == Some(&State::Free)
                 && let Some(e) = eq.get_mut(dof)

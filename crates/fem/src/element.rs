@@ -34,7 +34,8 @@
 
 use modelcraft_model::ElementKind;
 
-use crate::dense::{Cholesky, Matrix, inverse3};
+use crate::dense::{Cholesky, Matrix, inverse3, positive_inverse};
+use crate::dof::{DofSet, ElementDofs, Internal};
 use crate::material::{Elasticity, stress};
 use crate::quadrature::{Point, Rule};
 use crate::shape::{self, MAX_NODES, Shape};
@@ -144,6 +145,13 @@ pub enum Formulation {
 }
 
 impl Formulation {
+    /// The unknowns of a solid element so formulated: three translations per node, and the
+    /// incompatible modes it condenses out.
+    pub fn dofs(self) -> ElementDofs {
+        let incompatible_modes = if self == Formulation::IncompatibleModes { INCOMPATIBLE_DOFS } else { 0 };
+        ElementDofs { node: DofSet::TRANSLATIONS, internal: Internal { incompatible_modes, pressure: 0 } }
+    }
+
     /// The formulation a model section asks for, if this element type has it.
     pub fn from_section(kind: ElementKind, f: &modelcraft_model::Formulation) -> Result<Formulation> {
         let ty = element_type(kind)?;
@@ -220,6 +228,11 @@ impl<'a> Solid<'a> {
         Ok(Solid { ty, xyz, formulation })
     }
 
+    /// The element's unknowns, in the order of its matrices.
+    pub fn dofs(&self) -> ElementDofs {
+        self.formulation.dofs()
+    }
+
     /// The stiffness integration rule.
     pub fn rule(&self) -> Rule {
         match (self.formulation, self.ty.reduced) {
@@ -249,11 +262,7 @@ impl<'a> Solid<'a> {
     fn gradients(&self, xi: [f64; 3]) -> Result<Gradients> {
         let shape = (self.ty.shape)(xi);
         let j = self.jacobian(&shape);
-        let (inv, det) = inverse3(&j).ok_or_else(|| self.degenerate())?;
-        let norms: f64 = j.iter().map(|r| (r[0] * r[0] + r[1] * r[1] + r[2] * r[2]).sqrt()).product();
-        if !(det > 1e-12 * norms) {
-            return Err(self.degenerate());
-        }
+        let (inv, det) = positive_inverse(&j).ok_or_else(|| self.degenerate())?;
         let mut dx = [[0.0; 3]; MAX_NODES];
         for (g, d) in dx.iter_mut().zip(shape.derivatives()) {
             for b in 0..3 {
