@@ -20,6 +20,7 @@
 
 use std::cmp::Ordering;
 
+use super::indirect::{Axis, GenericPoint, generic_compare, generic_insphere, generic_orient3d};
 use super::{Point2, Point3, Sign, incircle, insphere, orient2d, orient3d};
 
 /// Lexicographic order on coordinates (total: `f64::total_cmp`).
@@ -50,7 +51,14 @@ pub fn insphere_sos(a: &Point3, b: &Point3, c: &Point3, d: &Point3, e: &Point3) 
 
 #[cold]
 fn insphere_perturbed(a: &Point3, b: &Point3, c: &Point3, d: &Point3, e: &Point3) -> Sign {
-    for i in ranked(&[a.0, b.0, c.0, d.0, e.0]) {
+    perturbed_cofactors([a, b, c, d, e], ranked(&[a.0, b.0, c.0, d.0, e.0]), orient3d)
+}
+
+/// The sign of the first nonzero lift cofactor, in rank order (`order`: argument positions by
+/// decreasing rank). The single statement of the perturbation rule for every point type.
+fn perturbed_cofactors<P>(points: [&P; 5], order: [usize; 5], orient: impl Fn(&P, &P, &P, &P) -> Sign) -> Sign {
+    let [a, b, c, d, e] = points;
+    for i in order {
         let [p, q, r, s] = match i {
             0 => [b, c, d, e],
             1 => [a, c, d, e],
@@ -58,13 +66,53 @@ fn insphere_perturbed(a: &Point3, b: &Point3, c: &Point3, d: &Point3, e: &Point3
             3 => [a, b, c, e],
             _ => [a, b, c, d],
         };
-        let minor = orient3d(p, q, r, s);
+        let minor = orient(p, q, r, s);
         if !minor.is_zero() {
             // Row i + 1 (1-based), lift column 4: cofactor sign (-1)^(i + 5).
             return if i % 2 == 1 { minor } else { -minor };
         }
     }
     Sign::Zero
+}
+
+/// The lexicographic order of two points' exact coordinates (`x`, then `y`, then `z`): the rank
+/// order of the perturbation, for explicit and implicit points alike. On explicit points it is
+/// the order [`insphere_sos`] uses (callers admit `+0.0`, never `-0.0`).
+pub fn generic_lex(p: &GenericPoint, q: &GenericPoint) -> Ordering {
+    if let (Some(p), Some(q)) = (p.explicit(), q.explicit()) {
+        return lex(&p.coords(), &q.coords());
+    }
+    Axis::ALL.into_iter().map(|a| generic_compare(p, q, a)).find(|o| o.is_ne()).unwrap_or(Ordering::Equal)
+}
+
+/// [`insphere_sos`] on explicit or implicit points: the same lift by lexicographic rank, so a
+/// triangulation built with [`insphere_sos`] stays consistent when implicit points are added.
+/// Never [`Sign::Zero`] when `a, b, c, d` is not coplanar; points must be pairwise distinct.
+pub fn generic_insphere_sos(a: &GenericPoint, b: &GenericPoint, c: &GenericPoint, d: &GenericPoint, e: &GenericPoint) -> Sign {
+    if let (Some(a), Some(b), Some(c), Some(d), Some(e)) = (a.explicit(), b.explicit(), c.explicit(), d.explicit(), e.explicit()) {
+        return insphere_sos(a, b, c, d, e);
+    }
+    let exact = generic_insphere(a, b, c, d, e);
+    if !exact.is_zero() {
+        return exact;
+    }
+    let points = [a, b, c, d, e];
+    // Positions by decreasing rank, ties by position: an insertion sort, which needs no total
+    // order guarantee from the comparator to stay in bounds.
+    let mut order = [0usize, 1, 2, 3, 4];
+    for i in 1..order.len() {
+        let mut j = i;
+        while j > 0 {
+            let (Some(&x), Some(&y)) = (order.get(j - 1), order.get(j)) else { break };
+            let (Some(px), Some(py)) = (points.get(x), points.get(y)) else { break };
+            if generic_lex(py, px) != Ordering::Greater {
+                break;
+            }
+            order.swap(j - 1, j);
+            j -= 1;
+        }
+    }
+    perturbed_cofactors(points, order, generic_orient3d)
 }
 
 /// [`incircle`] with symbolic perturbation: never [`Sign::Zero`] when `a, b, c` is not
