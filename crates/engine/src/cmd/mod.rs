@@ -21,6 +21,7 @@ pub static ALL: &[CommandSpec] = &[
     mesh::ELEMENT_REMOVE,
     mesh::QUALITY,
     mesh::DELAUNAY_POINTS,
+    mesh::SURFACE_CHECK,
 ];
 
 /// A required label parameter (1..=u32::MAX; the model checks its own range).
@@ -62,4 +63,12 @@ pub(crate) fn labels(p: &Value, key: &str, max_len: usize) -> Result<Vec<u32>> {
         .map(|v| v.as_u64().and_then(|n| u32::try_from(n).ok()).filter(|n| (1..=MAX_LABEL).contains(n)))
         .collect::<Option<Vec<u32>>>()
         .ok_or_else(|| EngineError::Params(format!("`{key}` must be labels in 1..={MAX_LABEL}")))
+}
+
+/// An optional number parameter.
+pub(crate) fn optional_number(p: &Value, key: &str, default: f64) -> Result<f64> {
+    match p.get(key) {
+        None => Ok(default),
+        Some(v) => v.as_f64().ok_or_else(|| EngineError::Params(format!("`{key}` must be a number"))),
+    }
 }

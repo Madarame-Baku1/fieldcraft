@@ -1,9 +1,13 @@
+use std::borrow::Cow;
+
+use modelcraft_geometry::SurfaceMesh;
 use modelcraft_mesh::delaunay::Triangulation;
 use modelcraft_mesh::quality::{self, QualityReport};
+use modelcraft_mesh::surface::{BoundarySurface, Defect, FeatureKind, SurfaceOptions};
 use modelcraft_model::{ElementKind, MAX_ELEMENTS};
 use serde_json::{Value, json};
 
-use super::{label, labels, points, xyz};
+use super::{label, labels, optional_number, points, xyz};
 use crate::{CommandSpec, EngineError, Result, Session};
 
 pub const NODE_ADD: CommandSpec = CommandSpec {
@@ -56,6 +60,13 @@ fn delaunay_points(_: &mut Session, p: &Value) -> Result<Value> {
         "tets": tets,
     }))
 }
+
+pub const SURFACE_CHECK: CommandSpec = CommandSpec {
+    id: "mesh.surface.check",
+    label: "Check Boundary Surface",
+    params: r#"{"body": "Body1", "tolerance": 0.05} or {"surface": 0}, optional "weld": 1e-9 (0 or 1e-15..=1e-3 of the bounding-box diagonal), "weld_distance": mm (default: the surface's own, twice SolidCraft's linear tolerance for a tessellated body, 0 for an imported mesh), "feature_angle": 45 (degrees, (0, 180]) — welds the tessellated body or imported surface and checks it can bound a volume mesh: closed, manifold, outward, no self-intersections; reports shells, genus, volume and feature edges, or the located defects"#,
+    run: surface_check,
+};
 
 fn node_add(s: &mut Session, p: &Value) -> Result<Value> {
     let l = label(p, "label")?;
@@ -136,6 +147,63 @@ fn quality_report(s: &mut Session, p: &Value) -> Result<Value> {
     }))
 }
 
+/// The surface named by `body` (tessellated at `tolerance`) or `surface` (an imported index).
+fn surface_input<'a>(s: &'a Session, p: &Value) -> Result<Cow<'a, SurfaceMesh>> {
+    match (p.get("body"), p.get("surface")) {
+        (Some(_), None) => Ok(Cow::Owned(super::geometry::body_mesh(s, p)?.1)),
+        (None, Some(i)) => {
+            let n = s.surfaces.len();
+            i.as_u64()
+                .and_then(|i| usize::try_from(i).ok())
+                .and_then(|i| s.surfaces.get(i))
+                .map(|t| Cow::Borrowed(&t.mesh))
+                .ok_or_else(|| EngineError::Params(format!("`surface` must be the index of an imported surface (there are {n})")))
+        }
+        _ => Err(EngineError::Params("give either `body` (with `tolerance`) or `surface`".into())),
+    }
+}
+
+fn defect_json(d: &Defect) -> Value {
+    json!({"kind": d.kind(), "message": d.to_string(), "at": d.at()})
+}
+
+fn surface_check(s: &mut Session, p: &Value) -> Result<Value> {
+    let mesh = surface_input(s, p)?;
+    let defaults = SurfaceOptions::default();
+    let options = SurfaceOptions {
+        weld_tolerance: optional_number(p, "weld", defaults.weld_tolerance)?,
+        weld_distance: optional_number(p, "weld_distance", mesh.weld_distance)?,
+        feature_angle: optional_number(p, "feature_angle", defaults.feature_angle)?,
+    };
+    let surface = match BoundarySurface::new(&mesh.positions, &mesh.triangles, &mesh.tri_face, &options) {
+        Ok(surface) => surface,
+        Err(modelcraft_mesh::Error::Surface(d)) => {
+            return Ok(json!({"valid": false, "defects": {"count": d.total, "listed": d.listed.iter().map(defect_json).collect::<Vec<_>>()}}));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let mut faces: Vec<u32> = surface.tri_face().to_vec();
+    faces.sort_unstable();
+    faces.dedup();
+    let count = |k: FeatureKind| surface.feature_edges().iter().filter(|e| e.kind == k).count();
+    let shells: Vec<Value> = surface
+        .shells()
+        .iter()
+        .map(|sh| json!({"triangles": sh.triangles, "vertices": sh.vertices, "genus": sh.genus, "volume": sh.volume, "void": sh.void}))
+        .collect();
+    Ok(json!({
+        "valid": true,
+        "vertices": surface.points().len(),
+        "triangles": surface.triangles().len(),
+        "input": {"vertices": mesh.positions.len(), "triangles": mesh.triangles.len()},
+        "faces": faces.len(),
+        "volume": surface.volume(),
+        "shells": shells,
+        "feature_edges": {"face_boundary": count(FeatureKind::FaceBoundary), "sharp": count(FeatureKind::Sharp)},
+        "feature_corners": surface.feature_corners().len(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -201,5 +269,82 @@ mod tests {
         assert!(s.execute("mesh.quality", &json!({"bins": 0})).is_err());
         assert!(s.execute("mesh.quality", &json!({"bins": 1e9})).is_err());
         assert!(s.execute("mesh.quality", &json!({"elements": "all"})).is_err());
+    }
+
+    #[test]
+    fn a_tessellated_block_is_a_valid_boundary() {
+        use modelcraft_mesh::surface::{BoundarySurface, FeatureKind, SurfaceOptions};
+        let mesh = modelcraft_geometry::block([0.0; 3], [2.0, 3.0, 4.0]).unwrap().tessellate(0.01).unwrap();
+        let options = SurfaceOptions { weld_distance: mesh.weld_distance, ..SurfaceOptions::default() };
+        let s = BoundarySurface::new(&mesh.positions, &mesh.triangles, &mesh.tri_face, &options).unwrap();
+        assert!(s.points().len() < mesh.positions.len(), "the tessellation is a soup that welding joins");
+        assert_eq!((s.shells().len(), s.shells()[0].genus), (1, 0));
+        assert!((s.volume() - 24.0).abs() < 1e-9, "{}", s.volume());
+        assert!(s.feature_edges().iter().all(|e| e.kind == FeatureKind::FaceBoundary));
+        assert_eq!(s.feature_corners().len(), 8);
+        let length: f64 = s
+            .feature_edges()
+            .iter()
+            .map(|e| {
+                let [a, b] = e.vertices.map(|v| s.points()[v as usize]);
+                ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+            })
+            .sum();
+        assert!((length - 4.0 * (2.0 + 3.0 + 4.0)).abs() < 1e-9, "the twelve edges: {length}");
+    }
+
+    #[test]
+    fn surface_check_on_an_open_design_and_on_imported_surfaces() {
+        use std::sync::Arc;
+
+        use modelcraft_geometry::sample::{Plate, plate_design};
+        use modelcraft_geometry::tagged_mesh::TaggedSurface;
+        use modelcraft_geometry::{SurfaceMesh, open_design};
+
+        let plate = Plate::default();
+        let mut s = Session { design: Some(Arc::new(open_design(&plate_design(&plate).unwrap()).unwrap())), ..Session::default() };
+        let r = s.execute("mesh.surface.check", &json!({"body": "Body1", "tolerance": 0.05})).unwrap();
+        assert_eq!(r["valid"], true, "{r}");
+        assert_eq!(r["faces"], 8);
+        assert_eq!(r["shells"].as_array().unwrap().len(), 1);
+        assert_eq!(r["shells"][0]["genus"], 1, "the hole is a handle");
+        let exact = (plate.width * plate.depth - std::f64::consts::PI * (plate.hole_diameter / 2.0).powi(2)) * plate.thickness;
+        let volume = r["volume"].as_f64().unwrap();
+        assert!(volume >= exact && volume < exact * 1.01, "a polygonal hole inscribed in the circle: {volume} vs {exact}");
+        assert!(r["feature_edges"]["face_boundary"].as_u64().unwrap() > 12);
+        assert!(r["feature_corners"].as_u64().unwrap() >= 8);
+        assert!(s.journal.is_empty(), "a check changes nothing");
+
+        // A tagged tetrahedron, and the same with a face missing.
+        let p = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let t = vec![[0, 2, 1], [0, 1, 3], [1, 2, 3], [0, 3, 2]];
+        let tet = SurfaceMesh { positions: p.clone(), triangles: t.clone(), tri_face: vec![0, 1, 1, 1], weld_distance: 0.0 };
+        let open = SurfaceMesh { positions: p, triangles: t[..3].to_vec(), tri_face: vec![0, 1, 1], weld_distance: 0.0 };
+        for mesh in [tet, open] {
+            s.surfaces.push(Arc::new(TaggedSurface { name: "Tet".into(), mesh, faces: 2 }));
+        }
+        let r = s.execute("mesh.surface.check", &json!({"surface": 0, "feature_angle": 180})).unwrap();
+        assert_eq!((r["valid"].clone(), r["feature_edges"].clone()), (json!(true), json!({"face_boundary": 3, "sharp": 0})));
+        let r = s.execute("mesh.surface.check", &json!({"surface": 1})).unwrap();
+        assert_eq!(r["valid"], false);
+        assert_eq!(r["defects"]["count"], 3);
+        assert_eq!(r["defects"]["listed"][0]["kind"], "open_edge");
+        assert!(r["defects"]["listed"][0]["at"].is_array());
+
+        for bad in [
+            json!({"surface": 2}),
+            json!({"surface": -1}),
+            json!({"surface": 0, "body": "Body1"}),
+            json!({}),
+            json!({"surface": 0, "weld": 1.0}),
+            json!({"surface": 0, "weld": "fine"}),
+            json!({"surface": 0, "weld_distance": -1}),
+            json!({"surface": 0, "weld_distance": 1}),
+            json!({"surface": 0, "feature_angle": 0}),
+            json!({"body": "Body1"}),
+            json!({"body": "Nope", "tolerance": 0.05}),
+        ] {
+            assert!(s.execute("mesh.surface.check", &bad).is_err(), "{bad}");
+        }
     }
 }
