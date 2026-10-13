@@ -1,0 +1,16 @@
+# Roadmap
+
+ModelCraft's goal is CAE pre-processing on par with Abaqus/CAE, Nastran pre-processors and
+LS-PrePost, with hexahedral meshing as the centre of gravity, plus its own linear solver.
+
+| Milestone | Scope | Status |
+|---|---|---|
+| M0 Foundation | Workspace, quality gates (`cargo xtask ci`), FE model, command engine with rollback and panic guard, CLI, geometry boundary on SolidCraft's kernel and tessellator | done |
+| M1 Surface preparation | Robust adaptive-precision predicates; weld, closed/manifold/orientation checks and feature edges on the tessellated boundary; mesh quality metrics | next |
+| M2 Tetrahedral meshing | 3D Delaunay (Bowyer–Watson), boundary recovery, Delaunay refinement to a size field, Voronoi-based optimization (CVT/ODT), sliver removal; linear and quadratic tets | planned |
+| M3 Hexahedral meshing (core) | Method from the literature survey: a hex mesher whose output is always valid, then quality-driven methods; hex-dominant fallback | planned |
+| M4 Model definition | Materials, sections, sets and surfaces, boundary conditions, loads, steps, output requests | planned |
+| M5 Solver decks | Abaqus input, Nastran bulk data, LS-DYNA keyword: writers first, then readers | planned |
+| M6 Linear solver | Element library, sparse assembly, linear static and modal analysis, verified against analytic solutions | planned |
+| M7 Desktop and agents | egui desktop app, control channel, MCP server, browser build | planned |
+| M8 Post-processing | Results display: deformed shape, contours, probes | planned |

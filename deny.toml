@@ -1,0 +1,16 @@
+# Licences are covered by `cargo xtask licences --check`.
+[advisories]
+unmaintained = "all"
+yanked = "warn"
+
+[bans]
+multiple-versions = "warn"
+wildcards = "warn"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# SolidCraft's kernel and its patched truck crates, pinned by rev in Cargo.toml.
+allow-git = ["https://github.com/bherbruck/solidcraft"]

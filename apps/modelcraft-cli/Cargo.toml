@@ -1,0 +1,13 @@
+[package]
+name = "modelcraft-cli"
+description = "ModelCraft from the command line: list commands, run scripts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+modelcraft-engine = { workspace = true }
+serde_json = { workspace = true }

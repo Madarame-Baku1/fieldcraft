@@ -1,0 +1,60 @@
+# Architecture
+
+ModelCraft turns geometry into finite element models, writes them for the solvers engineers
+already use, and solves linear problems itself.
+
+```
+SolidCraft B-rep ──tessellate──▶ boundary surface ──▶ volume mesh ──▶ FE model ──▶ Abaqus .inp
+ (solidcraft-kernel)           (welded, watertight,   tet (Delaunay)   materials,     Nastran .bdf
+                                face-tagged)          hex (core goal)  sections,      LS-DYNA .k
+                                                                       BCs, loads,  ──▶ own linear
+                                                                       steps            solver
+```
+
+## Crates and layers
+
+`cargo xtask layers` enforces the table in `xtask/src/layers.rs`: a crate may depend only on
+crates in strictly lower layers.
+
+| Layer | Crate | Role | Status |
+|---|---|---|---|
+| L0 | `modelcraft-model` | Solver-neutral FE model: nodes, elements by label; materials, sections, sets, BCs, loads and steps as they land. Knows no file format. | started |
+| L1 | `modelcraft-geometry` | The only door to SolidCraft: B-rep bodies, measures, tessellation into a face-tagged `SurfaceMesh`. No SolidCraft type in its API. | started |
+| L1 | `modelcraft-mesh` | Surface preparation (weld, watertightness, feature edges), robust predicates, Delaunay tetrahedralization and refinement, Voronoi-based optimization, hex meshing, quality metrics. | planned |
+| L1 | `modelcraft-solver` | Element formulations, assembly, sparse linear static and modal solution. | planned |
+| L1 | `modelcraft-decks` | Abaqus input, Nastran bulk data and LS-DYNA keyword readers and writers, to and from `model`. | planned |
+| L1 | `modelcraft-render` | Display data (meshes, contour maps) without a GPU dependency. | planned |
+| L2 | `modelcraft-doc` | The document: geometry, mesh, model, results, history. | planned |
+| L3 | `modelcraft-io` | `.modelcraft` files, result files. | planned |
+| L4 | `modelcraft-engine` | Commands (`CommandSpec`), `Session::execute` with rollback and the panic guard, scripts. | started |
+| L5 | `modelcraft-ui-egui`, `modelcraft-mcp` | Desktop UI, control channel and MCP server. | planned |
+| apps | `modelcraft`, `modelcraft-cli`, `modelcraft-web` | Desktop, command line, browser. | cli started |
+
+Rules beyond the layer order:
+- Nothing below L5 uses egui, eframe, winit, wgpu or rfd.
+- Only `modelcraft-geometry` uses `solidcraft-*`, pinned by rev in the workspace `Cargo.toml`.
+  SolidCraft's `[patch.crates-io]` (its fixed truck crates) does not reach dependents, so the
+  workspace repeats it from the same rev; bump both together.
+- Everything below the apps builds for `wasm32-unknown-unknown`.
+
+## Meshing pipeline
+
+1. **Boundary surface.** SolidCraft tessellates each body; every triangle carries its B-rep face,
+   so feature edges and face-based loads and BCs survive meshing.
+2. **Surface preparation.** Weld coincident vertices, check the surface is closed, manifold and
+   consistently oriented, find feature edges (face boundaries, sharp dihedral angles).
+3. **Tetrahedral meshing.** 3D Delaunay tetrahedralization of the boundary points with exact
+   predicates, boundary recovery, Delaunay refinement to a size field, then Voronoi-based
+   optimization (centroidal Voronoi / optimal Delaunay) and sliver removal.
+4. **Hexahedral meshing (the core).** All-hex first where it can be guaranteed valid, with
+   hex-dominant as the fallback; the method is chosen from the literature survey
+   (`docs/meshing/literature.md`).
+5. **Quality.** Scaled Jacobian, aspect ratio, dihedral angles; every generated mesh is checked
+   for positive Jacobians and conserved volume before it reaches the model.
+
+## Commands
+
+Every user-visible action is a `CommandSpec` in `crates/engine/src/cmd/<area>.rs` with a JSON
+form. `Session::execute` clones the model, runs the command under `catch_unwind`, and restores
+the model on an error or a panic; commands that changed the model are journalled, so the
+journal replays as a script.
