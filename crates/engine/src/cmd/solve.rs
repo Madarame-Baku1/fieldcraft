@@ -1,7 +1,7 @@
 //! `solve.*`: run the model's steps with the implicit solver, keep the results in the session,
 //! and read them back.
 
-use modelcraft_solver::{FrequencyOptions, Limits, MassKind, StepResult, solve_frequency, solve_static};
+use modelcraft_solver::{FrequencyOptions, Limits, Location, MassKind, StepResult, solve_frequency, solve_static};
 use serde_json::{Value, json};
 
 use super::{labels, opt};
@@ -26,7 +26,7 @@ pub const FREQUENCY: CommandSpec = CommandSpec {
 pub const PROBE: CommandSpec = CommandSpec {
     id: "solve.probe",
     label: "Probe Results",
-    params: r#"{"step": "Load", "nodes": [1, 2], "mode": 1} — the stored result at nodes: displacement, reaction, stress and von Mises (static), or the shape of mode `mode` (frequency, from 1)"#,
+    params: r#"{"step": "Load", "nodes": [1, 2], "mode": 1} — the stored result at nodes: displacement, reaction, stress and von Mises (static), or the shape of mode `mode` (frequency, from 1); a coupled reference point's label gives its six displacements (translations, rotations) and reactions (forces, moments)"#,
     kind: CommandKind::Model,
     run: probe,
 };
@@ -75,6 +75,12 @@ fn run_static(s: &mut Session, p: &Value) -> Result<Value> {
         "max_von_mises": largest(r.nodes.iter().zip(&r.von_mises).map(|(l, v)| (*l, *v))),
         "applied_total": r.applied_total,
         "reaction_total": r.reaction_total,
+        "reference_points": r.reference_points.iter().map(|p| json!({
+            "name": p.name,
+            "label": p.label,
+            "displacement": p.displacement,
+            "reaction": p.reaction,
+        })).collect::<Vec<_>>(),
         "warnings": r.warnings,
     });
     s.store_result(StepResult::Static(r));
@@ -109,21 +115,28 @@ fn probe(s: &mut Session, p: &Value) -> Result<Value> {
     let step = opt::<String>(p, "step")?.ok_or_else(|| EngineError::Params("`step` is required".into()))?;
     let result = s.result(&step).ok_or_else(|| EngineError::Params(format!("step `{step}` has no result; solve it first")))?;
     let nodes = labels(p, "nodes", MAX_PROBE)?;
-    let index = |label: u32| {
-        result.nodes().binary_search(&label).map_err(|_| EngineError::Params(format!("node {label} has no result (it belongs to no solved element)")))
+    let locate = |label: u32| {
+        result
+            .locate(label)
+            .ok_or_else(|| EngineError::Params(format!("node {label} has no result (it belongs to no solved element or coupled reference point)")))
     };
     let out: Vec<Value> = match result.as_ref() {
         StepResult::Static(r) => nodes
             .iter()
             .map(|&l| {
-                let i = index(l)?;
-                Ok(json!({
-                    "node": l,
-                    "displacement": r.displacement.get(i),
-                    "reaction": r.reaction.get(i),
-                    "stress": r.stress.get(i),
-                    "von_mises": r.von_mises.get(i),
-                }))
+                Ok(match locate(l)? {
+                    Location::Point(k) => {
+                        let p = r.reference_points.get(k);
+                        json!({"node": l, "reference_point": p.map(|p| &p.name), "displacement": p.map(|p| p.displacement), "reaction": p.map(|p| p.reaction)})
+                    }
+                    Location::Node(i) => json!({
+                        "node": l,
+                        "displacement": r.displacement.get(i),
+                        "reaction": r.reaction.get(i),
+                        "stress": r.stress.get(i),
+                        "von_mises": r.von_mises.get(i),
+                    }),
+                })
             })
             .collect::<Result<_>>()?,
         StepResult::Frequency(r) => {
@@ -132,7 +145,17 @@ fn probe(s: &mut Session, p: &Value) -> Result<Value> {
                 .checked_sub(1)
                 .and_then(|k| r.modes.get(k))
                 .ok_or_else(|| EngineError::Params(format!("`mode` must be from 1 to {}", r.modes.len())))?;
-            nodes.iter().map(|&l| Ok(json!({"node": l, "shape": m.shape.get(index(l)?)}))).collect::<Result<_>>()?
+            nodes
+                .iter()
+                .map(|&l| {
+                    Ok(match locate(l)? {
+                        Location::Point(k) => {
+                            json!({"node": l, "reference_point": r.reference_points.get(k).map(|p| &p.0), "shape": m.point_shape.get(k)})
+                        }
+                        Location::Node(i) => json!({"node": l, "shape": m.shape.get(i)}),
+                    })
+                })
+                .collect::<Result<_>>()?
         }
     };
     Ok(json!({"step": step, "nodes": out}))
@@ -259,10 +282,28 @@ pub(crate) mod tests {
                 }
             }
         }
-        // An unsupported model (a coupling, a reference point load) is an error, not a panic.
-        let mut defined = Session::default();
-        crate::cmd::define::tests::defined_bar(&mut defined);
-        let e = defined.execute("solve.static", &json!({"step": "Bend"})).unwrap_err().to_string();
-        assert!(e.contains("not supported yet"), "{e}");
+    }
+
+    #[test]
+    fn solve_and_probe_a_coupled_reference_point() {
+        // The defined bar: a force on a reference point kinematically coupled to the free end.
+        let mut s = Session::default();
+        crate::cmd::define::tests::defined_bar(&mut s);
+        let r = s.execute("solve.static", &json!({"step": "Bend"})).unwrap();
+        let rp = &r["reference_points"][0];
+        assert_eq!(rp["name"], "RP", "{r}");
+        assert!(rp["displacement"][2].as_f64().unwrap() < 0.0, "{r}");
+        assert!((r["reaction_total"][2].as_f64().unwrap() - 100.0).abs() < 1e-6, "{r}");
+        let label = rp["label"].as_u64().unwrap();
+        let probe = s.execute("solve.probe", &json!({"step": "Bend", "nodes": [label, 1]})).unwrap();
+        assert_eq!(probe["nodes"][0]["reference_point"], "RP", "{probe}");
+        assert_eq!(probe["nodes"][0]["displacement"].as_array().unwrap().len(), 6, "{probe}");
+        assert!(probe["nodes"][1]["reaction"].is_array(), "{probe}");
+        s.execute("solve.frequency", &json!({"step": "Modes"})).unwrap();
+        let shape = s.execute("solve.probe", &json!({"step": "Modes", "nodes": [label], "mode": 1})).unwrap();
+        assert_eq!(shape["nodes"][0]["shape"].as_array().unwrap().len(), 6, "{shape}");
+        for p in [json!({"step": "Bend", "nodes": [label, label, 0]}), json!({"step": "Modes", "nodes": [label], "mode": 99})] {
+            assert!(s.execute("solve.probe", &p).is_err(), "{p}");
+        }
     }
 }

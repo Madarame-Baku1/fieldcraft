@@ -24,13 +24,15 @@
 
 pub mod analysis;
 pub mod cholesky;
+pub mod constraints;
 pub mod eigen;
 pub mod ordering;
 pub mod sparse;
 pub mod system;
 
 pub use analysis::{
-    ElementStress, FrequencyOptions, FrequencyResult, MassKind, Mode, StaticResult, Stats, StepResult, solve_frequency, solve_static,
+    ElementStress, FrequencyOptions, FrequencyResult, Location, MassKind, Mode, PointResult, StaticResult, Stats, StepResult, solve_frequency,
+    solve_static,
 };
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]

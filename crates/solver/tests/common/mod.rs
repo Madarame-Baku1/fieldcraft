@@ -1,13 +1,13 @@
 //! Structured meshes generated in code for the analytic verification suite: a block of
-//! hexahedra (hex8, hex20) or Kuhn-split tetrahedra (tet4, tet10) on [0, 1]³, mapped to the part
+//! hexahedra (hex8, hex20), of wedges (two per cell) or of Kuhn-split tetrahedra (tet4, tet10) on [0, 1]³, mapped to the part
 //! by a function, and helpers to define the model on it.
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
 
 use modelcraft_model::{
-    BoundaryCondition, Elastic, ElementFace, ElementKind, Formulation, Integration, Load, Material, Model, Procedure, Section, SectionKind, Set,
-    Step, Symmetry, Target,
+    BoundaryCondition, Coupling, CouplingKind, Dofs, Elastic, ElementFace, ElementKind, Formulation, Integration, Load, Material, Model, Procedure,
+    ReferencePoint, Section, SectionKind, Set, Step, Symmetry, Target,
 };
 
 pub struct Grid {
@@ -53,6 +53,15 @@ pub fn grid(n: [usize; 3], kind: ElementKind, map: impl Fn([f64; 3]) -> [f64; 3]
                         }
                         model.set_element(next, kind, nodes).unwrap();
                         next += 1;
+                    }
+                    ElementKind::Wedge6 => {
+                        // Two prisms along z, split by the cell's (x, y) diagonal, both counter-clockwise from above.
+                        for tri in [[[0, 0], [2, 0], [2, 2]], [[0, 0], [2, 2], [0, 2]]] {
+                            let nodes: Vec<u32> =
+                                [0, 2].iter().flat_map(|&z| tri.map(|t| [t[0], t[1], z])).map(|c| node(&mut model, at(c))).collect();
+                            model.set_element(next, kind, nodes).unwrap();
+                            next += 1;
+                        }
                     }
                     _ => {
                         // Six tetrahedra around the cell's main diagonal (Kuhn), conforming across cells.
@@ -144,6 +153,15 @@ impl Grid {
         self.bc(name, BoundaryCondition::Symmetry { target: Target::Set(name.into()), plane });
     }
 
+    /// A reference point `name` at `xyz`, coupled to the nodes where `f` holds.
+    pub fn couple(&mut self, name: &str, xyz: [f64; 3], kind: CouplingKind, dofs: &[u8], f: impl Fn([f64; 3]) -> bool) {
+        let set = format!("{name}_nodes");
+        self.node_set(&set, f);
+        self.model.add_reference_point(name, ReferencePoint { xyz, label: 0 }).unwrap();
+        let dofs = Dofs::try_from(dofs.to_vec()).unwrap();
+        self.model.add_coupling(&format!("{name}_coupling"), Coupling { reference_point: name.into(), set, kind, dofs }).unwrap();
+    }
+
     pub fn fixed(&mut self, name: &str, f: impl Fn([f64; 3]) -> bool) {
         self.node_set(name, f);
         self.bc(name, BoundaryCondition::Fixed { target: Target::Set(name.into()) });
@@ -171,6 +189,7 @@ pub fn variants() -> Vec<(ElementKind, Formulation, &'static str)> {
     vec![
         (ElementKind::Tet4, full(), "tet4"),
         (ElementKind::Tet10, full(), "tet10"),
+        (ElementKind::Wedge6, full(), "wedge6"),
         (ElementKind::Hex8, full(), "hex8"),
         (ElementKind::Hex8, incompatible(), "hex8 incompatible"),
         (ElementKind::Hex20, full(), "hex20"),
