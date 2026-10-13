@@ -1,6 +1,8 @@
 //! The command registry. Each area has its own module; [`ALL`] lists every command.
 
 pub(crate) mod define;
+mod edit;
+pub(crate) mod file;
 mod geometry;
 mod mesh;
 mod model;
@@ -56,6 +58,14 @@ pub static ALL: &[CommandSpec] = &[
     define::STEP_DELETE,
     define::STEP_ACTIVATE,
     define::ACTIVITY,
+    file::OPEN,
+    file::SAVE,
+    file::SAVE_AS,
+    file::RECOVERY_LIST,
+    file::RECOVER,
+    file::RECOVERY_DISCARD,
+    edit::UNDO,
+    edit::REDO,
 ];
 
 /// A required label parameter (1..=u32::MAX; the model checks its own range).
@@ -97,6 +107,14 @@ pub(crate) fn labels(p: &Value, key: &str, max_len: usize) -> Result<Vec<u32>> {
         .map(|v| v.as_u64().and_then(|n| u32::try_from(n).ok()).filter(|n| (1..=MAX_LABEL).contains(n)))
         .collect::<Option<Vec<u32>>>()
         .ok_or_else(|| EngineError::Params(format!("`{key}` must be labels in 1..={MAX_LABEL}")))
+}
+
+/// A required path parameter.
+pub(crate) fn path_param<'a>(p: &'a Value, key: &str) -> Result<&'a str> {
+    p.get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty() && s.len() <= modelcraft_io::MAX_PATH_LEN && !s.contains('\0'))
+        .ok_or_else(|| EngineError::Params(format!("`{key}` must be a file path")))
 }
 
 /// An optional number parameter.

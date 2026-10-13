@@ -1855,6 +1855,7 @@ version = "0.1.0"
 dependencies = [
  "log",
  "modelcraft-geometry",
+ "modelcraft-io",
  "modelcraft-mesh",
  "modelcraft-model",
  "serde",
@@ -1875,6 +1876,19 @@ dependencies = [
  "solidcraft-geom",
  "solidcraft-io",
  "solidcraft-kernel",
+ "thiserror 2.0.21",
+ "zip",
+]
+
+[[package]]
+name = "modelcraft-io"
+version = "0.1.0"
+dependencies = [
+ "log",
+ "modelcraft-model",
+ "serde",
+ "serde_json",
+ "sha2",
  "thiserror 2.0.21",
  "zip",
 ]
