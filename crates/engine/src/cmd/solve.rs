@@ -86,13 +86,13 @@ fn run_static(s: &mut Session, p: &Value) -> Result<Value> {
     let limits = limits(p)?;
     let step = opt::<String>(p, "step")?;
     let r = solve_static(&s.model, step.as_deref(), &limits)?;
-    let magnitude = |u: &[f64; 3]| (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
+
     let summary = json!({
         "step": r.step,
         "dofs": r.stats.dofs,
         "equations": r.stats.equations,
         "factor_entries": r.stats.factor_entries,
-        "max_displacement": largest(r.nodes.iter().zip(&r.displacement).map(|(l, u)| (*l, magnitude(u)))),
+        "max_displacement": largest(r.nodes.iter().zip(&r.displacement).map(|(l, u)| (*l, crate::results::magnitude(*u)))),
         "max_von_mises": largest(r.nodes.iter().zip(&r.von_mises).map(|(l, v)| (*l, *v))),
         "applied_total": r.applied_total,
         "reaction_total": r.reaction_total,
@@ -208,7 +208,13 @@ fn history(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn probe(s: &mut Session, p: &Value) -> Result<Value> {
     let step = opt::<String>(p, "step")?.ok_or_else(|| EngineError::Params("`step` is required".into()))?;
-    let result = s.result(&step).ok_or_else(|| EngineError::Params(format!("step `{step}` has no result; solve it first")))?;
+    let result = s.result(&step).ok_or_else(|| {
+        EngineError::Params(if s.latest_result(&step).is_some() {
+            format!("the result of step `{step}` is stale (the model changed since it was solved); solve it again")
+        } else {
+            format!("step `{step}` has no result; solve it first")
+        })
+    })?;
     let nodes = labels(p, "nodes", MAX_PROBE)?;
     let result = match result.as_ref() {
         StepResult::Explicit(r) => return probe_frame(r, &step, &nodes, p),
@@ -358,7 +364,8 @@ pub(crate) mod tests {
         s.execute("edit.undo", &json!({})).unwrap();
         assert_eq!(s.solved_steps().count(), 2);
         s.execute("edit.redo", &json!({})).unwrap();
-        assert!(s.execute("solve.probe", &json!({"step": "Bend", "nodes": [1]})).is_err());
+        let e = s.execute("solve.probe", &json!({"step": "Bend", "nodes": [1]})).unwrap_err().to_string();
+        assert!(e.contains("stale"), "{e}");
     }
 
     #[test]

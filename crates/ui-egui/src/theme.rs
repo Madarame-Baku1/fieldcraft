@@ -43,7 +43,26 @@ pub struct Tokens {
     /// Element edges (the mesh wireframe).
     pub mesh_edge: Color32,
     pub node: Color32,
+    // ---- geometry ----
+    /// Faces of the open design and imported surfaces.
+    pub geometry: Color32,
+    /// Their face boundaries.
+    pub geometry_edge: Color32,
+    // ---- results ----
+    /// The contour colour scale, low to high (the same in both themes).
+    pub contour: [Color32; 5],
+    /// Faces with no result at a node.
+    pub no_result: Color32,
 }
+
+/// The contour colour scale: blue, cyan, green, yellow, red.
+const CONTOUR: [Color32; 5] = [
+    Color32::from_rgb(0x2b, 0x4f, 0xd8),
+    Color32::from_rgb(0x2f, 0xb8, 0xe0),
+    Color32::from_rgb(0x3c, 0xc8, 0x64),
+    Color32::from_rgb(0xf0, 0xd2, 0x3c),
+    Color32::from_rgb(0xe0, 0x40, 0x2e),
+];
 
 impl Tokens {
     pub fn get(dark: bool) -> Tokens {
@@ -79,6 +98,10 @@ impl Tokens {
             line_element: Color32::from_rgb(0xf0, 0xc0, 0x50),
             mesh_edge: Color32::from_rgb(0x14, 0x18, 0x1e),
             node: Color32::from_rgb(0xf2, 0xe6, 0x6e),
+            geometry: Color32::from_rgb(0xa8, 0xae, 0xb8),
+            geometry_edge: Color32::from_rgb(0xe8, 0xec, 0xf2),
+            contour: CONTOUR,
+            no_result: Color32::from_rgb(0x70, 0x76, 0x80),
         }
     }
 
@@ -111,7 +134,16 @@ impl Tokens {
             line_element: Color32::from_rgb(0xc8, 0x8c, 0x1e),
             mesh_edge: Color32::from_rgb(0x1e, 0x23, 0x2a),
             node: Color32::from_rgb(0xb4, 0x3c, 0x8c),
+            geometry: Color32::from_rgb(0xb4, 0xba, 0xc4),
+            geometry_edge: Color32::from_rgb(0x2a, 0x30, 0x3a),
+            contour: CONTOUR,
+            no_result: Color32::from_rgb(0x9a, 0xa0, 0xaa),
         }
+    }
+
+    /// The contour colour scale for the renderer, low to high.
+    pub fn contour_stops(&self) -> [Rgb; 5] {
+        self.contour.map(rgb)
     }
 
     /// The colour elements of this kind are drawn in.
