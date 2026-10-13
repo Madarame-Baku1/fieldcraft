@@ -47,9 +47,17 @@ pub struct Node {
     pub xyz: [f64; 3],
 }
 
-/// Element topology. Node order follows each family's usual corner-first convention (corners,
-/// then mid-side nodes), which all three target formats share for these shapes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// Element topology. Node order is corners first, then mid-side nodes, with positive volume for
+/// a right-handed ordering:
+/// - tet10: mid-side nodes 5–10 on edges 1-2, 2-3, 3-1, 1-4, 2-4, 3-4;
+/// - wedge6: triangle 1-2-3, then 4-5-6 on the side its right-hand normal points to;
+/// - hex8/hex20: face 1-2-3-4, then 5-6-7-8 above it; hex20's mid-side nodes 9–12 lie on the
+///   edges of 1-2-3-4, 13–16 on those of 5-6-7-8, and 17–20 on edges 1-5, 2-6, 3-7, 4-8.
+///
+/// This is the Abaqus (and VTK) order. Formats that order nodes differently, such as Nastran's
+/// CHEXA with 20 nodes (vertical edges before the top face's edges), are reordered by their deck
+/// readers and writers; the model never stores another order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ElementKind {
     /// Two-node axial member.
@@ -148,6 +156,15 @@ pub struct Model {
     elements: BTreeMap<u32, Element>,
 }
 
+/// Check that every coordinate is a finite number within ±[`MAX_COORD`] (the rule for nodes,
+/// shared by everything that takes coordinates from outside).
+pub fn check_coordinates(xyz: &[f64]) -> Result<()> {
+    match xyz.iter().find(|c| !(c.abs() <= MAX_COORD)) {
+        Some(c) => Err(Error::Invalid(format!("coordinate {c} is not a finite number within ±{MAX_COORD}"))),
+        None => Ok(()),
+    }
+}
+
 fn check_label(what: &str, label: u32) -> Result<()> {
     if label == 0 || label > MAX_LABEL {
         return Err(Error::Invalid(format!("{what} label {label} is outside 1..={MAX_LABEL}")));
@@ -175,9 +192,10 @@ impl Model {
     /// Add a node, or move an existing one (decks redefine nodes the same way).
     pub fn set_node(&mut self, label: u32, xyz: [f64; 3]) -> Result<()> {
         check_label("node", label)?;
-        if let Some(c) = xyz.iter().find(|c| !(c.abs() <= MAX_COORD)) {
-            return Err(Error::Invalid(format!("node {label}: coordinate {c} is not a finite number within ±{MAX_COORD}")));
-        }
+        check_coordinates(&xyz).map_err(|e| match e {
+            Error::Invalid(m) => Error::Invalid(format!("node {label}: {m}")),
+            e => e,
+        })?;
         if !self.nodes.contains_key(&label) && self.nodes.len() >= MAX_NODES {
             return Err(Error::Limit(format!("a model holds at most {MAX_NODES} nodes")));
         }
