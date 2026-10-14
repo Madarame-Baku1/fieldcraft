@@ -1874,6 +1874,8 @@ name = "modelcraft-cli"
 version = "0.1.0"
 dependencies = [
  "modelcraft-engine",
+ "modelcraft-io",
+ "modelcraft-mcp",
  "serde_json",
 ]
 
@@ -1899,6 +1901,7 @@ dependencies = [
  "modelcraft-lbm",
  "modelcraft-mesh",
  "modelcraft-model",
+ "modelcraft-render",
  "modelcraft-solver",
  "serde",
  "serde_json",
@@ -1960,6 +1963,17 @@ dependencies = [
  "modelcraft-mesh",
  "modelcraft-model",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "modelcraft-mcp"
+version = "0.1.0"
+dependencies = [
+ "modelcraft-engine",
+ "modelcraft-io",
+ "modelcraft-render",
+ "modelcraft-testkit",
+ "serde_json",
 ]
 
 [[package]]
