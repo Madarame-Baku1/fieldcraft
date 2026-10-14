@@ -1901,6 +1901,7 @@ dependencies = [
  "modelcraft-lbm",
  "modelcraft-mesh",
  "modelcraft-model",
+ "modelcraft-parallel",
  "modelcraft-render",
  "modelcraft-solver",
  "serde",
@@ -1915,6 +1916,7 @@ version = "0.1.0"
 dependencies = [
  "modelcraft-fem",
  "modelcraft-model",
+ "modelcraft-parallel",
  "serde",
  "thiserror 2.0.21",
 ]
@@ -1962,6 +1964,7 @@ version = "0.1.0"
 dependencies = [
  "modelcraft-mesh",
  "modelcraft-model",
+ "modelcraft-parallel",
  "thiserror 2.0.21",
 ]
 
@@ -1998,6 +2001,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "modelcraft-parallel"
+version = "0.1.0"
+dependencies = [
+ "rayon",
+]
+
+[[package]]
 name = "modelcraft-render"
 version = "0.1.0"
 dependencies = [
@@ -2013,6 +2023,7 @@ version = "0.1.0"
 dependencies = [
  "modelcraft-fem",
  "modelcraft-model",
+ "modelcraft-parallel",
  "serde",
  "thiserror 2.0.21",
 ]
