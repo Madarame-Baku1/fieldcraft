@@ -12,10 +12,9 @@
 
 use std::collections::BTreeMap;
 
-use super::geom::{add, scale};
 use super::interval::Intervals;
 use super::{Ctx, Raw, project_to_face, project_to_faces};
-use crate::quad::transfinite_grid;
+use crate::quad::{lattice_index, transfinite_faces, transfinite_volume};
 use crate::size::{divide_polyline, ideal_divisions};
 use crate::vec3::{P, det, sub};
 use crate::{Error, Result};
@@ -114,7 +113,7 @@ pub(crate) fn mesh(ctx: &Ctx) -> Result<Raw> {
         let last = pts.len().saturating_sub(1);
         Ok(pts.iter().enumerate().map(|(k, q)| if k == 0 || k == last { *q } else { project_to_faces(ctx, &faces, *q) }).collect())
     };
-    let idx = |i: usize, j: usize, k: usize| (k * (nj + 1) + j) * (ni + 1) + i;
+    let idx = |i: usize, j: usize, k: usize| lattice_index([ni, nj, nk], [i, j, k]);
     let mut x: Vec<Option<P>> = vec![None; total];
     // Edges: E[d][s][t] along direction d at the other two coordinates (s, t) ∈ {0, 1}².
     for (d, g) in groups.iter().enumerate() {
@@ -133,96 +132,43 @@ pub(crate) fn mesh(ctx: &Ctx) -> Result<Raw> {
             }
         }
     }
-    let get = |x: &[Option<P>], i: usize, j: usize, k: usize| -> Result<P> {
-        x.get(idx(i, j, k)).copied().flatten().ok_or_else(|| Error::Failed("mapped grid node".into()))
-    };
-    // Faces: grids from their edges, projected onto the face found at the face's centre.
-    for d in 0..3 {
-        for side in 0..2 {
-            // Face d = side·n_d; its parameters (a, b) run along the other two directions.
-            let (da, db) = match d {
-                0 => (1, 2),
-                1 => (0, 2),
-                _ => (0, 1),
-            };
-            let (na, nb) = ([ni, nj, nk][da], [ni, nj, nk][db]);
-            let ijk = |a: usize, b: usize| -> (usize, usize, usize) {
-                let mut c = [0usize; 3];
-                c[d] = side * [ni, nj, nk][d];
-                c[da] = a;
-                c[db] = b;
-                (c[0], c[1], c[2])
-            };
-            let line = |f: &dyn Fn(usize) -> (usize, usize, usize), n: usize| -> Result<Vec<P>> {
-                (0..=n)
-                    .map(|q| {
-                        let (i, j, k) = f(q);
-                        get(&x, i, j, k)
-                    })
-                    .collect()
-            };
-            let bottom = line(&|a| ijk(a, 0), na)?;
-            let top = line(&|a| ijk(a, nb), na)?;
-            let left = line(&|b| ijk(0, b), nb)?;
-            let right = line(&|b| ijk(na, b), nb)?;
-            let grid = transfinite_grid(&bottom, &right, &top, &left)?;
-            // The B-rep face bounded by this side's four edges.
-            let logical = |a: usize, b: usize| {
-                let (i, j, k) = ijk(a, b);
-                at(usize::from(i > 0), usize::from(j > 0), usize::from(k > 0))
-            };
-            let ring = [logical(0, 0), logical(na, 0), logical(na, nb), logical(0, nb)];
-            let mut bounding: Vec<usize> = (0..4).filter_map(|m| edge_between(ring[m], ring[(m + 1) % 4]).map(|x| x.0)).collect();
-            bounding.sort_unstable();
-            let face = brep.faces.iter().position(|f| {
-                let mut es: Vec<usize> = f.loops.iter().flatten().map(|x| x.0).collect();
-                es.sort_unstable();
-                es == bounding
-            });
-            for b in 1..nb {
-                for a in 1..na {
-                    let q = grid.get(b * (na + 1) + a).copied().unwrap_or([0.0; 3]);
-                    let q = face.and_then(|f| project_to_face(ctx, f, q)).unwrap_or(q);
-                    let (i, j, k) = ijk(a, b);
-                    if let Some(slot) = x.get_mut(idx(i, j, k)) {
-                        *slot = Some(q);
-                    }
+    // Faces: grids from their edges, projected onto the B-rep face their four edges bound.
+    let n = [ni, nj, nk];
+    transfinite_faces(&mut x, n, None, |d, side, grid| {
+        let (da, db) = match d {
+            0 => (1, 2),
+            1 => (0, 2),
+            _ => (0, 1),
+        };
+        let logical = |a: usize, b: usize| {
+            let mut c = [0usize; 3];
+            c[d] = side;
+            c[da] = a;
+            c[db] = b;
+            at(c[0], c[1], c[2])
+        };
+        let ring = [logical(0, 0), logical(1, 0), logical(1, 1), logical(0, 1)];
+        let mut bounding: Vec<usize> = (0..4).filter_map(|m| edge_between(ring[m], ring[(m + 1) % 4]).map(|x| x.0)).collect();
+        bounding.sort_unstable();
+        let face = brep.faces.iter().position(|f| {
+            let mut es: Vec<usize> = f.loops.iter().flatten().map(|x| x.0).collect();
+            es.sort_unstable();
+            es == bounding
+        });
+        let (na, nb) = (n[da], n[db]);
+        for b in 1..nb {
+            for a in 1..na {
+                if let Some(q) = grid.get_mut(b * (na + 1) + a) {
+                    *q = face.and_then(|f| project_to_face(ctx, f, *q)).unwrap_or(*q);
                 }
             }
         }
-    }
-    // Volume: trivariate transfinite interpolation.
-    let (fi, fj, fk) = (ni as f64, nj as f64, nk as f64);
-    for k in 1..nk {
-        for j in 1..nj {
-            for i in 1..ni {
-                let (u, v, w) = (i as f64 / fi, j as f64 / fj, k as f64 / fk);
-                let g = |i: usize, j: usize, k: usize| get(&x, i, j, k);
-                let lin = |t: f64, a: P, b: P| add(scale(a, 1.0 - t), scale(b, t));
-                // Faces.
-                let faces = add(add(lin(u, g(0, j, k)?, g(ni, j, k)?), lin(v, g(i, 0, k)?, g(i, nj, k)?)), lin(w, g(i, j, 0)?, g(i, j, nk)?));
-                // Edges.
-                let bil = |s: f64, t: f64, p00: P, p10: P, p01: P, p11: P| lin(t, lin(s, p00, p10), lin(s, p01, p11));
-                let edges = add(
-                    add(
-                        bil(v, w, g(i, 0, 0)?, g(i, nj, 0)?, g(i, 0, nk)?, g(i, nj, nk)?),
-                        bil(u, w, g(0, j, 0)?, g(ni, j, 0)?, g(0, j, nk)?, g(ni, j, nk)?),
-                    ),
-                    bil(u, v, g(0, 0, k)?, g(ni, 0, k)?, g(0, nj, k)?, g(ni, nj, k)?),
-                );
-                // Corners.
-                let corners = lin(
-                    w,
-                    bil(u, v, g(0, 0, 0)?, g(ni, 0, 0)?, g(0, nj, 0)?, g(ni, nj, 0)?),
-                    bil(u, v, g(0, 0, nk)?, g(ni, 0, nk)?, g(0, nj, nk)?, g(ni, nj, nk)?),
-                );
-                let p = add(sub(faces, edges), corners);
-                if let Some(slot) = x.get_mut(idx(i, j, k)) {
-                    *slot = Some(p);
-                }
-            }
-        }
-    }
+        Ok(())
+    })?;
+    // Volume: trivariate transfinite interpolation, blended by index.
+    let uniform = |n: usize| -> Vec<f64> { (0..=n).map(|q| q as f64 / n as f64).collect() };
+    let (bi, bj, bk) = (uniform(ni), uniform(nj), uniform(nk));
+    transfinite_volume(&mut x, [ni, nj, nk], [&bi, &bj, &bk])?;
     let nodes: Vec<P> = x.into_iter().map(|p| p.ok_or_else(|| Error::Failed("mapped grid node missing".into()))).collect::<Result<_>>()?;
     let id = |i: usize, j: usize, k: usize| idx(i, j, k) as u32;
     let mut hexes = Vec::with_capacity(ni * nj * nk);

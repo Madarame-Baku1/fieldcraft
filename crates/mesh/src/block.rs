@@ -1,11 +1,13 @@
 //! Mapped blocks: a structured mesh of one six-sided region given by its eight corners and,
 //! optionally, curved edges (circular and elliptical arcs).
 //!
-//! The interior follows the edge-based transfinite interpolation of Gordon and Hall (1973,
-//! "Construction of curvilinear co-ordinate systems and applications to mesh generation",
-//! Int. J. Numer. Meth. Engng 7, 461–477): the twelve edge curves blended linearly across the
-//! block, minus twice the trilinear interpolation of the corners. It reproduces every edge
-//! exactly, gives Coons patches on the faces and the trilinear map for straight edges.
+//! The lattice follows the transfinite interpolation shared with the structured hex mesher
+//! ([`crate::quad::transfinite_faces`], Gordon and Hall 1973, for the faces;
+//! [`crate::quad::transfinite_volume`], Gordon and Thiel 1982, for the interior): the edge curves
+//! at their (graded) parameters, each face the Coons patch of its four edges and the volume
+//! blended from the faces, both by the same lattice parameters. It reproduces every edge exactly
+//! and gives the trilinear map for straight edges. A 2D patch is the Coons patch of its four
+//! edges.
 //!
 //! Elements: hex8 and hex20 per cell; tet4 and tet10 by Kuhn's split of each cell into six
 //! tetrahedra along its main diagonal (conforming between the cells of a block); wedge6 by
@@ -18,6 +20,7 @@
 
 use modelcraft_model::{ElementKind, MAX_COORD};
 
+use crate::quad::{lattice_index, transfinite_faces, transfinite_grid_blended, transfinite_volume};
 use crate::quality::{Validity, element_validity, planar_quad_validity};
 use crate::vec3::{P, cross, dot, norm, sub};
 use crate::{Error, Result};
@@ -94,8 +97,19 @@ fn add_scaled(a: P, s: f64, b: P) -> P {
 /// An edge curve resolved against its end points: `point(s)` for `s` in `[0, 1]`.
 #[derive(Debug, Clone, Copy)]
 enum Path {
-    Line { from: P, to: P },
-    Ellipse { center: P, a: P, b: P, start: f64, sweep: f64 },
+    Line {
+        from: P,
+        to: P,
+    },
+    /// The ends are kept so the curve passes through the corners exactly (not to rounding).
+    Ellipse {
+        center: P,
+        a: P,
+        b: P,
+        start: f64,
+        sweep: f64,
+        ends: [P; 2],
+    },
 }
 
 impl Path {
@@ -144,13 +158,17 @@ impl Path {
         if !(sweep.abs() > 1e-12) || std::f64::consts::PI - sweep.abs() < 1e-9 {
             return Err(Error::Invalid(format!("the arc from {from:?} to {to:?} spans 0 or 180 degrees; split it")));
         }
-        Ok(Path::Ellipse { center, a, b, start, sweep })
+        Ok(Path::Ellipse { center, a, b, start, sweep, ends: [from, to] })
     }
 
     fn point(&self, s: f64) -> P {
         match *self {
+            // The ends are the corners exactly (not to rounding): shared faces and the
+            // transfinite grids, which need equal corners, rely on it.
+            Path::Line { from, .. } | Path::Ellipse { ends: [from, _], .. } if s == 0.0 => from,
+            Path::Line { to, .. } | Path::Ellipse { ends: [_, to], .. } if s == 1.0 => to,
             Path::Line { from, to } => add_scaled(from, s, sub(to, from)),
-            Path::Ellipse { center, a, b, start, sweep } => {
+            Path::Ellipse { center, a, b, start, sweep, .. } => {
                 let t = start + s * sweep;
                 add_scaled(add_scaled(center, t.cos(), a), t.sin(), b)
             }
@@ -183,49 +201,26 @@ fn parameters(n: usize, bias: f64, order: usize) -> Vec<f64> {
     out
 }
 
-/// The map from the unit cube onto the block, on the lattice of `params`: each edge curve is
-/// evaluated once per lattice parameter along its direction.
-struct Map<'a> {
-    corners: [P; 8],
-    params: &'a [Vec<f64>; 3],
-    /// `edges[k][i]`: edge `k` at the `i`-th parameter of its direction (`k / 4`).
-    edges: [Vec<P>; 12],
-}
-
-impl<'a> Map<'a> {
-    fn new(corners: [P; 8], paths: &[Path; 12], params: &'a [Vec<f64>; 3]) -> Map<'a> {
-        let edges = std::array::from_fn(|k| params[k / 4].iter().map(|&s| paths[k].point(s)).collect());
-        Map { corners, params, edges }
-    }
-
-    /// The point at lattice coordinates `[i, j, k]`.
-    fn point(&self, at: [usize; 3]) -> P {
-        let [u, v, w] = [0, 1, 2].map(|d| self.params[d].get(at[d]).copied().unwrap_or(0.0));
-        let e = |k: usize| self.edges[k].get(at[k / 4]).copied().unwrap_or([f64::NAN; 3]);
-        let terms: [(f64, P); 12] = [
-            ((1.0 - v) * (1.0 - w), e(0)),
-            (v * (1.0 - w), e(1)),
-            ((1.0 - v) * w, e(2)),
-            (v * w, e(3)),
-            ((1.0 - u) * (1.0 - w), e(4)),
-            (u * (1.0 - w), e(5)),
-            ((1.0 - u) * w, e(6)),
-            (u * w, e(7)),
-            ((1.0 - u) * (1.0 - v), e(8)),
-            (u * (1.0 - v), e(9)),
-            (u * v, e(10)),
-            ((1.0 - u) * v, e(11)),
-        ];
-        let mut x = [0.0; 3];
-        for (f, p) in terms {
-            x = add_scaled(x, f, p);
+/// The block's lattice of `params.len()` points per direction (node `(i, j, k)` at
+/// `(k·n1 + j)·n0 + i`): the twelve edge curves at their parameters, the six faces as transfinite
+/// grids of their edges ([`transfinite_grid`]) and the interior by the trivariate interpolation of
+/// the faces ([`transfinite_volume`]), blended by the lattice parameters.
+fn lattice_points(paths: &[Path; 12], params: &[Vec<f64>; 3]) -> Result<Vec<P>> {
+    let n = [0, 1, 2].map(|d| params[d].len() - 1);
+    let mut x: Vec<Option<P>> = vec![None; params.iter().map(Vec::len).product()];
+    for (k, [from, _]) in EDGES.iter().enumerate() {
+        let along = k / 4;
+        for (q, &t) in params[along].iter().enumerate() {
+            let c = [0, 1, 2].map(|d| if d == along { q } else { CORNERS[*from][d] * n[d] });
+            if let Some(slot) = x.get_mut(lattice_index(n, c)) {
+                slot.get_or_insert(paths[k].point(t));
+            }
         }
-        for (c, at) in self.corners.iter().zip(CORNERS) {
-            let f = |bit: usize, t: f64| if bit == 1 { t } else { 1.0 - t };
-            x = add_scaled(x, -2.0 * f(at[0], u) * f(at[1], v) * f(at[2], w), *c);
-        }
-        x
     }
+    let blend = [params[0].as_slice(), params[1].as_slice(), params[2].as_slice()];
+    transfinite_faces(&mut x, n, Some(blend), |_, _, _| Ok(()))?;
+    transfinite_volume(&mut x, n, blend)?;
+    x.into_iter().map(|p| p.ok_or_else(|| Error::Failed("a block lattice node is missing".into()))).collect()
 }
 
 /// Lattice offsets of each element of one cell, in units of the lattice (two per cell for
@@ -309,7 +304,7 @@ pub fn block(b: &Block) -> Result<BlockMesh> {
 
     let order = if kind.is_quadratic() { 2 } else { 1 };
     let params: [Vec<f64>; 3] = [0, 1, 2].map(|d| parameters(b.divisions[d], b.bias[d], order));
-    let map = Map::new(b.corners, &paths, &params);
+    let lattice_xyz = lattice_points(&paths, &params)?;
     let size = [0, 1, 2].map(|d| params[d].len());
     let index = |c: [usize; 3]| c[0] + size[0] * (c[1] + size[1] * c[2]);
 
@@ -342,7 +337,7 @@ pub fn block(b: &Block) -> Result<BlockMesh> {
                     && let Some(slot) = number.get_mut(at)
                 {
                     *slot = Some(u32::try_from(points.len()).map_err(|_| Error::Limit("too many points in one block".into()))?);
-                    points.push(map.point([i, j, k]));
+                    points.push(lattice_xyz.get(at).copied().unwrap_or([f64::NAN; 3]));
                 }
             }
         }
@@ -489,22 +484,16 @@ pub fn patch(b: &Patch) -> Result<BlockMesh> {
     }
     let order = if kind.is_quadratic() { 2 } else { 1 };
     let params: [Vec<f64>; 2] = [0, 1].map(|d| parameters(b.divisions[d], b.bias[d], order));
-    let mut edges: [Vec<P>; 4] = Default::default();
+    let mut sides: [Vec<P>; 4] = Default::default();
     for (k, [from, to]) in PATCH_EDGES.iter().enumerate() {
         let path = Path::new(curves[k].unwrap_or(Curve::Line), b.corners[*from], b.corners[*to])?;
-        edges[k] = params[k / 2].iter().map(|&t| path.point(t)).collect();
+        sides[k] = params[k / 2].iter().map(|&t| path.point(t)).collect();
     }
+    // Bottom (1→2), right (2→3), top (4→3), left (1→4): the Coons patch of the four sides.
+    let [bottom, top, left, right] = &sides;
+    let grid = transfinite_grid_blended(bottom, right, top, left, &params[0], &params[1])?;
     let at = |i: usize, j: usize| -> P {
-        let (u, v) = (params[0].get(i).copied().unwrap_or(0.0), params[1].get(j).copied().unwrap_or(0.0));
-        let e = |k: usize, n: usize| edges[k].get(n).copied().unwrap_or([f64::NAN; 3]);
-        let [c0, c1, c2, c3] = b.corners;
-        let mut x = [0.0; 3];
-        for (f, p) in [(1.0 - v, e(0, i)), (v, e(1, i)), (1.0 - u, e(2, j)), (u, e(3, j))] {
-            x = add_scaled(x, f, p);
-        }
-        for (f, c) in [((1.0 - u) * (1.0 - v), c0), (u * (1.0 - v), c1), (u * v, c2), ((1.0 - u) * v, c3)] {
-            x = add_scaled(x, -f, c);
-        }
+        let mut x = grid.get(j * params[0].len() + i).copied().unwrap_or([f64::NAN; 3]);
         x[2] = 0.0;
         x
     };
