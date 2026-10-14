@@ -35,6 +35,22 @@ impl Tab {
     pub const ALL: [Tab; 10] =
         [Tab::Geometry, Tab::Mesh, Tab::Properties, Tab::Assembly, Tab::Steps, Tab::Loads, Tab::Interactions, Tab::Solve, Tab::Results, Tab::Tools];
 
+    /// Its id in JSON (`loads`).
+    pub fn id(self) -> &'static str {
+        match self {
+            Tab::Geometry => "geometry",
+            Tab::Mesh => "mesh",
+            Tab::Properties => "properties",
+            Tab::Assembly => "assembly",
+            Tab::Steps => "steps",
+            Tab::Loads => "loads",
+            Tab::Interactions => "interactions",
+            Tab::Solve => "solve",
+            Tab::Results => "results",
+            Tab::Tools => "tools",
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Tab::Geometry => "Geometry",
@@ -47,6 +63,70 @@ impl Tab {
             Tab::Solve => "Solve",
             Tab::Results => "Results",
             Tab::Tools => "Tools",
+        }
+    }
+}
+
+/// The workspaces: one per stage of an analysis, each a set of toolbar tabs. Tools is on every
+/// workspace.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Workspace {
+    /// Geometry and meshing.
+    #[default]
+    Prepare,
+    /// Materials, sections, sets, steps, loads, boundary conditions and interactions.
+    Model,
+    /// Checking, writing decks and solving.
+    Analysis,
+    /// Looking at results.
+    Results,
+}
+
+impl Workspace {
+    pub const ALL: [Workspace; 4] = [Workspace::Prepare, Workspace::Model, Workspace::Analysis, Workspace::Results];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Workspace::Prepare => "Prepare",
+            Workspace::Model => "Model",
+            Workspace::Analysis => "Analysis",
+            Workspace::Results => "Results",
+        }
+    }
+
+    /// One line: what it is for.
+    pub fn about(self) -> &'static str {
+        match self {
+            Workspace::Prepare => "Open geometry and mesh it",
+            Workspace::Model => "Materials, sections, steps, loads and boundary conditions",
+            Workspace::Analysis => "Check the model, write decks and solve",
+            Workspace::Results => "Deformed shapes, contours, modes and probes",
+        }
+    }
+
+    /// Its tabs, in order.
+    pub fn tabs(self) -> &'static [Tab] {
+        match self {
+            Workspace::Prepare => &[Tab::Geometry, Tab::Mesh, Tab::Tools],
+            Workspace::Model => &[Tab::Properties, Tab::Assembly, Tab::Steps, Tab::Loads, Tab::Interactions, Tab::Tools],
+            Workspace::Analysis => &[Tab::Solve, Tab::Tools],
+            Workspace::Results => &[Tab::Results, Tab::Tools],
+        }
+    }
+
+    /// The workspace that shows `tab`: `current` when it does, else the first that does.
+    pub fn showing(tab: Tab, current: Workspace) -> Workspace {
+        if current.tabs().contains(&tab) { current } else { Workspace::ALL.into_iter().find(|w| w.tabs().contains(&tab)).unwrap_or(current) }
+    }
+
+    /// The catalogue entry whose icon stands for the workspace.
+    pub fn icon(self) -> &'static str {
+        match self {
+            Workspace::Prepare => "mesh.tet.generate",
+            Workspace::Model => "model.material.create",
+            Workspace::Analysis => "solve.run",
+            Workspace::Results => "results.contour",
         }
     }
 }
@@ -332,6 +412,7 @@ pub static CATALOGUE: &[Capability] = &[
     soon("interaction.connector", "Connector", Interactions, "Connectors", "M7", "Connector elements between points"),
     soon("interaction.fsi", "FSI Interface", Interactions, "Coupled", "M13", "The fluid–structure interface"),
     // ---- Solve ----
+    ready("solve.run", "Solve", Solve, "Run", "Solve every step in order and show the results"),
     ready("model.check", "Check Model", Solve, "Check", "Name every missing or bad definition before writing or solving"),
     deck("deck.write.abaqus", "Abaqus Input", "abaqus", "Write an Abaqus input file (.inp)"),
     deck("deck.write.nastran", "Nastran Deck", "nastran", "Write Nastran bulk data (SOL 101, 103)"),
@@ -381,6 +462,7 @@ pub static CATALOGUE: &[Capability] = &[
     // ---- Tools ----
     ready("model.info", "Model Info", Tools, "Model", "Node and element counts and the model summary"),
     ready("file.open", "Open Model", Tools, "File", "Open a .modelcraft model"),
+    ready("file.sample", "Samples", Tools, "File", "Open a sample model, ready to solve"),
     ready("file.save", "Save", Tools, "File", "Save the model to its .modelcraft file"),
     ready("file.save_as", "Save As", Tools, "File", "Save the model to a new .modelcraft file"),
     ready_more(
@@ -398,6 +480,12 @@ pub static CATALOGUE: &[Capability] = &[
 /// The catalogue entry with this id.
 pub fn find(id: &str) -> Option<&'static Capability> {
     CATALOGUE.iter().find(|c| c.id == id)
+}
+
+/// The entry that claims a command: the one running it, else the one listing it among its
+/// related commands. Every registered command has one (a test checks it).
+pub fn entry_of(command: &str) -> Option<&'static Capability> {
+    CATALOGUE.iter().find(|c| c.command() == Some(command)).or_else(|| CATALOGUE.iter().find(|c| c.more.contains(&command)))
 }
 
 /// The entries of a tab (one run of the catalogue).
@@ -441,6 +529,24 @@ pub fn features_page() -> String {
 mod tests {
     use super::*;
     use crate::{commands, find_command};
+
+    #[test]
+    fn every_tab_is_on_a_workspace_and_every_command_has_an_entry() {
+        for tab in Tab::ALL {
+            assert!(Workspace::ALL.iter().any(|w| w.tabs().contains(&tab)), "{tab:?} is on no workspace");
+        }
+        assert!(Workspace::ALL.iter().all(|w| w.tabs().contains(&Tab::Tools)));
+        assert!(Workspace::ALL.iter().all(|w| find(w.icon()).is_some()));
+        assert_eq!(Workspace::showing(Tab::Results, Workspace::Prepare), Workspace::Results);
+        assert_eq!(Workspace::showing(Tab::Tools, Workspace::Model), Workspace::Model);
+        for c in commands() {
+            assert!(entry_of(c.id).is_some(), "{} has no catalogue entry", c.id);
+        }
+        assert_eq!(entry_of("model.material.edit").map(|c| c.id), Some("model.material.create"));
+        for tab in Tab::ALL {
+            assert_eq!(serde_json::to_value(tab).ok().and_then(|v| v.as_str().map(str::to_string)).as_deref(), Some(tab.id()));
+        }
+    }
 
     #[test]
     fn every_command_is_claimed_and_every_ready_entry_runs_a_command() {

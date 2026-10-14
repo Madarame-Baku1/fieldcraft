@@ -1,6 +1,7 @@
 //! ModelCraft desktop app.
 //!
-//! Usage: `modelcraft [--sample] [--control PORT]`
+//! Usage: `modelcraft [--sample [NAME]] [--control PORT] [FILE…]` (files open as if dropped on the
+//! window; NAME is a sample of `modelcraft_engine::sample`, `parts` by default)
 //!
 //! `--sample` opens a sample model (`modelcraft_engine::sample`). `--control PORT` (or
 //! `MODELCRAFT_CONTROL_PORT`) starts a localhost JSON-lines control server:
@@ -14,10 +15,12 @@ mod control_server;
 
 use modelcraft_engine::Session;
 use modelcraft_engine::autosave::{self, Autosaver};
-use modelcraft_ui_egui::ModelApp;
+use modelcraft_ui_egui::{Filter, ModelApp, Services};
 
-const USAGE: &str = "usage: modelcraft [--sample] [--control PORT]";
+const USAGE: &str = "usage: modelcraft [--sample [parts|cantilever|impact]] [--control PORT] [FILE…]  (FILE: .modelcraft, .solidcraft or .3mf)";
 const DEPTH_BITS: u8 = 24;
+/// The window draws its own caption buttons where the OS ones would sit apart from the app bar.
+const CUSTOM_TITLEBAR: bool = !cfg!(target_os = "macos");
 const MSAA: u16 = 4;
 
 /// The window and Dock icon: the 256 px export of the application icon (assets/app-icon).
@@ -78,19 +81,42 @@ impl eframe::App for App {
     }
 }
 
+/// Native file pickers and the recent-files file, for the UI.
+fn services() -> Services {
+    let dialog = |filters: &[Filter]| filters.iter().fold(rfd::FileDialog::new(), |d, f| d.add_filter(f.name, f.extensions));
+    Services {
+        pick_open: Some(Box::new(move |filters: &[Filter]| dialog(filters).pick_file().map(|p| p.to_string_lossy().to_string()))),
+        pick_save: Some(Box::new(move |name: &str, filters: &[Filter]| {
+            dialog(filters).set_file_name(name).save_file().map(|p| p.to_string_lossy().to_string())
+        })),
+        // Beside the recovery folder in the per-user data folder.
+        recent_path: modelcraft_io::recovery::default_dir().and_then(|d| d.parent().map(|p| p.join("recent.json"))),
+    }
+}
+
 /// Command-line options.
 #[derive(Debug, Default, PartialEq)]
 struct Args {
-    sample: bool,
+    /// The sample to open (`--sample [NAME]`).
+    sample: Option<String>,
     control: Option<u16>,
+    /// Files to open (models, designs, tagged meshes).
+    files: Vec<String>,
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>, env_port: Option<String>) -> Result<Option<Args>, String> {
     let mut out = Args { control: env_port.and_then(|p| p.trim().parse().ok()), ..Default::default() };
-    let mut args = args.into_iter();
+    let mut args = args.into_iter().peekable();
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--sample" => out.sample = true,
+            "--sample" => {
+                // An optional sample name follows.
+                let name = args.peek().filter(|a| modelcraft_engine::sample::find(a).is_some()).cloned();
+                if name.is_some() {
+                    args.next();
+                }
+                out.sample = Some(name.unwrap_or_else(|| "parts".into()));
+            }
             "--control" => {
                 let port = args.next().ok_or("--control needs a port")?;
                 out.control = Some(port.parse().map_err(|_| format!("--control: `{port}` is not a port number"))?);
@@ -103,7 +129,8 @@ fn parse_args(args: impl IntoIterator<Item = String>, env_port: Option<String>) 
                 println!("{USAGE}");
                 return Ok(None);
             }
-            other => return Err(format!("unknown argument `{other}`\n{USAGE}")),
+            other if other.starts_with('-') => return Err(format!("unknown argument `{other}`\n{USAGE}")),
+            file => out.files.push(file.to_string()),
         }
     }
     Ok(Some(out))
@@ -123,7 +150,14 @@ fn main() -> eframe::Result {
             .with_title("ModelCraft")
             .with_icon(app_icon())
             .with_inner_size([1400.0, 900.0])
-            .with_min_inner_size([800.0, 500.0]),
+            .with_min_inner_size([960.0, 600.0])
+            .with_drag_and_drop(true)
+            // The app bar is the title bar (as in the other Craft apps): on macOS under the
+            // traffic lights, elsewhere with its own caption buttons and resize zones.
+            .with_decorations(!CUSTOM_TITLEBAR)
+            .with_fullsize_content_view(true)
+            .with_titlebar_shown(false)
+            .with_title_shown(false),
         depth_buffer: DEPTH_BITS,
         multisampling: MSAA,
         ..Default::default()
@@ -132,7 +166,9 @@ fn main() -> eframe::Result {
         "ModelCraft",
         options,
         Box::new(move |cc| {
-            let mut app = ModelApp::new(Session::default());
+            let mut app = ModelApp::new(Session::default()).with_services(services());
+            app.custom_titlebar = CUSTOM_TITLEBAR;
+            app.integrated_titlebar = cfg!(target_os = "macos");
             if let Some(rs) = &cc.wgpu_render_state {
                 let info = rs.adapter.get_info();
                 eprintln!("modelcraft: graphics {:?} {}, MSAA {}x (requested {MSAA}x)", info.backend, info.name, rs.msaa_samples);
@@ -141,15 +177,17 @@ fn main() -> eframe::Result {
             if let Some(port) = args.control {
                 app = app.with_control(control_server::start(port, cc.egui_ctx.clone()));
             }
-            if args.sample {
-                // The status bar reports a failure; the app still opens.
-                let _ = app.run_script(&modelcraft_engine::sample::script());
+            if let Some(name) = &args.sample {
+                app.open_sample(name);
+            }
+            for f in &args.files {
+                app.open_path(f);
             }
             let autosaver = autosave::default_dir().and_then(|dir| {
                 let listed = app.session.execute("file.recovery.list", &serde_json::json!({"dir": dir}));
                 let recoverable = listed.ok().and_then(|v| v.as_array().map(Vec::len)).unwrap_or(0);
                 if recoverable > 0 {
-                    app.set_status(format!("{recoverable} autosaved model(s) can be recovered (file.recovery.list, file.recover)"), false);
+                    app.set_status(format!("{recoverable} autosaved model(s) can be recovered: File › Recover…"), false);
                 }
                 Autosaver::new(&dir).map_err(|e| log::warn!("autosave unavailable: {e}")).ok()
             });
@@ -176,12 +214,19 @@ mod tests {
     #[test]
     fn arguments() {
         assert_eq!(parse(&[], None), Ok(Some(Args::default())));
-        assert_eq!(parse(&["--sample", "--control", "7070"], None), Ok(Some(Args { sample: true, control: Some(7070) })));
-        assert_eq!(parse(&[], Some("9000")), Ok(Some(Args { sample: false, control: Some(9000) })));
+        assert_eq!(
+            parse(&["--sample", "--control", "7070"], None),
+            Ok(Some(Args { sample: Some("parts".into()), control: Some(7070), files: vec![] }))
+        );
+        assert_eq!(parse(&[], Some("9000")), Ok(Some(Args { control: Some(9000), ..Default::default() })));
         assert_eq!(parse(&[], Some("nope")), Ok(Some(Args::default())));
         assert!(parse(&["--control"], None).is_err());
         assert!(parse(&["--control", "99999"], None).is_err());
         assert!(parse(&["--frobnicate"], None).is_err());
+        assert_eq!(parse(&["--sample", "impact"], None).map(|a| a.and_then(|a| a.sample)), Ok(Some("impact".into())));
+        let a = parse(&["--sample", "x.modelcraft"], None).unwrap().unwrap();
+        assert_eq!((a.sample.as_deref(), a.files), (Some("parts"), vec!["x.modelcraft".to_string()]));
+        assert_eq!(parse(&["a.modelcraft", "--sample"], None).map(|a| a.map(|a| a.files)), Ok(Some(vec!["a.modelcraft".to_string()])));
         assert_eq!(parse(&["--help"], None), Ok(None));
     }
 }

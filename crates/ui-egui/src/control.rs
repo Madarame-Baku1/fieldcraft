@@ -115,9 +115,37 @@ pub fn handle(app: &mut ModelApp, ctx: &egui::Context, req: &ControlRequest) -> 
             "model": {"nodes": app.session.model.nodes().len(), "elements": app.session.model.elements().len()},
             "results": app.session.results_report(),
             "probe": app.probe,
+            "busy": app.busy(),
+            "selected": app.selected.as_ref().map(|(k, n)| json!({"kind": k, "name": n})),
+            "nav": app.nav,
+            "layout": app.layout.iter().map(|(k, r)| (k.to_string(), json!([r.left(), r.top(), r.width(), r.height()]))).collect::<serde_json::Map<String, Value>>(),
+            "prompt": app.prompt.as_ref().map(|p| match p {
+                crate::files::Prompt::Unsaved(next) => json!({"unsaved": match next {
+                    crate::files::Replace::File(p) => p.clone(),
+                    crate::files::Replace::Sample(n) => format!("sample {n}"),
+                }}),
+                crate::files::Prompt::Recover => json!("recover"),
+                crate::files::Prompt::Samples => json!("samples"),
+            }),
+            "recent": app.recent.paths,
             "version": crate::VERSION,
         })),
         "ui.toolbar" => ok(crate::toolbar::describe(app)),
+        "ui.select" => {
+            // Select a definition as a browser click does (its properties show on the right).
+            let kind = p.get("kind").cloned().and_then(|k| serde_json::from_value::<crate::browser::Def>(k).ok());
+            match (kind, s("name")) {
+                (Some(kind), Some(name)) if crate::browser::definition(&app.session.model, kind, name).is_some() => {
+                    app.selected = Some((kind, name.to_string()));
+                    ok(Value::Null)
+                }
+                (Some(_), Some(name)) => err(format!("no such definition `{name}`")),
+                _ => {
+                    app.selected = None;
+                    ok(Value::Null)
+                }
+            }
+        }
         "ui.set" => {
             let mut cur = serde_json::to_value(&app.ui).unwrap_or(json!({}));
             if let (Some(o), Some(src)) = (cur.as_object_mut(), p.as_object()) {
@@ -129,7 +157,14 @@ pub fn handle(app: &mut ModelApp, ctx: &egui::Context, req: &ControlRequest) -> 
                 }
             }
             match serde_json::from_value::<UiState>(cur) {
-                Ok(u) => {
+                Ok(mut u) => {
+                    // The workspace and its tab stay together: a tab brings its workspace, a
+                    // workspace alone its first tab.
+                    if p.get("tab").is_some() {
+                        u.select_tab(u.tab);
+                    } else if p.get("workspace").is_some() {
+                        u.select_workspace(u.workspace);
+                    }
                     app.ui = u;
                     ok(json!(app.ui))
                 }
@@ -140,8 +175,7 @@ pub fn handle(app: &mut ModelApp, ctx: &egui::Context, req: &ControlRequest) -> 
             match s("view").unwrap_or("iso") {
                 "fit" => app.fit_view(),
                 "home" => {
-                    app.set_view(StandardView::Iso);
-                    app.fit_view();
+                    app.home_view();
                 }
                 v => match StandardView::parse(v) {
                     Some(sv) => app.set_view(sv),
@@ -152,7 +186,7 @@ pub fn handle(app: &mut ModelApp, ctx: &egui::Context, req: &ControlRequest) -> 
         }
         "ui.start" => {
             let Some(id) = s("command") else { return err("missing `command`") };
-            match app.start(id) {
+            match app.start_programmatic(id) {
                 Ok(()) => ok(json!({"dialog": app.dialog.as_ref().map(|d| d.command)})),
                 Err(e) => err(e),
             }
@@ -172,6 +206,42 @@ pub fn handle(app: &mut ModelApp, ctx: &egui::Context, req: &ControlRequest) -> 
                 return wrap(app.run_dialog());
             }
             ok(json!(app.dialog.as_ref().map(|d| json!({"command": d.command, "text": d.text, "error": d.error}))))
+        }
+        "ui.prompt" => {
+            let Some(prompt) = app.prompt.clone() else { return err("no prompt is open") };
+            match (prompt, s("answer")) {
+                (crate::files::Prompt::Unsaved(_), Some(a @ ("save" | "discard" | "cancel"))) => {
+                    let answer = match a {
+                        "save" => crate::files::Answer::Save,
+                        "discard" => crate::files::Answer::Discard,
+                        _ => crate::files::Answer::Cancel,
+                    };
+                    app.answer_unsaved(answer);
+                    ok(json!({"busy": app.busy()}))
+                }
+                (crate::files::Prompt::Samples, Some("open")) => match s("name") {
+                    Some(name) => {
+                        app.prompt = None;
+                        app.open_sample(name);
+                        ok(json!({"prompt": app.prompt.is_some()}))
+                    }
+                    None => err("missing `name` (a sample)"),
+                },
+                (crate::files::Prompt::Recover | crate::files::Prompt::Samples, Some("close" | "cancel")) => {
+                    app.prompt = None;
+                    ok(Value::Null)
+                }
+                (crate::files::Prompt::Recover, Some("recover")) => match s("id") {
+                    Some(id) => {
+                        app.recover(id);
+                        ok(json!({"busy": app.busy()}))
+                    }
+                    None => err("missing `id` (from file.recovery.list)"),
+                },
+                (_, a) => err(format!(
+                    "`answer` {a:?} does not answer this prompt (unsaved: save, discard, cancel; recover: recover with id, close; samples: open with name, close)"
+                )),
+            }
         }
         "ui.move" | "ui.click" => {
             let (Some(x), Some(y)) = (f("x"), f("y")) else { return err("missing x/y") };
@@ -242,6 +312,12 @@ pub fn handle(app: &mut ModelApp, ctx: &egui::Context, req: &ControlRequest) -> 
             let (Some(w), Some(h)) = (f("width"), f("height")) else { return err("missing width/height") };
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w.clamp(320.0, 8192.0) as f32, h.clamp(240.0, 8192.0) as f32)));
             ok(Value::Null)
+        }
+        "ui.fullscreen" => {
+            // Into or out of full screen (`on`, default true); the title bar follows next frame.
+            let on = p.get("on").and_then(Value::as_bool).unwrap_or(true);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(on));
+            ok(json!({"fullscreen": on}))
         }
         "ui.screenshot" => Outcome::Screenshot { path: s("path").map(str::to_string) },
         "ui.capture" => {
@@ -432,6 +508,9 @@ mod tests {
             "ui.render",
             "ui.capture",
             "ui.toolbar",
+            "ui.prompt",
+            "ui.select",
+            "ui.fullscreen",
         ] {
             for p in &hostile {
                 let _ = call(&mut app, method, p.clone());
@@ -451,6 +530,11 @@ mod tests {
         let soon = entries.iter().find(|e| e["id"] == "mesh.order.quadratic").unwrap();
         assert_eq!((soon["coming_soon"].as_str(), soon["command"].is_null()), (Some("M2"), true));
         assert_eq!(call(&mut app, "ui.set", json!({"tab": "nope"}))["ok"], false);
+        // A workspace brings its first tab; a tab brings its workspace.
+        let r = call(&mut app, "ui.set", json!({"workspace": "model"}));
+        assert_eq!((r["result"]["workspace"].as_str(), r["result"]["tab"].as_str()), (Some("model"), Some("properties")));
+        let r = call(&mut app, "ui.set", json!({"tab": "solve"}));
+        assert_eq!(r["result"]["workspace"], "analysis");
         let r = call(&mut app, "ui.start", json!({"command": "mesh.order.quadratic"}));
         assert_eq!((r["ok"].as_bool(), r["error"].as_str()), (Some(false), Some("Quadratic is coming soon (M2)")));
     }
