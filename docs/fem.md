@@ -101,3 +101,35 @@ of the family's degree; on a curved map, linear fields exact with zero Hessian, 
 physical Hessian of a quadratic interpolant consistent with finite differences of its physical
 gradient. The solver and explicit migration to `DofLayout` was checked bit for bit: every
 result of the solver, explicit, engine and io test suites hashes identically before and after.
+
+## Heat transfer and thermal strain
+
+A heat conduction element carries one temperature per node (`heat::HEAT_DOFS`, kind `T`);
+`heat::Conduction` gives the conductivity ∫ ∇Nᵀ k ∇N dV (full rule), the capacity ∫ ρc N Nᵀ dV
+and a source ∫ N Q dV (mass rule), and the heat flux −k∇T at the integration points;
+`heat::face_weights` and `face_film` integrate surface flux and convection on tri3/tri6/quad4/quad8
+faces. The solver (`modelcraft_solver::heat`) numbers the temperatures with
+`DofLayout::uniform(…, DofSet::TEMPERATURE)` and assembles with the same `sparse::add_block`.
+
+Thermal strain ε_th = α (T − T_ref) along the material axes enters a solid as the load
+`Solid::thermal_load(d, &ThermalStrain { alpha, delta })` = ∫ Bᵀ D ε_th dV and its stress as
+`Solid::stresses_with(d, u, Some(&thermal))` = D (ε − ε_th); `delta` is the nodal T − T_ref.
+2D elements have the same pair (`Plane::thermal_load`, `Plane::stresses_with`): plane stress
+leaves εzz free (σzz = 0), plane strain holds it (σzz = −D₃·ε_th), axisymmetric elements strain
+the hoop direction too. Trusses (rod2, rod3) take the axial part Σ αₖ tₖ² ΔT along their tangent (`Truss::thermal_load`,
+`Truss::stresses_with`). Shells and beams will provide the same two functions for their strains;
+springs, dashpots and point masses have no thermal strain.
+
+Explicit dynamics takes a step's temperature loads as a thermal strain rate per element,
+α ΔT / end time (the change reached linearly over the step, like a prescribed displacement, so
+there is no thermal shock), subtracted from each increment's strain increment before the
+constitutive update, so it feeds J2 and Johnson–Cook plasticity alike; isotropic expansion only
+(the rate is the same in any frame). Explicit trusses take no thermal strain yet (a warning
+says so).
+
+Model side: `Material::thermal` (`conductivity`, `specific_heat`, `expansion`, each isotropic
+or per axis, and `reference_temperature`), `BoundaryCondition::Temperature`, loads
+`SurfaceFlux`, `Convection`, `HeatSource` (heat transfer) and `Temperature` (a temperature field
+in a static step), procedures `HeatTransfer { transient }` and `CoupledTemperatureDisplacement`.
+Commands: `solve.heat`, and `solve.static` for coupled steps. The deck writers refuse heat
+transfer by name for now.
