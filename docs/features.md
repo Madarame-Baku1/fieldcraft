@@ -6,7 +6,7 @@ Every entry is a toolbar button. **Ready** entries run their command; **coming s
 shown greyed with the roadmap milestone that brings them (ROADMAP.md). Scripts, the command line,
 the control channel and AI agents over MCP (docs/mcp.md) run the same commands.
 
-52 ready, 51 coming soon.
+54 ready, 49 coming soon.
 
 ## Geometry
 
@@ -33,8 +33,8 @@ the control channel and AI agents over MCP (docs/mcp.md) run the same commands.
 | Tet | Delaunay Points — Delaunay tetrahedralization of a point list (debugging aid) | ready | `mesh.delaunay.points` |
 | 2D | 2D Mesh — Quad or triangle mesh of a planar face or polygon in the XY plane for plane stress, plane strain and axisymmetric models; edges tagged | ready | `mesh.planar` |
 | Structured Hex | Quad Faces — All-quad meshes of faces on shared edge nodes | coming soon (M5) |  |
-| Structured Hex | Mapped Hex — Mapped hex mesh of six-sided regions | coming soon (M5) |  |
-| Structured Hex | Sweep Hex — Hex mesh swept along extrusions and revolutions | coming soon (M5) |  |
+| Structured Hex | Mapped Hex — Mapped hex mesh of a six-sided block (curved faces allowed) | ready | `mesh.hex.mapped`, `mesh.hex.generate` |
+| Structured Hex | Sweep Hex — Hex mesh swept along extrusions (several levels), around revolutions, or from a source face to a target | ready | `mesh.hex.sweep`, `mesh.hex.generate` |
 | Structured Hex | Decompose — Find sweepable and mappable regions and propose the splits | coming soon (M5) |  |
 | Structured Hex | Transition — Conforming tet–hex interfaces with pyramids | coming soon (M5) |  |
 | Automatic Hex | All-Hex — Octree dual all-hex mesh of any part | coming soon (M6) |  |
