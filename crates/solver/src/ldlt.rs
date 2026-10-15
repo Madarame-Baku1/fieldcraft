@@ -60,12 +60,12 @@
 
 use serde::Serialize;
 
+use crate::Result;
 use crate::cholesky::{
-    Context, Factor, FactorError, PANEL, PIVOT_TOLERANCE, Panel, Pivot, Structure, Supernode, Symbolic, UpperColumns, offset, products, subtract,
-    times_d,
+    Context, Factor, FactorError, PANEL, PIVOT_TOLERANCE, Panel, Pivot, Structure, Supernode, Symbolic, UpperColumns, offset, products,
+    solve_supernodes, subtract, times_d,
 };
 use crate::sparse::Csr;
-use crate::{Error, Result};
 
 /// (1 + √17)/8: the growth bound of Bunch and Kaufman.
 const ALPHA: f64 = 0.640_388_203_202_207_6;
@@ -94,11 +94,17 @@ struct Block {
 }
 
 impl Supernode for Block {
+    #[inline]
     fn values(&self) -> &[f64] {
         &self.values
     }
+    #[inline]
     fn pivots(&self) -> Option<&[Pivot]> {
         Some(&self.pivots)
+    }
+    #[inline]
+    fn order(&self) -> Option<&[usize]> {
+        Some(&self.order)
     }
 }
 
@@ -410,94 +416,7 @@ impl LdltFactor {
 
     /// Solve A x = b in place.
     pub fn solve(&self, b: &mut [f64]) -> Result<()> {
-        if b.len() != self.n {
-            return Err(Error::Internal("right-hand side length".into()));
-        }
-        let mut x: Vec<f64> = self.perm.iter().map(|&j| b.get(j).copied().unwrap_or(0.0)).collect();
-        let s = &self.structure;
-        let get = |v: &[f64], i: usize| v.get(i).copied().unwrap_or(0.0);
-        let mut y = Vec::new();
-        // L z = P b, then D⁻¹, by supernodes; the supernode's own unknowns are left in pivot
-        // order for the backward pass.
-        for (k, blk) in self.blocks.iter().enumerate() {
-            let rows = s.rows(k);
-            let (m, f, w) = (rows.len(), s.cols(k).start, s.cols(k).len());
-            let t = Panel { m, data: &blk.values };
-            y.clear();
-            y.extend(blk.order.iter().map(|c| get(&x, f + c)));
-            let mut c = 0;
-            while c < w {
-                let width = if blk.pivots.get(c) == Some(&Pivot::First) { 2 } else { 1 };
-                for q in c..c + width {
-                    let yq = get(&y, q);
-                    for (r, l) in (c + width..m).zip(t.column(q, c + width, m - c - width)) {
-                        let target = if r < w { y.get_mut(r) } else { rows.get(r).and_then(|g| x.get_mut(*g)) };
-                        if let Some(v) = target {
-                            *v -= l * yq;
-                        }
-                    }
-                }
-                c += width;
-            }
-            let mut c = 0;
-            while c < w {
-                if blk.pivots.get(c) == Some(&Pivot::First) {
-                    let (d11, d21, d22) = (t.at(c, c), t.at(c + 1, c), t.at(c + 1, c + 1));
-                    let det = d11 * d22 - d21 * d21;
-                    let (p, q) = (get(&y, c), get(&y, c + 1));
-                    if let Some(v) = y.get_mut(c) {
-                        *v = (d22 * p - d21 * q) / det;
-                    }
-                    if let Some(v) = y.get_mut(c + 1) {
-                        *v = (d11 * q - d21 * p) / det;
-                    }
-                    c += 2;
-                } else {
-                    if let Some(v) = y.get_mut(c) {
-                        *v /= t.at(c, c);
-                    }
-                    c += 1;
-                }
-            }
-            if let Some(dst) = x.get_mut(f..f + w) {
-                dst.copy_from_slice(&y);
-            }
-        }
-        // Lᵀ x = z, supernodes in reverse; each scatters its unknowns back from pivot order.
-        for (k, blk) in self.blocks.iter().enumerate().rev() {
-            let rows = s.rows(k);
-            let (m, f, w) = (rows.len(), s.cols(k).start, s.cols(k).len());
-            let t = Panel { m, data: &blk.values };
-            y.clear();
-            y.extend(x.get(f..f + w).unwrap_or_default());
-            let mut c = w;
-            while c > 0 {
-                let width = if c >= 2 && blk.pivots.get(c - 1) == Some(&Pivot::Second) { 2 } else { 1 };
-                let first = c - width;
-                for q in first..c {
-                    let mut sum = get(&y, q);
-                    for (r, l) in (c..m).zip(t.column(q, c, m - c)) {
-                        let v = if r < w { get(&y, r) } else { rows.get(r).map_or(0.0, |g| get(&x, *g)) };
-                        sum -= l * v;
-                    }
-                    if let Some(v) = y.get_mut(q) {
-                        *v = sum;
-                    }
-                }
-                c = first;
-            }
-            for (pos, c) in blk.order.iter().enumerate() {
-                if let Some(v) = x.get_mut(f + c) {
-                    *v = get(&y, pos);
-                }
-            }
-        }
-        for (&j, v) in self.perm.iter().zip(&x) {
-            if let Some(t) = b.get_mut(j) {
-                *t = *v;
-            }
-        }
-        Ok(())
+        solve_supernodes(self.n, &self.perm, &self.structure, &self.blocks, b)
     }
 }
 
@@ -606,6 +525,7 @@ impl Symmetric {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Error;
     use fieldcraft_parallel as parallel;
 
     fn csr(rows: &[Vec<(usize, f64)>]) -> Csr {
@@ -788,6 +708,79 @@ mod tests {
         }
         let err = residual(&a, &|b: &mut [f64]| one.solve(b).unwrap(), 0.1);
         assert!(err < 1e-9, "{err}");
+    }
+
+    #[test]
+    fn solve_across_pivoted_supernodes_and_rhs_errors() {
+        // Two dense blocks sharing a separator; interleaving their columns forces a global
+        // postorder, while the first block needs a local interchange and a 2 × 2 pivot.
+        let mut rows = vec![Vec::new(); 7];
+        for (i, row) in [[0.0, 0.1, 3.0], [0.1, 5.0, 0.2], [3.0, 0.2, 0.5]].iter().enumerate() {
+            rows[i].extend(row.iter().enumerate().map(|(j, v)| (j, *v)));
+        }
+        for i in 3..6 {
+            rows[i].extend((3..6).map(|j| (j, if i == j { 4.0 } else { 0.25 })));
+        }
+        for i in 0..6 {
+            rows[i].push((6, 0.15));
+            rows[6].push((i, 0.15));
+        }
+        rows[6].push((6, 8.0));
+        let order = [3, 0, 4, 1, 5, 2, 6];
+        let inverse: Vec<_> = (0..7).map(|i| order.iter().position(|&j| j == i).unwrap()).collect();
+        let mixed = csr(&order.iter().map(|&i| rows[i].iter().map(|&(j, v)| (inverse[j], v)).collect()).collect::<Vec<_>>());
+        let f = LdltFactor::new(&UpperColumns::from_symmetric(&mixed), usize::MAX).unwrap();
+        assert!(f.perm.iter().enumerate().any(|(i, &j)| i != j));
+        assert!(f.blocks.len() > 1);
+        assert!(f.blocks.iter().enumerate().any(|(k, b)| {
+            b.pivots.contains(&Pivot::One)
+                && b.pivots.contains(&Pivot::First)
+                && b.order.iter().enumerate().any(|(i, &j)| i != j)
+                && f.structure.rows(k).len() > b.order.len()
+        }));
+        let cases = [
+            csr(&[]),
+            csr(&[vec![(0, 4.0)]]),
+            csr(&[vec![(0, -4.0)]]),
+            mixed,
+            shifted_grid([4, 3, 3], -0.5).0,
+            shifted_grid([4, 3, 3], 2.7).0,
+            shifted_grid([4, 3, 3], 7.1).0,
+        ];
+        for (case, a) in cases.iter().enumerate() {
+            let upper = UpperColumns::from_symmetric(a);
+            let ldlt = LdltFactor::new(&upper, usize::MAX).unwrap();
+            let chol = Factor::new(&upper, usize::MAX).ok();
+            for seed in [0.0, 0.5, 3.25] {
+                let expected: Vec<_> = (0..a.n).map(|i| ((i as f64 + seed) * 0.37).sin()).collect();
+                let mut rhs = vec![0.0; a.n];
+                a.mul(&expected, &mut rhs);
+                let mut actual = rhs.clone();
+                ldlt.solve(&mut actual).unwrap();
+                assert!(actual.iter().zip(&expected).all(|(x, y)| (x - y).abs() < 1e-10), "case {case}");
+                let mut repeated = rhs.clone();
+                ldlt.solve(&mut repeated).unwrap();
+                assert!(actual.iter().zip(&repeated).all(|(x, y)| x.to_bits() == y.to_bits()));
+                if let Some(chol) = &chol {
+                    let mut actual = rhs;
+                    chol.solve(&mut actual).unwrap();
+                    assert!(actual.iter().zip(&expected).all(|(x, y)| (x - y).abs() < 1e-10), "case {case}");
+                }
+            }
+            for len in [a.n + 1, a.n.saturating_sub(1)] {
+                if len == a.n {
+                    continue;
+                }
+                let before = vec![0.25; len];
+                let mut rhs = before.clone();
+                assert!(matches!(ldlt.solve(&mut rhs), Err(Error::Internal(_))));
+                assert_eq!(rhs, before);
+                if let Some(chol) = &chol {
+                    assert!(matches!(chol.solve(&mut rhs), Err(Error::Internal(_))));
+                    assert_eq!(rhs, before);
+                }
+            }
+        }
     }
 
     #[test]

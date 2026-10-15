@@ -531,15 +531,142 @@ pub(crate) trait Supernode: Send + Sync {
     fn values(&self) -> &[f64];
     /// The pivots of D (symmetric indefinite factors), `None` for Cholesky.
     fn pivots(&self) -> Option<&[Pivot]>;
+    /// Local pivot position to symbolic column within this supernode; identity for Cholesky.
+    #[inline]
+    fn order(&self) -> Option<&[usize]> {
+        None
+    }
 }
 
 impl Supernode for Vec<f64> {
+    #[inline]
     fn values(&self) -> &[f64] {
         self
     }
+    #[inline]
     fn pivots(&self) -> Option<&[Pivot]> {
         None
     }
+}
+
+/// Shared triangular solve, with Cholesky's diagonal or LDLᵀ's unit L and block diagonal D.
+pub(crate) fn solve_supernodes<T: Supernode>(n: usize, perm: &[usize], s: &Structure, blocks: &[T], b: &mut [f64]) -> Result<()> {
+    if b.len() != n {
+        return Err(Error::Internal("right-hand side length".into()));
+    }
+    let mut x: Vec<f64> = perm.iter().map(|&j| b.get(j).copied().unwrap_or(0.0)).collect();
+    let get = |v: &[f64], i: usize| v.get(i).copied().unwrap_or(0.0);
+    let mut scratch = Vec::new();
+    // L z = P b, then D⁻¹, by supernodes; the supernode's own unknowns are left in pivot
+    // order for the backward pass.
+    for (k, blk) in blocks.iter().enumerate() {
+        let rows = s.rows(k);
+        let (m, f, w) = (rows.len(), s.cols(k).start, s.cols(k).len());
+        let t = Panel { m, data: blk.values() };
+        let (own, tail) = x.get_mut(f..).and_then(|v| v.split_at_mut_checked(w)).ok_or_else(|| Error::Internal("solve supernode range".into()))?;
+        let pivots = blk.pivots();
+        let order = blk.order();
+        scratch.clear();
+        let y = if let Some(order) = order {
+            scratch.extend(order.iter().map(|&c| get(own, c)));
+            scratch.as_mut_slice()
+        } else {
+            &mut *own
+        };
+        for q in 0..w {
+            let end = q + if pivots.and_then(|p| p.get(q)) == Some(&Pivot::First) { 2 } else { 1 };
+            let mut yq = get(y, q);
+            if pivots.is_none() {
+                yq /= t.data.get(offset(m, q)).copied().unwrap_or(1.0);
+                if let Some(v) = y.get_mut(q) {
+                    *v = yq;
+                }
+            }
+            for (v, l) in y.get_mut(end..w).unwrap_or_default().iter_mut().zip(t.column(q, end, w - end)) {
+                *v -= l * yq;
+            }
+            for (&r, l) in rows.get(w..).unwrap_or_default().iter().zip(t.column(q, w, m - w)) {
+                if let Some(v) = tail.get_mut(r.wrapping_sub(f + w)) {
+                    *v -= l * yq;
+                }
+            }
+        }
+        if pivots.is_some() {
+            let mut c = 0;
+            while c < w {
+                if pivots.and_then(|p| p.get(c)) == Some(&Pivot::First) {
+                    let (d11, d21, d22) = (t.at(c, c), t.at(c + 1, c), t.at(c + 1, c + 1));
+                    let det = d11 * d22 - d21 * d21;
+                    let (p, q) = (get(y, c), get(y, c + 1));
+                    if let Some(v) = y.get_mut(c) {
+                        *v = (d22 * p - d21 * q) / det;
+                    }
+                    if let Some(v) = y.get_mut(c + 1) {
+                        *v = (d11 * q - d21 * p) / det;
+                    }
+                    c += 2;
+                } else {
+                    if let Some(v) = y.get_mut(c) {
+                        *v /= t.at(c, c);
+                    }
+                    c += 1;
+                }
+            }
+        }
+        if order.is_some() {
+            own.copy_from_slice(&scratch);
+        }
+    }
+    // Lᵀ x = z, supernodes in reverse; each scatters its unknowns back from pivot order.
+    for (k, blk) in blocks.iter().enumerate().rev() {
+        let rows = s.rows(k);
+        let (m, f, w) = (rows.len(), s.cols(k).start, s.cols(k).len());
+        let t = Panel { m, data: blk.values() };
+        let (own, tail) = x.get_mut(f..).and_then(|v| v.split_at_mut_checked(w)).ok_or_else(|| Error::Internal("solve supernode range".into()))?;
+        let pivots = blk.pivots();
+        let order = blk.order();
+        scratch.clear();
+        let y = if order.is_some() {
+            scratch.extend_from_slice(own);
+            scratch.as_mut_slice()
+        } else {
+            &mut *own
+        };
+        for c in (0..w).rev() {
+            // Reverse pivot groups, keeping ascending columns within each 2 × 2 group.
+            let (q, end) = match pivots.and_then(|p| p.get(c)) {
+                Some(Pivot::Second) if c > 0 => (c - 1, c + 1),
+                Some(Pivot::First) => (c + 1, c + 2),
+                _ => (c, c + 1),
+            };
+            let mut sum = get(y, q);
+            for (v, l) in y.get(end..w).unwrap_or_default().iter().zip(t.column(q, end, w - end)) {
+                sum -= l * v;
+            }
+            for (&r, l) in rows.get(w..).unwrap_or_default().iter().zip(t.column(q, w, m - w)) {
+                sum -= l * get(tail, r.wrapping_sub(f + w));
+            }
+            if pivots.is_none() {
+                sum /= t.data.get(offset(m, q)).copied().unwrap_or(1.0);
+            }
+            if let Some(v) = y.get_mut(q) {
+                *v = sum;
+            }
+        }
+        if let Some(order) = order {
+            for (pos, &c) in order.iter().enumerate() {
+                if let Some(v) = own.get_mut(c) {
+                    *v = get(&scratch, pos);
+                }
+            }
+        }
+    }
+    for (&j, v) in perm.iter().zip(&x) {
+        if let Some(t) = b.get_mut(j) {
+            *t = *v;
+        }
+    }
+    Ok(())
 }
 
 fn internal(what: &str) -> FactorError {
@@ -981,49 +1108,7 @@ impl Factor {
 
     /// Solve A x = b in place.
     pub fn solve(&self, b: &mut [f64]) -> Result<()> {
-        if b.len() != self.n {
-            return Err(Error::Internal("right-hand side length".into()));
-        }
-        let mut x: Vec<f64> = self.perm.iter().map(|&j| b.get(j).copied().unwrap_or(0.0)).collect();
-        let s = &self.structure;
-        // L y = b, by columns.
-        for (k, l) in self.values.iter().enumerate() {
-            let rows = s.rows(k);
-            let m = rows.len();
-            for (c, j) in s.cols(k).enumerate() {
-                let start = offset(m, c);
-                let yj = x.get(j).copied().unwrap_or(0.0) / l.get(start).copied().unwrap_or(1.0);
-                if let Some(v) = x.get_mut(j) {
-                    *v = yj;
-                }
-                for (r, v) in rows.get(c + 1..).unwrap_or_default().iter().zip(l.get(start + 1..).unwrap_or_default()) {
-                    if let Some(t) = x.get_mut(*r) {
-                        *t -= v * yj;
-                    }
-                }
-            }
-        }
-        // Lᵀ x = y.
-        for (k, l) in self.values.iter().enumerate().rev() {
-            let rows = s.rows(k);
-            let m = rows.len();
-            for (c, j) in s.cols(k).enumerate().rev() {
-                let start = offset(m, c);
-                let mut sum = x.get(j).copied().unwrap_or(0.0);
-                for (r, v) in rows.get(c + 1..).unwrap_or_default().iter().zip(l.get(start + 1..).unwrap_or_default()) {
-                    sum -= v * x.get(*r).copied().unwrap_or(0.0);
-                }
-                if let Some(t) = x.get_mut(j) {
-                    *t = sum / l.get(start).copied().unwrap_or(1.0);
-                }
-            }
-        }
-        for (&j, v) in self.perm.iter().zip(&x) {
-            if let Some(t) = b.get_mut(j) {
-                *t = *v;
-            }
-        }
-        Ok(())
+        solve_supernodes(self.n, &self.perm, &self.structure, &self.values, b)
     }
 }
 
