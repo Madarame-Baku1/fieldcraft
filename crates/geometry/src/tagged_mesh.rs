@@ -58,8 +58,8 @@ fn bad<T>(msg: impl std::fmt::Display) -> Result<T> {
 
 fn read_part(zip: &mut zip::ZipArchive<Cursor<&[u8]>>, name: &str) -> Result<Option<Vec<u8>>> {
     let want = name.trim_start_matches('/').to_ascii_lowercase();
-    let Some(idx) =
-        (0..zip.len()).find(|i| zip.name_for_index(*i).is_some_and(|n| n.replace('\\', "/").trim_start_matches('/').to_ascii_lowercase() == want))
+    let Some(idx) = (0..zip.len())
+        .find(|i| zip.name_for_index(*i).is_some_and(|n| n.is_ok_and(|n| n.replace('\\', "/").trim_start_matches('/').to_ascii_lowercase() == want)))
     else {
         return Ok(None);
     };
@@ -446,7 +446,7 @@ mod tests {
         for (name, data) in [("[Content_Types].xml", types), ("_rels/.rels", rels), ("3D/3dmodel.model", x.as_str())] {
             let o = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated)
-                .last_modified_time(Some(zip::DateTime::default()));
+                .last_modified_time(zip::DateTime::default());
             zip.start_file(name, o).unwrap();
             zip.write_all(data.as_bytes()).unwrap();
         }
