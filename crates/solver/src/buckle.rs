@@ -33,7 +33,7 @@ use serde::Serialize;
 
 use crate::analysis::{
     BLOCK, FrequencyResult, Mode, Setup, Stats, TOLERANCE, assemble, budget, factor_error, factor_symmetric, lanczos_basis, pattern, reduction,
-    solve_static, split,
+    split, static_on,
 };
 use crate::eigen::{Operator, Wanted, lanczos};
 use crate::ldlt::{Kind, Symmetric};
@@ -130,16 +130,12 @@ pub fn solve_buckle(model: &Model, step: Option<&str>, limits: &Limits) -> Resul
         )));
     }
     // The preload: the step solved as a linear static step.
-    let mut preload_model = model.clone();
-    let mut preload_step = step.clone();
-    preload_step.procedure = Procedure::Static {};
-    preload_model.replace_step(preload_step)?;
-    let preload = solve_static(&preload_model, Some(&step.name), limits)?;
+    let setup = Setup { model, resolved: &resolved, mesh: &mesh, step };
+    let preload = static_on(&setup, limits)?;
     let mut warnings: Vec<String> = preload.warnings.clone();
     let stresses: BTreeMap<u32, Vec<[f64; 6]>> = preload.elements.iter().map(|e| (e.label, e.points.iter().map(|p| p.stress).collect())).collect();
 
     let (graph, order) = pattern(&mesh);
-    let setup = Setup { model, resolved: &resolved, mesh: &mesh, step };
     let red = reduction(&setup, false, &order, budget(limits, &mesh, &graph, 2), &mut Vec::new())?;
     let neq = red.neq();
     if neq == 0 {

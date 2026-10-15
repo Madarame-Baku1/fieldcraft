@@ -375,35 +375,41 @@ pub fn solve_static(model: &Model, step: Option<&str>, limits: &Limits) -> Resul
     )?;
     crate::system::refuse_contact(model, "linear static")?;
     let mesh = Mesh::new(model, &resolved, limits.max_dofs)?;
+    static_on(&Setup { model, resolved: &resolved, mesh: &mesh, step }, limits)
+}
+
+/// Static equilibrium on an already validated step and mesh, also used for a buckling preload.
+pub(crate) fn static_on(setup: &Setup<'_>, limits: &Limits) -> Result<StaticResult> {
+    fieldcraft_model::progress::check()?;
+    let (model, resolved, mesh, step) = (setup.model, setup.resolved, setup.mesh, setup.step);
     let mut warnings: Vec<String> = resolved.warnings.iter().map(ToString::to_string).chain(mesh.warnings.iter().cloned()).collect();
     warnings.extend(inelastic_warnings(model));
     // The temperature field: the coupled step's own heat solution, or the step's temperature
     // loads.
     let (field, temperature) = match step.procedure {
         Procedure::CoupledTemperatureDisplacement {} => {
-            let field = crate::heat::temperatures_at(model, &resolved, step, limits, &mesh.labels)?;
+            let field = crate::heat::temperatures_at(model, resolved, step, limits, &mesh.labels)?;
             let temperature = field.iter().map(|t| t.unwrap_or(0.0)).collect();
             (Some(field), Some(temperature))
         }
-        _ => (temperature_loads(model, &resolved, &mesh, step)?, None),
+        _ => (temperature_loads(model, resolved, mesh, step)?, None),
     };
     if field.is_some() && !mesh.structural.is_empty() {
         warnings.push("shells and beams take no thermal strain yet; the temperatures strain the solid, 2D and truss elements only".into());
     }
-    let (graph, order) = pattern(&mesh);
-    ignored_dashpots(&mesh, &mut warnings);
-    let setup = Setup { model, resolved: &resolved, mesh: &mesh, step };
-    let red = reduction(&setup, true, &order, budget(limits, &mesh, &graph, 1), &mut warnings)?;
-    let mut f = loads(model, &resolved, &mesh, step, &red.active)?;
+    let (graph, order) = pattern(mesh);
+    ignored_dashpots(mesh, &mut warnings);
+    let red = reduction(setup, true, &order, budget(limits, mesh, &graph, 1), &mut warnings)?;
+    let mut f = loads(model, resolved, mesh, step, &red.active)?;
     if let Some(field) = &field {
-        add_thermal_loads(&mut f, &mesh, field)?;
+        add_thermal_loads(&mut f, mesh, field)?;
     }
-    let k = assemble(&mesh, &graph, None)?.k;
+    let k = assemble(mesh, &graph, None)?.k;
     if red.neq() == 0 {
         return Err(Error::Invalid("every degree of freedom is prescribed; there is nothing to solve".into()));
     }
     let [kff] = red.reduce([&k])?;
-    let chol = factor_raw(&kff, limits).map_err(|e| factor_error(e, &mesh, &red))?;
+    let chol = factor_raw(&kff, limits).map_err(|e| factor_error(e, mesh, &red))?;
     drop(kff);
     let mut q = red.rhs(&f, &k);
     chol.solve(&mut q)?;
@@ -411,9 +417,9 @@ pub fn solve_static(model: &Model, step: Option<&str>, limits: &Limits) -> Resul
     if u.iter().any(|x| !x.is_finite()) {
         return Err(Error::Singular("the solution is not finite; the model is ill-conditioned".into()));
     }
-    let (displacement, rotation, point_motion) = split(&u, &mesh);
+    let (displacement, rotation, point_motion) = split(&u, mesh);
     let reactions = red.reactions(&k, &u, &f);
-    let (reaction, reaction_moment, point_reaction) = split(&reactions, &mesh);
+    let (reaction, reaction_moment, point_reaction) = split(&reactions, mesh);
     let (mut applied_total, mut reaction_total) = ([0.0; 3], [0.0; 3]);
     for (dof, (fv, rv)) in f.iter().zip(&reactions).enumerate() {
         let Some(d) = mesh.kind(dof).and_then(DofKind::direction) else { continue };
@@ -483,7 +489,7 @@ pub fn solve_static(model: &Model, step: Option<&str>, limits: &Limits) -> Resul
     }
     elements.sort_by_key(|e| e.label);
     let (mut shells, mut beams) = (Vec::new(), Vec::new());
-    let per_volume = structural_body_forces(model, &resolved, &mesh, step)?;
+    let per_volume = structural_body_forces(model, resolved, mesh, step)?;
     for (s, body) in mesh.structural.iter().zip(&per_volume) {
         let at = |err| Error::element(s.label, err);
         let dofs = mesh
@@ -510,7 +516,7 @@ pub fn solve_static(model: &Model, step: Option<&str>, limits: &Limits) -> Resul
     let stress: Vec<[f64; 6]> = sum.iter().zip(&count).map(|(s, c)| s.map(|v| if *c > 0 { v / f64::from(*c) } else { 0.0 })).collect();
     let von_mises = stress.iter().map(von_mises).collect();
     let scale = crate::system::balance_scale(&applied_total, &reaction_total, &reaction);
-    let ground = mesh.discrete.ground_force(&u, &mesh);
+    let ground = mesh.discrete.ground_force(&u, mesh);
     let imbalance = (0..3).map(|c| (applied_total[c] + reaction_total[c] + ground[c]).abs()).fold(0.0, f64::max);
     if scale > 0.0 && imbalance > 1e-6 * scale {
         warnings.push(format!("loads and reactions differ by {imbalance:.3e} (relative {:.1e})", imbalance / scale));
@@ -735,6 +741,7 @@ impl StepResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fieldcraft_model::{BoundaryCondition, Directional, Elastic, Formulation, Load, Material, Section, SectionKind, Set, Target, Thermal};
 
     #[test]
     fn raised_factor_budget_keeps_the_lanczos_vector_limit() {
@@ -746,5 +753,110 @@ mod tests {
             assert!(2 * neq * vectors <= entries);
             assert_eq!(lanczos_basis(&Limits { max_lanczos_vectors: 7, ..limits }, neq), 7);
         }
+    }
+
+    fn block() -> Model {
+        let mut model = Model::default();
+        let xyz = [[0., 0., 0.], [1., 0., 0.], [1., 1., 0.], [0., 1., 0.], [0., 0., 1.], [1., 0., 1.], [1., 1., 1.], [0., 1., 1.]];
+        for (label, point) in (1..).zip(xyz) {
+            model.set_node(label, point).unwrap();
+        }
+        model.set_element(1, ElementKind::Hex8, (1..=8).collect()).unwrap();
+        model.add_set("all", Set { elements: vec![1], ..Set::default() }).unwrap();
+        model.add_set("base", Set { nodes: vec![1, 2, 3, 4], ..Set::default() }).unwrap();
+        model.add_set("top", Set { nodes: vec![5, 6, 7, 8], ..Set::default() }).unwrap();
+        model.add_material("Mat", Material { elastic: Some(Elastic::Isotropic { young: 1000.0, poisson: 0.3 }), ..Material::default() }).unwrap();
+        model
+            .add_section(
+                "solid",
+                Section { set: "all".into(), material: "Mat".into(), kind: SectionKind::Solid {}, formulation: Formulation::default() },
+            )
+            .unwrap();
+        model.add_boundary_condition("fixed", BoundaryCondition::Fixed { target: Target::Set("base".into()) }).unwrap();
+        model
+            .add_load("force", Load::Force { target: Target::Set("top".into()), vector: [0.0, 0.0, -1.0], distribution: Default::default() })
+            .unwrap();
+        let mut step = Step::new("Buckle", Procedure::Buckle { modes: 1, shift: None });
+        step.boundary_conditions.insert("fixed".into());
+        step.loads.insert("force".into());
+        model.add_step(step, None).unwrap();
+        model
+    }
+
+    fn preload(model: &Model, limits: &Limits) -> Result<StaticResult> {
+        let resolved = model.resolve()?;
+        let step = model.select_step(Some("Buckle"), |p| matches!(p, Procedure::Buckle { .. }), "buckling")?;
+        let mesh = Mesh::new(model, &resolved, limits.max_dofs)?;
+        static_on(&Setup { model, resolved: &resolved, mesh: &mesh, step }, limits)
+    }
+
+    fn static_reference(model: &Model) -> StaticResult {
+        let mut model = model.clone();
+        let mut step = model.steps()[0].clone();
+        step.procedure = Procedure::Static {};
+        model.replace_step(step).unwrap();
+        solve_static(&model, Some("Buckle"), &Limits::default()).unwrap()
+    }
+
+    #[test]
+    fn buckling_preloads_match_static_with_loads_motion_and_temperature() {
+        for case in 0..3 {
+            let mut model = block();
+            if case == 1 {
+                model
+                    .add_boundary_condition(
+                        "motion",
+                        BoundaryCondition::Displacement { target: Target::Set("top".into()), values: [None, None, Some(-0.01), None, None, None] },
+                    )
+                    .unwrap();
+                model.set_boundary_condition_active("Buckle", "motion", true).unwrap();
+            }
+            if case == 2 {
+                let mut material = model.material("Mat").unwrap().clone();
+                material.thermal = Some(Thermal { expansion: Some(Directional::Isotropic(1e-5)), ..Thermal::default() });
+                model.replace_material("Mat", material).unwrap();
+                model.add_load("warm", Load::Temperature { target: Target::Set("top".into()), value: 40.0 }).unwrap();
+                model.set_load_active("Buckle", "warm", true).unwrap();
+            }
+            let before = model.clone();
+            let expected = static_reference(&model);
+            for threads in [1, 3] {
+                let actual = parallel::with_threads(threads, || preload(&model, &Limits::default())).unwrap();
+                assert_eq!(actual, expected, "case {case}, threads {threads}");
+            }
+            assert_eq!(model, before);
+            assert!(solve_static(&model, Some("Buckle"), &Limits::default()).is_err());
+        }
+    }
+
+    #[test]
+    fn buckling_preload_keeps_original_step_diagnostics() {
+        let mut model = block();
+        model.add_load("heater", Load::HeatSource { set: "all".into(), power: 2.0 }).unwrap();
+        model.set_load_active("Buckle", "heater", true).unwrap();
+        let before = model.clone();
+        let result = crate::solve_buckle(&model, Some("Buckle"), &Limits::default()).unwrap();
+        assert!(result.warnings.iter().any(|w| w.contains("heat load `heater` has no effect in a buckle step")), "{:?}", result.warnings);
+        assert!(!result.warnings.iter().any(|w| w.contains("in a static step")), "{:?}", result.warnings);
+        assert_eq!(model, before);
+    }
+
+    #[test]
+    fn buckling_preload_keeps_limits_and_cancellation() {
+        let model = block();
+        let before = model.clone();
+        for limits in [Limits { max_dofs: 3, ..Limits::default() }, Limits { max_factor_entries: 1, ..Limits::default() }] {
+            assert!(matches!(preload(&model, &limits), Err(Error::Limit(_))));
+            assert!(matches!(crate::solve_buckle(&model, Some("Buckle"), &limits), Err(Error::Limit(_))));
+        }
+        let progress = fieldcraft_model::progress::Progress::new();
+        progress.cancel();
+        fieldcraft_model::progress::scoped(Some(progress), || {
+            for limits in [Limits::default(), Limits { max_factor_entries: 1, ..Limits::default() }] {
+                assert!(matches!(preload(&model, &limits), Err(Error::Model(fieldcraft_model::Error::Cancelled))));
+                assert!(matches!(crate::solve_buckle(&model, Some("Buckle"), &limits), Err(Error::Model(fieldcraft_model::Error::Cancelled))));
+            }
+        });
+        assert_eq!(model, before);
     }
 }
