@@ -368,16 +368,17 @@ fn coupling_errors_name_the_problem() {
 /// budget stops while counting, before allocating.
 #[test]
 fn oversized_reductions_are_refused_before_allocating() {
-    let mut g = grid([83, 83, 1], ElementKind::Hex8, |q| [83.0 * q[0], 83.0 * q[1], q[2]]);
+    let mut g = grid([110, 110, 1], ElementKind::Hex8, |q| [110.0 * q[0], 110.0 * q[1], q[2]]);
     g.define(iso(1000.0, 0.3), None, full(), Procedure::Static {});
-    g.couple("Base", [41.5, 41.5, 0.0], CouplingKind::Distributing, &ALL, |q| near(q[2], 0.0));
+    g.couple("Base", [55.0, 55.0, 0.0], CouplingKind::Distributing, &ALL, |q| near(q[2], 0.0));
     g.bc("hold", BoundaryCondition::Fixed { target: rp("Base") });
     g.face_set("top", |q| near(q[2], 1.0));
     g.load("p", Load::Pressure { set: "top".into(), magnitude: 1.0 });
     let start = std::time::Instant::now();
-    let e = solve_static(&g.model, Some("Step"), &Limits::default()).unwrap_err().to_string();
+    let raised = Limits { max_factor_entries: 2_000_000_000, ..Limits::default() };
+    let e = solve_static(&g.model, Some("Step"), &raised).unwrap_err().to_string();
     eprintln!("refused in {:?}: {e}", start.elapsed());
-    assert!(e.contains("couples 7056 nodes") && e.contains("GB") && e.contains("kinematic coupling"), "{e}");
+    assert!(e.contains("couples 12321 nodes") && e.contains("GB") && e.contains("kinematic coupling"), "{e}");
 
     let mut g = grid([2, 1, 1], ElementKind::Hex8, |q| [2.0 * q[0], q[1], q[2]]);
     g.define(iso(1000.0, 0.3), None, full(), Procedure::Static {});

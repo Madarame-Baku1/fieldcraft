@@ -76,6 +76,14 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
+    /// Factor-value bytes alone; indices and numeric workspace need additional memory.
+    pub(crate) fn factor_limit(entries: usize, limit: usize) -> Error {
+        let bytes = entries as u128 * std::mem::size_of::<f64>() as u128;
+        Error::Limit(format!(
+            "the factorization needs {entries} entries ({bytes} bytes of factor values alone; indices and workspace are additional); the limit is {limit} entries (refine less or raise max_factor_entries)"
+        ))
+    }
+
     /// A kernel error, naming the element.
     pub fn element(label: u32, source: fieldcraft_fem::Error) -> Error {
         Error::Element { label, source }
@@ -109,6 +117,22 @@ impl Default for Limits {
             max_factor_entries: Limits::MAX_FACTOR_ENTRIES,
             max_lanczos_vectors: Limits::MAX_LANCZOS_VECTORS,
             max_newton_iterations: Limits::MAX_NEWTON_ITERATIONS,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn factor_limit_estimates_bytes_without_allocating_the_factor() {
+        for (entries, bytes) in [(467_000_000, "3736000000"), (2_000_000_000, "16000000000")] {
+            let e = Error::factor_limit(entries, 400_000_000).to_string();
+            assert!(e.contains(&format!("{entries} entries ({bytes} bytes of factor values alone")), "{e}");
+            assert!(e.contains("indices and workspace are additional"), "{e}");
+            assert!(e.contains("limit is 400000000 entries"), "{e}");
+            assert!(e.contains("raise max_factor_entries"), "{e}");
         }
     }
 }

@@ -362,7 +362,8 @@ fn errors_name_the_problem() {
     let tight = Limits { max_dofs: 10, ..Limits::default() };
     assert!(solve_static(&g.model, Some("Step"), &tight).unwrap_err().to_string().contains("limit"));
     let tight = Limits { max_factor_entries: 5, ..Limits::default() };
-    assert!(solve_static(&g.model, Some("Step"), &tight).unwrap_err().to_string().contains("limit"));
+    let e = solve_static(&g.model, Some("Step"), &tight).unwrap_err().to_string();
+    assert!(e.contains("bytes of factor values alone") && e.contains("limit is 5 entries"), "{e}");
     assert!(solve_static(&g.model, Some("Nope"), &Limits::default()).is_err());
     assert!(solve_frequency(&g.model, Some("Step"), &FrequencyOptions::default(), &Limits::default()).is_err(), "a static step");
     assert!(solve_static(&g.model, Some("Step"), &Limits::default()).is_ok());

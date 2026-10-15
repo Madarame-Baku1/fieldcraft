@@ -438,3 +438,17 @@ fn trusses_take_thermal_strain_along_their_axis() {
         assert!(r.elements.iter().flat_map(|el| &el.points).all(|p| p.stress[0].abs() < 1e-9));
     }
 }
+
+#[test]
+fn heat_factor_cap_reports_value_bytes_before_allocation() {
+    let mut g = grid([2, 1, 1], ElementKind::Hex8, |p| [2.0 * p[0], p[1], p[2]]);
+    g.define(iso(1000.0, 0.3), None, full(), Procedure::HeatTransfer { transient: None });
+    thermal(&mut g, iso(1000.0, 0.3), None, conductor(K));
+    hold(&mut g, "cold", 0.0, |p| near(p[0], 0.0));
+    let before = g.model.clone();
+    let tight = Limits { max_factor_entries: 1, ..Limits::default() };
+    let e = solve_heat(&g.model, None, &tight).unwrap_err().to_string();
+    assert!(e.contains("bytes of factor values alone") && e.contains("limit is 1 entries"), "{e}");
+    assert_eq!(g.model, before);
+    assert!(solve_heat(&g.model, None, &Limits::default()).is_ok());
+}

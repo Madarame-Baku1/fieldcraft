@@ -367,7 +367,7 @@ impl Budget {
     }
 
     fn exceeded(&self, entries: usize) -> bool {
-        self.bytes(entries) > self.max_bytes
+        entries > self.max_bytes / (8 * (1 + self.matrices))
     }
 }
 
@@ -768,5 +768,20 @@ impl Reduction {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reduced_matrix_budget_refuses_byte_counts_that_overflow() {
+        for matrices in [1, 2] {
+            let budget = Budget { max_bytes: usize::MAX, pattern_entries: 0, matrices };
+            let entries = usize::MAX / (8 * (1 + matrices));
+            assert!(!budget.exceeded(entries));
+            assert!(budget.exceeded(entries + 1));
+        }
     }
 }
