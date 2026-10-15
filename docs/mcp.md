@@ -26,6 +26,23 @@ both must run on the same computer.
 
 ### Claude Code
 
+Use the CLI from your installation:
+
+| Platform | CLI path |
+|---|---|
+| macOS, app installed in Applications | `/Applications/FieldCraft.app/Contents/MacOS/fieldcraft-cli` |
+| Linux, unpacked tar.gz | `<unpacked-folder>/bin/fieldcraft-cli` |
+| Linux, installed `.deb` or `.rpm` | `/usr/bin/fieldcraft-cli` |
+| Windows, unpacked zip | `<unpacked-folder>\fieldcraft-cli.exe` |
+| Built from source | `<repository>/target/release/fieldcraft-cli` (`fieldcraft-cli.exe` on Windows) |
+
+The separate macOS CLI zip also contains `fieldcraft-cli` in its unpacked folder. Use an absolute
+path in your MCP configuration; quote it if it contains spaces. For the installed macOS app:
+
+```sh
+claude mcp add fieldcraft -- /Applications/FieldCraft.app/Contents/MacOS/fieldcraft-cli mcp
+```
+
 ```sh
 claude mcp add fieldcraft -- /path/to/fieldcraft-cli mcp
 # bridged to a running app:
@@ -34,8 +51,8 @@ claude mcp add fieldcraft -- /path/to/fieldcraft-cli mcp --connect 127.0.0.1:707
 claude mcp add fieldcraft -- /path/to/fieldcraft-cli mcp --automation-read-root /work/bracket --automation-write-root /work/bracket/out
 ```
 
-Build the binary first (`cargo build --release -p fieldcraft-cli`; it is
-`target/release/fieldcraft-cli`). The same setup as a project `.mcp.json`, or in another client's
+When building from source, run `cargo build --release -p fieldcraft-cli` first. The same setup as a
+project `.mcp.json`, or in another client's
 configuration (Claude Desktop's `claude_desktop_config.json`):
 
 ```json

@@ -7,7 +7,8 @@ modal problems with its own solver. AI agents can drive it over MCP (`fieldcraft
 
 **Which file?**
 - **macOS 11+** (Apple silicon and Intel): open `fieldcraft-{version}-macos-universal.dmg` and
-  drag `FieldCraft.app` onto Applications. The command-line tool is in
+  drag `FieldCraft.app` onto Applications. The command-line tool is included at
+  `/Applications/FieldCraft.app/Contents/MacOS/fieldcraft-cli` and also available separately in
   `fieldcraft-cli-{version}-macos-universal.zip`.
 - **Linux** (x86_64, glibc 2.35+: Ubuntu 22.04, Debian 12, Fedora 36 or newer):
   `fieldcraft-{version}-linux-x86_64.AppImage` (`chmod +x`, then run it), or unpack

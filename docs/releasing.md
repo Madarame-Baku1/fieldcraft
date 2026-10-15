@@ -10,7 +10,7 @@ are in `packaging/` and run the same way on a developer machine.
 
 | Platform | Files | Script |
 |---|---|---|
-| macOS 11+, universal (arm64 + x86_64) | `fieldcraft-<v>-macos-universal.dmg` (FieldCraft.app on a drag-to-Applications image), `fieldcraft-cli-<v>-macos-universal.zip` | `packaging/macos/package.sh` |
+| macOS 11+, universal (arm64 + x86_64) | `fieldcraft-<v>-macos-universal.dmg` (FieldCraft.app, including `Contents/MacOS/fieldcraft-cli`, on a drag-to-Applications image), `fieldcraft-cli-<v>-macos-universal.zip` | `packaging/macos/package.sh` |
 | Linux x86_64, glibc 2.35+ | `fieldcraft-<v>-linux-x86_64.tar.gz` (`bin/`, `share/`), `fieldcraft-<v>-linux-x86_64.AppImage`, `fieldcraft_<v>_amd64.deb` (Debian, Ubuntu 22.04+), `fieldcraft-<v>.x86_64.rpm` (Fedora, RHEL, openSUSE) | `packaging/linux/package.sh` |
 | Windows x64 | `fieldcraft-<v>-windows-x64.zip` (`fieldcraft.exe`, `fieldcraft-cli.exe`) | `packaging/windows/package.ps1` |
 

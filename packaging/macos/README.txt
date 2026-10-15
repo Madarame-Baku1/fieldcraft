@@ -10,4 +10,8 @@ right-click FieldCraft.app in Applications and choose Open, then Open again. Or 
 Updating: quit FieldCraft, drag FieldCraft.app from this disk image onto Applications and
 choose Replace.
 
-The command-line tool, fieldcraft-cli, is a separate download (fieldcraft-cli-*-macos-*.zip).
+The command-line tool is included at
+
+    /Applications/FieldCraft.app/Contents/MacOS/fieldcraft-cli
+
+It is also available separately (fieldcraft-cli-*-macos-*.zip).

@@ -125,6 +125,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/Licenses"
 # CFBundleIconName). Assets.car holds the layered icon for macOS 26 and later, the .icns the
 # icon for earlier versions (assets/app-icon/README.md).
 cp "$WORK/bin/fieldcraft" "$APP/Contents/MacOS/FieldCraft"
+cp "$WORK/bin/fieldcraft-cli" "$APP/Contents/MacOS/fieldcraft-cli"
 cp "$ICONS/icon.icns" "$APP/Contents/Resources/FieldCraft.icns"
 cp "$ICONS/Assets.car" "$APP/Contents/Resources/Assets.car"
 copy_docs "$APP/Contents/Resources/Licenses"
@@ -133,7 +134,8 @@ sed -e "s/@APP_ID@/$APP_ID/g" -e "s/@VERSION@/$VERSION/g" -e "s/@SHORT_VERSION@/
 plutil -lint "$APP/Contents/Info.plist"
 printf 'APPL????' >"$APP/Contents/PkgInfo"
 
-# Sign inside-out: the executable, then the bundle (no --deep on the bundle's own signature).
+# Sign inside-out: both executables, then the bundle (no --deep on the bundle's own signature).
+sign --options runtime --identifier "$APP_ID.cli" "$APP/Contents/MacOS/fieldcraft-cli"
 sign --options runtime --entitlements "$HERE/entitlements.plist" "$APP/Contents/MacOS/FieldCraft"
 sign --options runtime --entitlements "$HERE/entitlements.plist" "$APP"
 codesign --verify --strict --deep --verbose=2 "$APP"
@@ -185,9 +187,14 @@ cmp "$ICONS/Assets.car" "$M_APP/Contents/Resources/Assets.car"
 for f in "${DOC_FILES[@]}"; do
   test -s "$M_APP/Contents/Resources/Licenses/$f"
 done
-for arch in "${WANT[@]}"; do lipo "$M_APP/Contents/MacOS/FieldCraft" -verify_arch "$arch"; done
+for bin in FieldCraft fieldcraft-cli; do
+  test -x "$M_APP/Contents/MacOS/$bin"
+  for arch in "${WANT[@]}"; do lipo "$M_APP/Contents/MacOS/$bin" -verify_arch "$arch"; done
+  codesign --verify --strict --verbose=2 "$M_APP/Contents/MacOS/$bin"
+  "$M_APP/Contents/MacOS/$bin" --version
+done
 codesign --verify --strict --deep --verbose=2 "$M_APP"
-"$M_APP/Contents/MacOS/FieldCraft" --version
+"$M_APP/Contents/MacOS/fieldcraft-cli" commands >/dev/null
 hdiutil_retry detach "$MNT" >/dev/null
 trap - EXIT
 if [ "$NOTARIZE" = 1 ]; then
