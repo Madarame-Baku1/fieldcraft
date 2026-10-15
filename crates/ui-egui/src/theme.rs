@@ -119,7 +119,7 @@ impl Tokens {
             heading_bg: Color32::from_rgb(218, 223, 231),
             subheading_bg: Color32::from_rgb(234, 237, 242),
             border: Color32::from_rgb(208, 212, 220),
-            field: Color32::WHITE,
+            field: Color32::from_rgb(232, 236, 242),
             text: Color32::from_rgb(38, 42, 50),
             text_dim: Color32::from_rgb(110, 116, 128),
             accent: Color32::from_rgb(38, 120, 218),
@@ -294,6 +294,7 @@ fn visuals(dark: bool) -> egui::Visuals {
     v.selection.bg_fill = t.accent_soft;
     v.selection.stroke = Stroke::new(1.0, t.accent);
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, t.border);
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0, t.border);
     v.window_corner_radius = egui::CornerRadius::same(6);
     v.menu_corner_radius = egui::CornerRadius::same(6);
     v
@@ -337,6 +338,30 @@ pub fn apply(ctx: &egui::Context, dark: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Empty, unfocused fields still draw an outline in either theme.
+    #[test]
+    fn empty_text_fields_have_a_visible_outline() {
+        for dark in [false, true] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(visuals(dark));
+            let mut field_rect = egui::Rect::NOTHING;
+            let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                field_rect = ui.text_edit_singleline(&mut String::new()).rect;
+            });
+            out.textures_delta.clear();
+            assert!(
+                out.shapes.iter().any(|shape| {
+                    matches!(&shape.shape, egui::Shape::Rect(rect)
+                    if rect.rect == field_rect
+                        && rect.stroke.width >= 1.0
+                        && rect.stroke.color != Color32::TRANSPARENT
+                        && rect.stroke.color != Tokens::get(dark).panel)
+                }),
+                "empty field has no visible outline: dark={dark}"
+            );
+        }
+    }
 
     /// Title and section bands stand out from a panel, the title more than its sections.
     #[test]
