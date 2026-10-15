@@ -446,7 +446,7 @@ mod tests {
         for (name, data) in [("[Content_Types].xml", types), ("_rels/.rels", rels), ("3D/3dmodel.model", x.as_str())] {
             let o = zip::write::SimpleFileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated)
-                .last_modified_time(zip::DateTime::default());
+                .last_modified_time(Some(zip::DateTime::default()));
             zip.start_file(name, o).unwrap();
             zip.write_all(data.as_bytes()).unwrap();
         }

@@ -335,7 +335,7 @@ pub fn write(model: &Model, geometry: &Geometry, journal: &[JournalEntry], view:
         // Fixed time and permissions: the bytes depend on the model only.
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Stored)
-            .last_modified_time(zip::DateTime::default())
+            .last_modified_time(Some(zip::DateTime::default()))
             .unix_permissions(0o644)
             .large_file(bytes.len() as u64 >= u64::from(u32::MAX));
         zip.start_file(name, options).map_err(zip_error)?;
