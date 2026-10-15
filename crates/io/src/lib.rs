@@ -335,7 +335,7 @@ pub fn write(model: &Model, geometry: &Geometry, journal: &[JournalEntry], view:
         // Fixed time and permissions: the bytes depend on the model only.
         let options = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Stored)
-            .last_modified_time(Some(zip::DateTime::default()))
+            .last_modified_time(zip::DateTime::default())
             .unix_permissions(0o644)
             .large_file(bytes.len() as u64 >= u64::from(u32::MAX));
         zip.start_file(name, options).map_err(zip_error)?;
@@ -372,7 +372,8 @@ pub fn read(bytes: &[u8]) -> Result<ModelFile> {
     let names = [MANIFEST, MODEL, MESH, JOURNAL];
     let mut seen = Vec::with_capacity(zip.len());
     for name in zip.file_names() {
-        if !names.contains(&name) {
+        let name = name.map_err(|e| Error::Invalid(format!("not a FieldCraft file: {e}")))?;
+        if !names.contains(&name.as_ref()) {
             return invalid(format!("unexpected part `{}`", name.chars().take(80).collect::<String>()));
         }
         if seen.contains(&name) {
