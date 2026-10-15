@@ -35,7 +35,7 @@ use fieldcraft_model::MAX_COORD;
 /// flattens the object (relative, so a uniform scale is never refused).
 const MIN_RELATIVE_DET: f64 = 1e-12;
 
-const CORE_NS: &[u8] = b"http://schemas.microsoft.com/3dmanufacturing/core/2015/02";
+const CORE_NS: &str = "http://schemas.microsoft.com/3dmanufacturing/core/2015/02";
 /// SolidCraft's face-tag namespace, version 1.
 pub const FACE_TAGS_NS: &str = "https://github.com/bherbruck/solidcraft/formats/3mf-face-tags/2026/10";
 
@@ -85,7 +85,7 @@ enum Ns {
 fn ns_of(r: &ResolveResult) -> Ns {
     match r {
         ResolveResult::Bound(n) if n.as_ref() == CORE_NS => Ns::Core,
-        ResolveResult::Bound(n) if n.as_ref() == FACE_TAGS_NS.as_bytes() => Ns::FaceTags,
+        ResolveResult::Bound(n) if n.as_ref() == FACE_TAGS_NS => Ns::FaceTags,
         ResolveResult::Unbound => Ns::Core,
         _ => Ns::Other,
     }
@@ -93,7 +93,7 @@ fn ns_of(r: &ResolveResult) -> Ns {
 
 /// An element's attributes as (namespace, local name, value), borrowed from the event (values
 /// are copied only when they hold entity references). Unprefixed attributes are Core.
-type Attrs<'a> = Vec<(Ns, &'a [u8], Cow<'a, str>)>;
+type Attrs<'a> = Vec<(Ns, &'a str, Cow<'a, str>)>;
 
 fn attrs<'a, R>(rd: &NsReader<R>, e: &'a BytesStart) -> Result<Attrs<'a>> {
     let mut out = Vec::with_capacity(4);
@@ -107,7 +107,7 @@ fn attrs<'a, R>(rd: &NsReader<R>, e: &'a BytesStart) -> Result<Attrs<'a>> {
 }
 
 fn get<'s>(a: &'s Attrs, ns: Ns, key: &str) -> Option<&'s str> {
-    a.iter().find(|(n, k, _)| *n == ns && *k == key.as_bytes()).map(|(_, _, v)| v.as_ref())
+    a.iter().find(|(n, k, _)| *n == ns && *k == key).map(|(_, _, v)| v.as_ref())
 }
 
 fn int(a: &Attrs, ns: Ns, key: &str, what: &str) -> Result<Option<u32>> {
@@ -216,7 +216,7 @@ fn parse_model(xml: &[u8]) -> Result<Model> {
             Event::End(end) => {
                 depth = depth.saturating_sub(1);
                 if ns == Ns::Core
-                    && end.local_name().as_ref() == b"object"
+                    && end.local_name().as_ref() == "object"
                     && let Some((id, o)) = cur.take()
                 {
                     m.add(id, o)?;
@@ -237,13 +237,13 @@ fn parse_model(xml: &[u8]) -> Result<Model> {
         }
         let a = attrs(&rd, &e)?;
         match e.local_name().as_ref() {
-            b"model" => {
+            "model" => {
                 seen_model = true;
                 if let Some(u) = get(&a, Ns::Core, "unit") {
                     m.unit = unit_mm(u).ok_or_else(|| invalid(format!("unknown unit `{u}`")))?;
                 }
             }
-            b"object" => {
+            "object" => {
                 if cur.is_some() {
                     return bad("an object inside an object");
                 }
@@ -262,7 +262,7 @@ fn parse_model(xml: &[u8]) -> Result<Model> {
                     cur = Some((id, o));
                 }
             }
-            b"vertex" => {
+            "vertex" => {
                 let Some((_, o)) = cur.as_mut() else { return bad("vertex outside an object") };
                 vertices += 1;
                 if vertices > MAX_ELEMENTS {
@@ -270,7 +270,7 @@ fn parse_model(xml: &[u8]) -> Result<Model> {
                 }
                 o.positions.push([coord(&a, "x")?, coord(&a, "y")?, coord(&a, "z")?]);
             }
-            b"triangle" => {
+            "triangle" => {
                 let Some((id, o)) = cur.as_mut() else { return bad("triangle outside an object") };
                 triangles += 1;
                 if triangles > MAX_ELEMENTS {
@@ -288,11 +288,11 @@ fn parse_model(xml: &[u8]) -> Result<Model> {
                 }
                 o.triangles.push(t);
             }
-            b"component" => {
+            "component" => {
                 let Some((_, o)) = cur.as_mut() else { return bad("component outside an object") };
                 o.components = true;
             }
-            b"item" => {
+            "item" => {
                 if m.build.len() >= MAX_BUILD_ITEMS {
                     return bad(format!("more than {MAX_BUILD_ITEMS} build items"));
                 }
@@ -364,7 +364,7 @@ pub fn read_3mf(bytes: &[u8]) -> Result<Vec<TaggedSurface>> {
         let mut buf = Vec::new();
         loop {
             match rd.read_event_into(&mut buf) {
-                Ok(Event::Start(e)) | Ok(Event::Empty(e)) if e.local_name().as_ref() == b"Relationship" => {
+                Ok(Event::Start(e)) | Ok(Event::Empty(e)) if e.local_name().as_ref() == "Relationship" => {
                     let a = attrs(&rd, &e)?;
                     if get(&a, Ns::Core, "Type").is_some_and(|t| t.ends_with("/3dmodel"))
                         && let Some(t) = get(&a, Ns::Core, "Target")
