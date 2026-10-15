@@ -30,7 +30,7 @@ pub const RUN: CommandSpec = CommandSpec {
 pub const STATIC: CommandSpec = CommandSpec {
     id: "solve.static",
     label: "Solve Static Step",
-    params: r#"{"step": "Load", "max_dofs": 6000000, "max_factor_entries": 400000000, "threads": 8} — solves a linear static or coupled temperature–displacement step (the only one when `step` is left out) and keeps the result in the session; the caps may only be lowered; `threads` (1 to 256, by default the session's: `FIELDCRAFT_THREADS` or the cores) changes only the time, never the result"#,
+    params: r#"{"step": "Load", "max_dofs": 6000000, "max_factor_entries": 400000000, "threads": 8} — solves a linear static or coupled temperature–displacement step (the only one when `step` is left out) and keeps the result in the session; `max_dofs` may only be lowered; `max_factor_entries` defaults to 400000000 and may be deliberately raised up to 2000000000 (8 bytes per factor value; indices and workspace are additional); `threads` (1 to 256, by default the session's: `FIELDCRAFT_THREADS` or the cores) changes only the time, never the result"#,
     form: Some(super::forms::SOLVE_STATIC),
     kind: CommandKind::Model,
     requires: &[Requirement::Analysable, Requirement::ElementMaterial, Requirement::ElementSection, Requirement::Step],
@@ -40,7 +40,7 @@ pub const STATIC: CommandSpec = CommandSpec {
 pub const NONLINEAR: CommandSpec = CommandSpec {
     id: "solve.nonlinear",
     label: "Solve Nonlinear Static Step",
-    params: r#"{"step": "Inflate", "max_dofs": 6000000, "max_factor_entries": 400000000, "max_newton_iterations": 100000, "threads": 8} — solves a nonlinear static step (the only one when `step` is left out) in load increments with Newton–Raphson iterations and keeps the result in the session: the final displacements, reactions, Cauchy stresses and logarithmic strains (small strains without nonlinear geometry), the equivalent plastic strain of plastic materials (the largest in the summary), every increment's load factor, iterations and residuals (force, displacement and energy, relative to their tolerances' scales), and a displacement frame per converged increment, and with contact pairs (interaction.contact.pair: mortar contact by augmented Lagrangian, Coulomb friction by a return map) each contact's force, normal force, largest pressure, closed and slipping nodes, deepest penetration and augmentations (solve.probe gives each secondary node's pressure, gap and status, and with friction its shear traction and slip); the caps may only be lowered (`max_newton_iterations` over the whole step); `threads` as for solve.static"#,
+    params: r#"{"step": "Inflate", "max_dofs": 6000000, "max_factor_entries": 400000000, "max_newton_iterations": 100000, "threads": 8} — solves a nonlinear static step (the only one when `step` is left out) in load increments with Newton–Raphson iterations and keeps the result in the session: the final displacements, reactions, Cauchy stresses and logarithmic strains (small strains without nonlinear geometry), the equivalent plastic strain of plastic materials (the largest in the summary), every increment's load factor, iterations and residuals (force, displacement and energy, relative to their tolerances' scales), and a displacement frame per converged increment, and with contact pairs (interaction.contact.pair: mortar contact by augmented Lagrangian, Coulomb friction by a return map) each contact's force, normal force, largest pressure, closed and slipping nodes, deepest penetration and augmentations (solve.probe gives each secondary node's pressure, gap and status, and with friction its shear traction and slip); `max_dofs` and `max_newton_iterations` may only be lowered (the latter over the whole step); `max_factor_entries` and `threads` as for solve.static"#,
     form: Some(super::forms::SOLVE_NONLINEAR),
     kind: CommandKind::Model,
     requires: &[Requirement::Analysable, Requirement::ElementMaterial, Requirement::ElementSection, Requirement::Step],
@@ -50,7 +50,7 @@ pub const NONLINEAR: CommandSpec = CommandSpec {
 pub const HEAT: CommandSpec = CommandSpec {
     id: "solve.heat",
     label: "Solve Heat Transfer Step",
-    params: r#"{"step": "Heat", "max_dofs": 6000000, "max_factor_entries": 400000000, "threads": 8} — steady or transient heat conduction of a heat transfer step (the only one when `step` is left out): temperatures, heat flux and the heat flow at prescribed temperatures, kept in the session; the caps may only be lowered; `threads` as for solve.static"#,
+    params: r#"{"step": "Heat", "max_dofs": 6000000, "max_factor_entries": 400000000, "threads": 8} — steady or transient heat conduction of a heat transfer step (the only one when `step` is left out): temperatures, heat flux and the heat flow at prescribed temperatures, kept in the session; `max_dofs` may only be lowered; `max_factor_entries` and `threads` as for solve.static"#,
     form: Some(super::forms::SOLVE_STATIC),
     kind: CommandKind::Model,
     requires: &[Requirement::Analysable, Requirement::ElementMaterial, Requirement::ElementSection, Requirement::Step],
@@ -60,7 +60,7 @@ pub const HEAT: CommandSpec = CommandSpec {
 pub const FREQUENCY: CommandSpec = CommandSpec {
     id: "solve.frequency",
     label: "Solve Frequency Step",
-    params: r#"{"step": "Modes", "mass": "consistent|lumped", "shift": 0.0, "max_dofs": 6000000, "max_factor_entries": 400000000, "max_iterations": 3000, "threads": 8} — natural frequencies and mode shapes of a frequency step (its modes and range); `max_iterations` caps the Lanczos vectors; the result stays in the session; `threads` as for solve.static"#,
+    params: r#"{"step": "Modes", "mass": "consistent|lumped", "shift": 0.0, "max_dofs": 6000000, "max_factor_entries": 400000000, "max_iterations": 3000, "threads": 8} — natural frequencies and mode shapes of a frequency step (its modes and range); `max_iterations` caps the Lanczos vectors; the result stays in the session; `max_factor_entries` and `threads` as for solve.static"#,
     form: Some(super::forms::SOLVE_FREQUENCY),
     kind: CommandKind::Model,
     requires: &[Requirement::Analysable, Requirement::ElementMaterial, Requirement::ElementSection, Requirement::Step],
@@ -70,7 +70,7 @@ pub const FREQUENCY: CommandSpec = CommandSpec {
 pub const BUCKLE: CommandSpec = CommandSpec {
     id: "solve.buckle",
     label: "Solve Buckling Step",
-    params: r#"{"step": "Buckle", "max_dofs": 6000000, "max_factor_entries": 400000000, "max_iterations": 3000, "threads": 8} — linear buckling of a buckling step (the only one when `step` is left out): the step's loads as a linear preload, then the lowest load factors λ with (K + λ K_σ) φ = 0 and their mode shapes (largest component 1), or those above the step's shift (whose LDLᵀ factor counts the load factors below it); negative load factors found are reported; the result stays in the session and its modes display like frequency modes; `threads` as for solve.static"#,
+    params: r#"{"step": "Buckle", "max_dofs": 6000000, "max_factor_entries": 400000000, "max_iterations": 3000, "threads": 8} — linear buckling of a buckling step (the only one when `step` is left out): the step's loads as a linear preload, then the lowest load factors λ with (K + λ K_σ) φ = 0 and their mode shapes (largest component 1), or those above the step's shift (whose LDLᵀ factor counts the load factors below it); negative load factors found are reported; the result stays in the session and its modes display like frequency modes; `max_factor_entries` and `threads` as for solve.static"#,
     form: Some(super::forms::SOLVE_BUCKLE),
     kind: CommandKind::Model,
     requires: &[Requirement::Analysable, Requirement::ElementMaterial, Requirement::ElementSection, Requirement::Step],
@@ -117,6 +117,9 @@ pub const PROBE: CommandSpec = CommandSpec {
     run: probe,
 };
 
+/// Largest explicit factor cap accepted by solve commands; the default remains 400M entries.
+pub(super) const FACTOR_ENTRY_CEILING: usize = 2_000_000_000;
+
 /// Most nodes one probe lists.
 const MAX_PROBE: usize = 10_000;
 
@@ -154,7 +157,11 @@ fn threads(s: &Session, p: &Value) -> Result<usize> {
 fn limits(p: &Value) -> Result<Limits> {
     Ok(Limits {
         max_dofs: cap(p, "max_dofs", Limits::MAX_DOFS)?,
-        max_factor_entries: cap(p, "max_factor_entries", Limits::MAX_FACTOR_ENTRIES)?,
+        max_factor_entries: if p.get("max_factor_entries").is_none() {
+            Limits::MAX_FACTOR_ENTRIES
+        } else {
+            cap(p, "max_factor_entries", FACTOR_ENTRY_CEILING)?
+        },
         max_lanczos_vectors: cap(p, "max_iterations", Limits::MAX_LANCZOS_VECTORS)?,
         max_newton_iterations: cap(p, "max_newton_iterations", Limits::MAX_NEWTON_ITERATIONS)?,
     })
@@ -919,6 +926,76 @@ pub(crate) mod tests {
         s.execute("edit.redo", &json!({})).unwrap();
         let e = s.execute("solve.probe", &json!({"step": "Bend", "nodes": [1]})).unwrap_err().to_string();
         assert!(e.contains("stale"), "{e}");
+    }
+
+    #[test]
+    fn factor_cap_can_be_raised_deliberately_to_a_finite_ceiling() {
+        assert_eq!(limits(&json!({})).unwrap(), Limits::default());
+        for entries in [1, 400_000_000, 400_000_001, 467_000_000, 2_000_000_000] {
+            assert_eq!(limits(&json!({"max_factor_entries": entries})).unwrap().max_factor_entries, entries);
+        }
+        for entries in
+            [json!(null), json!(true), json!("467000000"), json!(-1), json!(0), json!(2.5), json!(2_000_000_001u64), json!(u64::MAX), json!(1e300)]
+        {
+            assert!(limits(&json!({"max_factor_entries": entries})).is_err(), "{entries}");
+        }
+        for params in [
+            json!({"max_dofs": Limits::MAX_DOFS + 1}),
+            json!({"max_iterations": Limits::MAX_LANCZOS_VECTORS + 1}),
+            json!({"max_newton_iterations": Limits::MAX_NEWTON_ITERATIONS + 1}),
+        ] {
+            assert!(limits(&params).is_err(), "{params}");
+        }
+        for id in ["solve.static", "solve.nonlinear", "solve.heat", "solve.frequency", "solve.buckle"] {
+            let schema = crate::schema::json_schema(crate::find_command(id).unwrap().form.unwrap());
+            let factor = &schema["properties"]["max_factor_entries"];
+            assert_eq!(factor["minimum"], 1, "{id}: {factor}");
+            assert_eq!(factor["maximum"], 2_000_000_000u64, "{id}: {factor}");
+        }
+    }
+
+    #[test]
+    fn raised_factor_caps_solve_small_models_and_failures_keep_results() {
+        let mut s = Session::default();
+        cantilever(&mut s);
+        s.run_script(&json!([
+            {"command": "model.section.edit", "params": {"name": "bar", "set": "all", "material": "Mat", "kind": {"type": "solid"}, "formulation": {}}},
+            {"command": "model.step.create", "params": {"name": "Nonlinear", "procedure": {"type": "nonlinear_static", "nonlinear_geometry": false}, "boundary_conditions": ["clamp"], "loads": ["push"]}},
+            {"command": "model.load.create", "params": {"name": "compress", "type": "force", "target": {"set": "tip"}, "vector": [-1, 0, 0]}},
+            {"command": "model.step.create", "params": {"name": "Buckle", "procedure": {"type": "buckle", "modes": 1}, "boundary_conditions": ["clamp"], "loads": ["compress"]}},
+            {"command": "model.material.edit", "params": {"name": "Mat", "elastic": {"type": "isotropic", "young": 1000, "poisson": 0}, "density": 1, "thermal": {"conductivity": 2}}},
+            {"command": "model.boundary_condition.create", "params": {"name": "cold", "type": "temperature", "target": {"set": "root"}, "value": 0}},
+            {"command": "model.boundary_condition.create", "params": {"name": "hot", "type": "temperature", "target": {"set": "tip"}, "value": 100}},
+            {"command": "model.step.create", "params": {"name": "Heat", "procedure": {"type": "heat_transfer"}, "boundary_conditions": ["cold", "hot"]}},
+        ])).unwrap();
+        for (command, step) in [
+            ("solve.static", "Bend"),
+            ("solve.nonlinear", "Nonlinear"),
+            ("solve.heat", "Heat"),
+            ("solve.frequency", "Modes"),
+            ("solve.buckle", "Buckle"),
+        ] {
+            let expected = s.execute(command, &json!({"step": step})).unwrap();
+            let probe_params = json!({"step": step, "nodes": [6]});
+            let probe = s.execute("solve.probe", &probe_params).unwrap();
+            for entries in [400_000_001, 467_000_000, 2_000_000_000] {
+                assert_eq!(s.execute(command, &json!({"step": step, "max_factor_entries": entries})).unwrap(), expected);
+                assert_eq!(s.execute("solve.probe", &probe_params).unwrap(), probe);
+            }
+            let before = s.model.clone();
+            let results = s.solved_steps().count();
+            let journal = s.journal.len();
+            for entries in [json!(1), json!(0), json!(-1), json!(2.5), json!(null), json!(2_000_000_001u64), json!(u64::MAX)] {
+                let e = s.execute(command, &json!({"step": step, "max_factor_entries": entries})).unwrap_err().to_string();
+                if entries == 1 {
+                    assert!(e.contains("bytes of factor values alone") && e.contains("limit is 1 entries"), "{command}: {e}");
+                }
+                assert_eq!(s.model, before, "{command}: {entries}");
+                assert_eq!(s.solved_steps().count(), results);
+                assert_eq!(s.journal.len(), journal);
+                assert_eq!(s.execute("solve.probe", &probe_params).unwrap(), probe);
+            }
+        }
     }
 
     #[test]

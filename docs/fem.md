@@ -102,6 +102,25 @@ physical Hessian of a quadratic interpolant consistent with finite differences o
 gradient. The solver and explicit migration to `DofLayout` was checked bit for bit: every
 result of the solver, explicit, engine and io test suites hashes identically before and after.
 
+## Solver memory limits
+
+`solve.static`, `solve.nonlinear`, `solve.heat`, `solve.frequency` and `solve.buckle`
+accept `max_factor_entries`: **400,000,000 by default**, or an explicit whole number from
+1 to **2,000,000,000**. For example, `solve.static` with
+`{"step": "Load", "max_factor_entries": 500000000}` deliberately raises the cap for that solve;
+it does not change the default of later solves. Other work and iteration caps can still only
+be lowered.
+
+Each factor value is 8 bytes: the default allows 3.2 GB of values, and the ceiling allows
+16 GB. These are factor values alone, not total RAM: indices, assembled matrices, numeric
+workspace and other solver storage need additional memory. Raising the cap neither reserves
+memory nor guarantees that it is available. Structural and heat cap errors report the required
+entry count and its factor-value byte estimate before allocating the factor values.
+
+The same entry budget continues to guard dense constraint reduction and Lanczos storage;
+32-bit builds remain limited by addressable allocation sizes. The solve parameter's ceiling
+is defined once as `FACTOR_ENTRY_CEILING` in `crates/engine/src/cmd/solve.rs`.
+
 ## Heat transfer and thermal strain
 
 A heat conduction element carries one temperature per node (`heat::HEAT_DOFS`, kind `T`);
