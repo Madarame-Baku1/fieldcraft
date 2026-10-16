@@ -856,7 +856,7 @@ pub enum Target {
     /// `to_surface`: pick the source face, then the target surface.
     ExtrudeFaces,
     /// The selected geometry faces as `faces: [{body, face}]`, in place of a sphere or labels
-    /// (the faces Relax Nodes relaxes).
+    /// (the faces Relax Nodes relaxes, the faces a local size refines).
     Faces,
 }
 
@@ -870,7 +870,7 @@ pub fn target(id: &str, params: &Value) -> Option<Target> {
         "geometry.datum.point" | "geometry.datum.point.edit" => Some(Target::DatumPoint),
         "mesh.cells" => Some(Target::Bodies),
         "mesh.hex.extrude" => Some(Target::ExtrudeFaces),
-        "mesh.node.relax" => Some(Target::Faces),
+        "mesh.node.relax" | "mesh.size.set" => Some(Target::Faces),
         "model.boundary_condition.create" | "model.boundary_condition.edit" => Some(Target::TargetSet),
         "model.section.create" | "model.section.edit" | "model.coupling.create" | "model.coupling.edit" | "interaction.rigid_wall" => {
             Some(Target::Set)

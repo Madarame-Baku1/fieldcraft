@@ -137,6 +137,57 @@ pub fn seeds(s: &mut Scene, model: &fieldcraft_model::Model, names: &[crate::sel
     }
 }
 
+/// Draw the model's size controls (mesh.size.set) where they apply: the faces and bodies they
+/// refine tinted on the drawn geometry, a box as its twelve edges, a sphere as
+/// [`sphere`] draws one, each labelled with its name and size.
+pub fn sizes(s: &mut Scene, model: &fieldcraft_model::Model, names: &[crate::selection::BodyNames], display: &DisplayMesh, t: &Tokens) {
+    use fieldcraft_model::{Entity, GeometryRef, SizeRegion};
+    if model.size_controls().is_empty() {
+        return;
+    }
+    let color = rgb(t.warm);
+    for (name, c) in model.size_controls() {
+        let text = format!("{name} {}", c.size);
+        let v = |p: [f64; 3]| Vec3 { x: p[0], y: p[1], z: p[2] };
+        match &c.region {
+            SizeRegion::Box { min, max } => {
+                let corner = |k: usize| v([0, 1, 2].map(|a| if (k >> a) & 1 == 1 { max[a] } else { min[a] }));
+                for k in 0..8usize {
+                    for a in 0..3 {
+                        if (k >> a) & 1 == 0 {
+                            s.lines.push(SceneLine { a: corner(k), b: corner(k | (1 << a)), color, width: 1.5 });
+                        }
+                    }
+                }
+                s.labels.push(SceneLabel { p: (corner(0) + corner(7)) * 0.5, text, color });
+            }
+            SizeRegion::Sphere { center, radius } => {
+                sphere(s, v(*center), *radius, color);
+                s.labels.push(SceneLabel { p: v(*center), text, color });
+            }
+            SizeRegion::Geometry(refs) => {
+                let (mut sum, mut n) = (Vec3 { x: 0.0, y: 0.0, z: 0.0 }, 0usize);
+                for tri in &display.surface_tris {
+                    let Some(body) = names.get(tri.body as usize) else { continue };
+                    let face = body.faces.get(tri.face as usize).and_then(|f| GeometryRef::face(body.name.clone(), f.clone()).ok());
+                    let hit = refs.iter().any(|r| match &r.entity {
+                        Entity::Body => r.body == body.name,
+                        _ => face.as_ref().is_some_and(|f| r.selects(f)),
+                    });
+                    if hit {
+                        s.fills.push(SceneFill { tri: SceneTri { p: tri.p, normal: tri.normal, color }, alpha: 0.3 });
+                        sum = sum + (tri.p[0] + tri.p[1] + tri.p[2]) * (1.0 / 3.0);
+                        n += 1;
+                    }
+                }
+                if n > 0 {
+                    s.labels.push(SceneLabel { p: sum * (1.0 / n as f64), text, color });
+                }
+            }
+        }
+    }
+}
+
 /// How many element edges of the drawn mesh lie along the geometry edge `run` (its polyline,
 /// `length` long): those whose ends and middle are all on it, counted once per element edge
 /// (a quadratic edge is drawn in pieces). 0 when the mesh has none there (not meshed).
@@ -264,5 +315,22 @@ mod tests {
         assert_eq!((s.tris.len(), s.lines.len()), (0, 6));
         assert_eq!(s.tris.first().map(|t| t.color), None);
         assert!(radius(&d.bounds, &Camera::default()) > 0.5);
+    }
+
+    #[test]
+    fn size_controls_draw_where_they_apply() {
+        use fieldcraft_model::{SizeControl, SizeRegion};
+        let mut m = Model::default();
+        m.set_size_control("Zone", SizeControl { region: SizeRegion::Box { min: [0.0; 3], max: [1.0; 3] }, size: 0.5 }).unwrap();
+        m.set_size_control("Ball", SizeControl { region: SizeRegion::Sphere { center: [0.0; 3], radius: 2.0 }, size: 0.5 }).unwrap();
+        let mut s = Scene::default();
+        sizes(&mut s, &m, &[], &DisplayMesh::default(), &Tokens::dark());
+        assert!(s.lines.len() >= 12 && !s.fills.is_empty(), "the box's edges and the sphere");
+        let mut labels: Vec<&str> = s.labels.iter().map(|l| l.text.as_str()).collect();
+        labels.sort();
+        assert_eq!(labels, ["Ball 0.5", "Zone 0.5"]);
+        let mut empty = Scene::default();
+        sizes(&mut empty, &Model::default(), &[], &DisplayMesh::default(), &Tokens::dark());
+        assert!(empty.lines.is_empty() && empty.labels.is_empty());
     }
 }

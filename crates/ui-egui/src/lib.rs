@@ -1153,6 +1153,7 @@ impl ModelApp {
                     datums.union(scene::datum_preview(&mut s, d, &self.display.1.bounds, &t));
                 }
                 scene::seeds(&mut s, &self.session.model, &self.pick.names, &self.display.1, &t);
+                scene::sizes(&mut s, &self.session.model, &self.pick.names, &self.display.1, &t);
             }
             self.scene = (Some(key), s, datums);
         }
@@ -1822,7 +1823,7 @@ impl ModelApp {
             selection::Target::ExtrudeFaces => selection::with_extrude_faces(&params, &self.pick.selection)
                 .ok_or("no face is selected: pick the source face, then the target surface (Select: Faces)")?,
             selection::Target::Faces => {
-                selection::with_faces(&params, &self.pick.selection).ok_or("no face is selected: pick the faces to relax (Select: Faces)")?
+                selection::with_faces(&params, &self.pick.selection).ok_or("no face is selected: pick the faces (Select: Faces)")?
             }
             selection::Target::Bodies => {
                 let bodies = selection::bodies(&self.pick.selection).ok_or("no geometry is selected: pick cells with Select: Bodies")?;
