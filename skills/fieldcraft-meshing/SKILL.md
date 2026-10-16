@@ -111,7 +111,8 @@ Shapes without a timeline (STEP, 3MF) skip `mesh.plan` and go to step 4.
   pure conduction. Set `layers` in `mesh.plan`, or `mesh.seed.edge` across the wall.
 - Matching counts on shared edges: `mesh.seed.edge`.
 - Size from the physics: finer at stress gradients, fillets and contact; in explicit, from the
-  wave length.
+  wave length. Refine locally with `mesh.size.set` (faces, bodies, a box or a sphere) rather
+  than making the whole part fine; `mesh.size.growth` sets how fast it coarsens away.
 
 ## 6. Quality, mark, relax
 

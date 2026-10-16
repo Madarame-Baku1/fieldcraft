@@ -1480,6 +1480,37 @@ pub const SEED_EDGE: &[Field] = &[
 
 pub const SEED_CLEAR: &[Field] = &[json("edges", "Edges").help("The edges to clear, as JSON; every seed when empty.").hint("every seed")];
 
+pub const SIZE_SET: &[Field] = &[
+    NAME,
+    positive("size", "Element size", D::Length).help("The element size in the region.").req(),
+    face_rows("faces", "Faces").help("Faces to refine. Pick them, then Use as faces.").hint("or bodies, a box or a sphere"),
+    references("bodies", "Bodies", C::Body).help("Whole bodies meshed at this size.").hint("or faces, a box or a sphere"),
+    group(
+        "box",
+        "Box",
+        &[
+            xyz("min", "Box min", D::Length).help("The box corner with the smallest coordinates.").req(),
+            xyz("max", "Box max", D::Length).help("The box corner with the largest coordinates.").req(),
+        ],
+    )
+    .help("An axis-aligned box to refine."),
+    group(
+        "sphere",
+        "Sphere",
+        &[
+            xyz("center", "Centre", D::Length).help("The sphere's centre; click the model to place it.").req(),
+            positive("radius", "Radius", D::Length).help("The sphere's radius.").req(),
+        ],
+    )
+    .help("A sphere to refine."),
+];
+
+pub const SIZE_GROWTH: &[Field] =
+    &[range("rate", "Growth rate", D::None, 0.05, 2.0).help("The largest change of element size per unit length away from a local size.").def("0.3")];
+
+pub const SIZE_CLEAR: &[Field] =
+    &[references("names", "Local sizes", C::SizeControl).help("The size controls to remove; every one when empty.").hint("every one")];
+
 pub const DELAUNAY_POINTS: &[Field] = &[points("points", "Points", D::Length, 20_000).help("The points to triangulate.").req()];
 
 pub const TAG: &[Field] = &[

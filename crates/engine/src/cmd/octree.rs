@@ -2,7 +2,6 @@
 //! imported surfaces.
 
 use fieldcraft_mesh::octree::{OctreeHexMesh, OctreeOptions, octree_hex_mesh};
-use fieldcraft_mesh::size::UniformSize;
 use fieldcraft_mesh::surface::BoundarySurface;
 use fieldcraft_model::{ElementKind, GeometryRef, MAX_ELEMENTS};
 use serde_json::{Value, json};
@@ -15,7 +14,7 @@ use crate::{CommandKind, CommandSpec, EngineError, Result, Session};
 pub const HEX_OCTREE: CommandSpec = CommandSpec {
     id: "mesh.hex.octree",
     label: "Octree Hex Mesh",
-    params: r#"{"body": "Body1" (default: every body of the open design) or "surface": 0 (an imported surface), "size": 2.0 (element size in the interior, mm; default 1/25 of the bounding-box diagonal), "tolerance": 0.05 (chordal tolerance of the tessellation, mm; default 1e-3 of the diagonal), "max_depth": 4 (the most refinement levels below the size, each a third, 0..=5; the levels the part's thinnest wall and narrowest face need are found before meshing, and a part that needs more levels or more than max_elements cells fails at once, naming them), "max_elements": 2000000 (1..=10000000; default the session limit), "attempts": 4 (builds, refining where one failed, 1..=8), "max_sweeps": 300 (optimiser sweeps, 0..=10000), and the boundary options of mesh.tet.generate ("weld", "weld_distance", "feature_angle")} — replaces the meshes of the bodies it meshes (as mesh.tet.generate; other bodies keep theirs) with an unstructured all-hex8 mesh of any part: an adaptive 3-refinement grid with conforming transition templates, a core inside the part, two boundary layers that capture every B-rep face boundary and sharp edge, and untangling. Every element is proven valid; boundary element faces are tagged with their B-rep faces (named as in geometry.bodies; by index when a face has no name), so sets by geometry resolve. Reports per body the elements, quality, volume and grid statistics (root cell size, levels, the thinnest wall and narrowest face, cells per level after refinement and after closure)"#,
+    params: r#"{"body": "Body1" (default: every body of the open design) or "surface": 0 (an imported surface), "size": 2.0 (element size in the interior, mm; default 1/25 of the bounding-box diagonal), "tolerance": 0.05 (chordal tolerance of the tessellation, mm; default 1e-3 of the diagonal), "max_depth": 4 (the most refinement levels below the size, each a third, 0..=5; the levels the part's thinnest wall, narrowest face and smallest local size (mesh.size.set) need are found before meshing, and a part that needs more levels or more than max_elements cells fails at once, naming them), "max_elements": 2000000 (1..=10000000; default the session limit), "attempts": 4 (builds, refining where one failed, 1..=8), "max_sweeps": 300 (optimiser sweeps, 0..=10000), and the boundary options of mesh.tet.generate ("weld", "weld_distance", "feature_angle")} — replaces the meshes of the bodies it meshes (as mesh.tet.generate; other bodies keep theirs) with an unstructured all-hex8 mesh of any part: an adaptive 3-refinement grid (root cells at `size`, refined where the size controls ask for smaller elements) with conforming transition templates, a core inside the part, two boundary layers that capture every B-rep face boundary and sharp edge, and untangling. Every element is proven valid; boundary element faces are tagged with their B-rep faces (named as in geometry.bodies; by index when a face has no name), so sets by geometry resolve. Reports per body the elements, quality, volume and grid statistics (root cell size, levels, the thinnest wall and narrowest face, cells per level after refinement and after closure)"#,
     form: Some(super::forms::HEX_OCTREE),
     kind: CommandKind::Model,
     requires: &[Requirement::Geometry],
@@ -46,13 +45,14 @@ fn hex_octree(s: &mut Session, p: &Value) -> Result<Value> {
         ..defaults
     };
     let bodies = inputs(s, p)?;
+    let sizing = super::sizes::sizing(s)?;
     let mut meshes: Vec<(Input, OctreeHexMesh)> = Vec::with_capacity(bodies.len());
     let mut total = 0usize;
     for b in bodies {
         if !(b.diagonal > 0.0 && b.diagonal.is_finite()) {
             return Err(EngineError::Params(format!("body `{}` has no extent", b.name)));
         }
-        let h = size.unwrap_or(DEFAULT_RELATIVE_SIZE * b.diagonal);
+        let h = sizing.body_size(&b.name, size.unwrap_or(DEFAULT_RELATIVE_SIZE * b.diagonal));
         if h < MIN_RELATIVE_SIZE * b.diagonal {
             return Err(EngineError::Params(format!("`size` must be at least {} mm for body `{}`", MIN_RELATIVE_SIZE * b.diagonal, b.name)));
         }
@@ -60,7 +60,8 @@ fn hex_octree(s: &mut Session, p: &Value) -> Result<Value> {
         let surface = BoundarySurface::new(&b.mesh.positions, &b.mesh.triangles, &b.mesh.tri_face, &surface_options)
             .map_err(|e| EngineError::Params(format!("body `{}`: {e}", b.name)))?;
         let left = OctreeOptions { max_elements: options.max_elements.saturating_sub(total).max(1), ..options.clone() };
-        let mesh = octree_hex_mesh(&surface, &UniformSize(h), &left).map_err(|e| EngineError::of_body(&b.name, e))?;
+        let field = sizing.field(&b.name, h)?;
+        let mesh = octree_hex_mesh(&surface, &field, &left).map_err(|e| EngineError::of_body(&b.name, e))?;
         total += mesh.hexes.len();
         meshes.push((b, mesh));
     }

@@ -28,7 +28,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use fieldcraft_mesh::cdt::CdtOptions;
 use fieldcraft_mesh::hex::{Cell, CellsMesh, HexMesh, HexMethod, HexOptions, hex_mesh_swept_cells};
-use fieldcraft_mesh::size::UniformSize;
 use fieldcraft_mesh::surface::BoundarySurface;
 use fieldcraft_model::geometry::Entity;
 use fieldcraft_model::{ElementFace, GeometryRef, Model, Set, Tie};
@@ -173,7 +172,10 @@ fn cells(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(o) = hex_params.as_object_mut() {
         o.remove("order");
     }
+    // The cells are meshed at one size, so the size controls apply to all of them alike.
+    let sizing = super::sizes::sizing(s)?.joint(&names.iter().map(String::as_str).collect::<Vec<_>>());
     let (tet_options, quality) = quality_options(&tet_params, s.limits.max_tets as u64)?;
+    let tet_options = sizing.tet_options("", &tet_params, &tet_options);
     let cdt = CdtOptions { max_steiner: s.limits.max_steiner, max_tets: tet_options.max_tets };
 
     let seeds = super::seeds::edge_seeds(s)?;
@@ -204,7 +206,7 @@ fn cells(s: &mut Session, p: &Value) -> Result<Value> {
             .filter_map(|&i| shapes.get(i))
             .map(|shape| Ok(Input { seeds: seeds.clone(), ..super::hex::shape_input(shape, Some(tolerance))? }))
             .collect::<Result<_>>()?;
-        match swept_together(p, &inputs, m, quadratic, size, tolerance, &seeds)? {
+        match swept_together(p, &inputs, m, quadratic, size, tolerance, &seeds, &sizing)? {
             Ok(cm) => {
                 for &i in &members {
                     if let Some(slot) = joint.get_mut(i) {
@@ -229,7 +231,7 @@ fn cells(s: &mut Session, p: &Value) -> Result<Value> {
         let input = || Ok::<_, EngineError>(Input { seeds: seeds.clone(), ..super::hex::shape_input(shape, Some(tolerance))? });
         let hex = |m: HexMethod| -> Result<(Input<'static>, HexMesh)> {
             let b = input()?;
-            let mesh = hex_body(&hex_params, &b, m, quadratic, size)?;
+            let mesh = hex_body(&hex_params, &b, m, quadratic, size, &sizing)?;
             Ok((b, mesh))
         };
         let (cell, mut info) = match method {
@@ -363,8 +365,10 @@ fn swept_together(
     size: Option<f64>,
     tolerance: f64,
     seeds: &[fieldcraft_mesh::seeds::EdgeSeed],
+    sizing: &super::sizes::Sizing,
 ) -> Result<std::result::Result<CellsMesh, String>> {
     let h = size.ok_or_else(|| EngineError::Params("no element size".into()))?;
+    let field = sizing.field("", h)?;
     let mut surfaces = Vec::with_capacity(inputs.len());
     for b in inputs {
         let options = super::mesh::surface_options(p, &b.mesh)?;
@@ -382,7 +386,7 @@ fn swept_together(
         seeds: seeds.to_vec(),
         ..HexOptions::default()
     };
-    match hex_mesh_swept_cells(&cells, &UniformSize(h), &options) {
+    match hex_mesh_swept_cells(&cells, &field, &options) {
         Ok(cm) => Ok(Ok(cm)),
         Err(fieldcraft_mesh::Error::Model(fieldcraft_model::Error::Cancelled)) => Err(EngineError::Model(fieldcraft_model::Error::Cancelled)),
         Err(e @ fieldcraft_mesh::Error::Limit(_)) => Err(EngineError::Params(e.to_string())),

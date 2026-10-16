@@ -336,6 +336,14 @@ pub static CATALOGUE: &[Capability] = &[
         "Element counts or sizes per design edge, with bias and an exact, minimum or free constraint; the meshers honour them",
         &["mesh.seed.clear", "mesh.seed.list"],
     ),
+    ready_more(
+        "mesh.size.set",
+        "Local Size",
+        Mesh,
+        "Size",
+        "Element size on faces or bodies, in a box or in a sphere, growing away at a set rate; every mesher honours it",
+        &["mesh.size.growth", "mesh.size.clear", "mesh.size.list"],
+    ),
     soon("mesh.size.adapt", "Curvature", Mesh, "Size", "M2", "Refine by curvature and proximity"),
     ready(
         "mesh.tet.generate",

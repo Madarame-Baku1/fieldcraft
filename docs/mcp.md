@@ -185,6 +185,27 @@ edges of partition cells matching counts.
 4. `mesh.seed.list` lists the seeds and the edges they reach (`stale` when the design has no such
    edge); `mesh.seed.clear {edges?}` removes them. Seeds are saved with the model.
 
+## Size controls
+
+Ask for a local element size where the answer is decided (a fillet, a hole's wall, a contact
+patch) instead of making the whole part fine.
+
+1. `execute` `mesh.size.set {name, size, faces: [{body, face}] | bodies: [...] | box: {min, max} |
+   sphere: {center, radius}}` adds the control (or replaces the one of that name). Faces are
+   named as `inspect_model` lists them.
+2. `mesh.size.growth {rate}` sets how fast the size grows away from a control (the largest
+   change of element size per unit length; 0.3 by default, 0.05 to 2).
+3. Mesh: every mesher honours the controls. The size at a point is the smallest of the mesh
+   command's `size` and, over the controls, a control's size plus the growth rate times the
+   distance to it. The tet mesher refines to that field; the structured hex meshers, the block
+   projection and mesh plans divide their edges by it (a structured mesh carries a count across
+   its block, so the refinement spans the row or layer); the octree refines its cells to it (a
+   size that needs more levels than `max_depth` is refused before meshing). A control on whole
+   bodies is their size in place of the command's.
+4. `mesh.size.list` lists the controls, what each covers in the open design (`stale` when the
+   design no longer has a face it names) and the growth rate; `mesh.size.clear {names?}` removes
+   them. Controls are saved with the model.
+
 ## Meshing from the feature graph
 
 A design opened from `.solidcraft` is rebuilt from its timeline, so how each body was made is

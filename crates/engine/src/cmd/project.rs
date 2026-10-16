@@ -485,7 +485,9 @@ fn hex_project(s: &mut Session, raw: &Value) -> Result<Value> {
     bounded(&p.fixed, "fixed")?;
     let b = open_body(s, &p.body, p.tolerance, raw)?;
     let diag = b.input.diagonal;
-    let size = element_size(p.size, diag)?;
+    let sizing = super::sizes::sizing(s)?;
+    let size = element_size(sizing.bodies.get(&p.body).copied().or(p.size), diag)?;
+    let field = sizing.local_field(size)?;
     let mut t = topology(&p, b.lo, b.hi)?;
     operate(&mut t, &p.operations)?;
     if p.preview {
@@ -545,6 +547,7 @@ fn hex_project(s: &mut Session, raw: &Value) -> Result<Value> {
         min_quality,
         fixed,
         planes: Vec::new(),
+        field,
     };
     let merge = merge_distance(p.merge, diag)?;
     project_body(s, &p.body, b, &t, &opts, merge)

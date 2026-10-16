@@ -1567,7 +1567,8 @@ fn corner_meshes(
     c: f64,
     tolerance: f64,
 ) -> Result<CornerCopy> {
-    let opts = fieldcraft_mesh::project::ProjectOptions { size: plan.size, ..Default::default() };
+    let field = super::sizes::sizing(s)?.local_field(plan.size)?;
+    let opts = fieldcraft_mesh::project::ProjectOptions { size: plan.size, field, ..Default::default() };
     let whole_body = super::project::open_body(s, cell, Some(tolerance), &json!({}))?;
     let merge = super::project::merge_distance(None, whole_body.diagonal())?;
     // What the cell meshed whole gets (no corner may be worse), and per candidate cut the whole
@@ -1783,7 +1784,8 @@ fn apply_projection(s: &mut Session, name: &str, plan: &MeshPlan, tolerance: f64
     // Cut faces another cell's mesh already covers are taken as given, so the cells meet node
     // to node there.
     let (fixed, fixed_faces) = cut_face_patches(s, &body, &plan.body, plan.size)?;
-    let opts = fieldcraft_mesh::project::ProjectOptions { size: plan.size, fixed, ..Default::default() };
+    let field = super::sizes::sizing(s)?.local_field(plan.size)?;
+    let opts = fieldcraft_mesh::project::ProjectOptions { size: plan.size, fixed, field, ..Default::default() };
     let mut mesh = super::project::project_body(s, &plan.body, body, &layout.topology, &opts, merge)
         .map_err(|e| EngineError::Params(format!("mesh plan `{name}`: the projected layout does not mesh: {e}")))?;
     if let Some(m) = mesh.as_object_mut() {

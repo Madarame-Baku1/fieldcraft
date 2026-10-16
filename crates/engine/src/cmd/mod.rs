@@ -31,6 +31,7 @@ pub(crate) mod relax;
 pub mod replace;
 mod results;
 pub(crate) mod seeds;
+pub(crate) mod sizes;
 pub(crate) mod solve;
 pub(crate) mod stitch;
 mod symmetry;
@@ -106,6 +107,10 @@ pub static ALL: &[CommandSpec] = &[
     seeds::SEED_EDGE,
     seeds::SEED_CLEAR,
     seeds::SEED_LIST,
+    sizes::SIZE_SET,
+    sizes::SIZE_GROWTH,
+    sizes::SIZE_CLEAR,
+    sizes::SIZE_LIST,
     mirror::MIRROR,
     nodes::MERGE,
     nodes::DUPLICATES,

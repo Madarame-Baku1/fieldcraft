@@ -5,18 +5,18 @@ use std::borrow::Cow;
 
 use fieldcraft_geometry::{FaceSurface, Shape, SurfaceMesh};
 use fieldcraft_mesh::hex::{BoundaryFace, Cell, HexMesh, HexMethod, HexOptions, MAX_CELLS, Surface, hex_mesh, hex_mesh_cells};
-use fieldcraft_mesh::size::UniformSize;
 use fieldcraft_mesh::surface::BoundarySurface;
 use fieldcraft_model::{GeometryRef, Model};
 use serde_json::{Value, json};
 
+use super::sizes::Sizing;
 use crate::requirement::Requirement;
 use crate::{CommandKind, CommandSpec, EngineError, Result, Session};
 
 pub const HEX_GENERATE: CommandSpec = CommandSpec {
     id: "mesh.hex.generate",
     label: "Hex Mesh",
-    params: r#"{"body": "Body1" (default: every body of the open design) or "surface": 0 (an imported surface), "size": 2.0 (element size, mm; default 1/25 of the bounding-box diagonal), "order": 1 (hex8) or 2 (hex20, mid-edge nodes on the geometry), "method": "auto" (default) | "swept" (any sweep) | "extrude" | "sweep" | "revolve" | "mapped", "tolerance": 0.05 (chordal tolerance of the tessellation, mm; default 1e-3 of the diagonal)} — replaces the meshes of the bodies it meshes (as mesh.tet.generate; other bodies keep theirs) with structured hexahedra: multi-level sweeps along a direction or around an axis (their cross-section cut into mappable blocks automatically: O-grids round holes, triangle primitives, four-sided blocks; nothing is added to the model), one-to-one sweeps through linking faces, or mapped blocks. Boundary element faces are tagged with their B-rep faces (named as in geometry.bodies; by index when a face has no name; `weld`, `weld_distance` and `feature_angle` as in mesh.tet.generate), so sets by geometry resolve. Edge seeds (mesh.seed.edge) set the counts and spacing of their edges: exact seeds are held, and seeds that cannot all hold (opposite sides of a mapped face, the layers between two levels) are an error naming them. Reports per body the method, counts and quality; a body no structured method fits is an error that says why"#,
+    params: r#"{"body": "Body1" (default: every body of the open design) or "surface": 0 (an imported surface), "size": 2.0 (element size, mm; default 1/25 of the bounding-box diagonal), "order": 1 (hex8) or 2 (hex20, mid-edge nodes on the geometry), "method": "auto" (default) | "swept" (any sweep) | "extrude" | "sweep" | "revolve" | "mapped", "tolerance": 0.05 (chordal tolerance of the tessellation, mm; default 1e-3 of the diagonal)} — replaces the meshes of the bodies it meshes (as mesh.tet.generate; other bodies keep theirs) with structured hexahedra: multi-level sweeps along a direction or around an axis (their cross-section cut into mappable blocks automatically: O-grids round holes, triangle primitives, four-sided blocks; nothing is added to the model), one-to-one sweeps through linking faces, or mapped blocks. Boundary element faces are tagged with their B-rep faces (named as in geometry.bodies; by index when a face has no name; `weld`, `weld_distance` and `feature_angle` as in mesh.tet.generate), so sets by geometry resolve. Edge seeds (mesh.seed.edge) set the counts and spacing of their edges: exact seeds are held, and seeds that cannot all hold (opposite sides of a mapped face, the layers between two levels) are an error naming them. Size controls (mesh.size.set) set the division counts and spacing of the other edges through the graded size field (a structured mesh carries a count across its block, so a control refines the whole layer or row it lies in). Reports per body the method, counts and quality; a body no structured method fits is an error that says why"#,
     form: Some(super::forms::HEX_GENERATE),
     kind: CommandKind::Model,
     requires: &[Requirement::Geometry],
@@ -158,7 +158,7 @@ pub const HEX_MAPPED: CommandSpec = CommandSpec {
 pub const HEX_BLOCKS: CommandSpec = CommandSpec {
     id: "mesh.hex.blocks",
     label: "Block Hex Mesh",
-    params: r#"{"bodies": ["Cell1", "Cell2"] (default: every body of the open design), "size": 2.0 (element size, mm; default 1/25 of the bounding-box diagonal of all of them), "order": 1 (hex8) or 2 (hex20, mid-edge nodes on the geometry), "tolerance": 0.05 (chordal tolerance of the tessellation, mm; default 1e-3 of that diagonal)} — replaces the cells' meshes (as mesh.tet.generate; other bodies keep theirs) with one conforming all-hex mesh of a part partitioned into cells (bodies that meet face to face, such as the pieces of solid.split_body in SolidCraft): every cell a mapped block (six four-sided faces; faces that meet smoothly, such as the two halves of a hole, count as one), division counts assigned over all cells together, each shared face meshed once and its nodes merged, radial lines graded off holes and fillets. Elements are tagged with their cell's body and boundary faces with its B-rep faces (`weld`, `weld_distance` and `feature_angle` as in mesh.tet.generate). Reports the cells, the shared faces, counts and quality; a cell that is not a block, or cells that touch without sharing whole faces, is an error that says which"#,
+    params: r#"{"bodies": ["Cell1", "Cell2"] (default: every body of the open design), "size": 2.0 (element size, mm; default 1/25 of the bounding-box diagonal of all of them), "order": 1 (hex8) or 2 (hex20, mid-edge nodes on the geometry), "tolerance": 0.05 (chordal tolerance of the tessellation, mm; default 1e-3 of that diagonal)} — replaces the cells' meshes (as mesh.tet.generate; other bodies keep theirs) with one conforming all-hex mesh of a part partitioned into cells (bodies that meet face to face, such as the pieces of solid.split_body in SolidCraft): every cell a mapped block (six four-sided faces; faces that meet smoothly, such as the two halves of a hole, count as one), division counts assigned over all cells together, each shared face meshed once and its nodes merged, radial lines graded off holes and fillets, size controls (mesh.size.set; one on a whole cell refines its surface) setting the counts and spacing through the graded size field. Elements are tagged with their cell's body and boundary faces with its B-rep faces (`weld`, `weld_distance` and `feature_angle` as in mesh.tet.generate). Reports the cells, the shared faces, counts and quality; a cell that is not a block, or cells that touch without sharing whole faces, is an error that says which"#,
     form: Some(super::forms::HEX_BLOCKS),
     kind: CommandKind::Model,
     requires: &[Requirement::Design],
@@ -232,7 +232,9 @@ pub(super) fn hex_blocks(s: &mut Session, p: &Value) -> Result<Value> {
         seeds: super::seeds::edge_seeds(s)?,
         ..HexOptions::default()
     };
-    let cm = hex_mesh_cells(&cells, &UniformSize(h), &options).map_err(|e| match e {
+    let names: Vec<&str> = inputs.iter().map(|b| b.name.as_str()).collect();
+    let field = super::sizes::sizing(s)?.joint(&names).field("", h)?;
+    let cm = hex_mesh_cells(&cells, &field, &options).map_err(|e| match e {
         fieldcraft_mesh::Error::Model(fieldcraft_model::Error::Cancelled) => EngineError::Model(fieldcraft_model::Error::Cancelled),
         e => EngineError::Params(e.to_string()),
     })?;
@@ -297,9 +299,10 @@ fn generate(s: &mut Session, p: &Value, default: HexMethod, allowed: &[HexMethod
         })?,
     };
     let bodies = inputs(s, p)?;
+    let sizing = super::sizes::sizing(s)?;
     let mut meshes: Vec<(Input, HexMesh)> = Vec::with_capacity(bodies.len());
     for b in bodies {
-        let mesh = hex_body(p, &b, method, quadratic, size)?;
+        let mesh = hex_body(p, &b, method, quadratic, size, &sizing)?;
         meshes.push((b, mesh));
     }
     // Replace the bodies' meshes (replace.rs); other bodies and the definitions stay.
@@ -327,13 +330,13 @@ fn generate(s: &mut Session, p: &Value, default: HexMethod, allowed: &[HexMethod
     Ok(cleared.report(s, json!({"bodies": report, "nodes": nodes, "elements": elements})))
 }
 
-/// Mesh one body with `method` (hex20 when `quadratic`) at `size` (default: from its extent);
-/// the model is not touched. Errors name the body.
-pub(super) fn hex_body(p: &Value, b: &Input, method: HexMethod, quadratic: bool, size: Option<f64>) -> Result<HexMesh> {
+/// Mesh one body with `method` (hex20 when `quadratic`) at `size` (default: from its extent) and
+/// the size controls of `sizing`; the model is not touched. Errors name the body.
+pub(super) fn hex_body(p: &Value, b: &Input, method: HexMethod, quadratic: bool, size: Option<f64>, sizing: &Sizing) -> Result<HexMesh> {
     if !(b.diagonal > 0.0 && b.diagonal.is_finite()) {
         return Err(EngineError::Params(format!("body `{}` has no extent", b.name)));
     }
-    let h = size.unwrap_or(DEFAULT_RELATIVE_SIZE * b.diagonal);
+    let h = sizing.body_size(&b.name, size.unwrap_or(DEFAULT_RELATIVE_SIZE * b.diagonal));
     if h < MIN_RELATIVE_SIZE * b.diagonal {
         return Err(EngineError::Params(format!("`size` must be at least {} mm for body `{}`", MIN_RELATIVE_SIZE * b.diagonal, b.name)));
     }
@@ -349,7 +352,8 @@ pub(super) fn hex_body(p: &Value, b: &Input, method: HexMethod, quadratic: bool,
         seeds: b.seeds.clone(),
         ..HexOptions::default()
     };
-    hex_mesh(&surface, &b.surfaces, &UniformSize(h), &options).map_err(|e| EngineError::of_body(&b.name, e))
+    let field = sizing.field(&b.name, h)?;
+    hex_mesh(&surface, &b.surfaces, &field, &options).map_err(|e| EngineError::of_body(&b.name, e))
 }
 
 /// Add a mesh of several cells (`inputs[c]` is cell `c`) after the model's largest labels, its

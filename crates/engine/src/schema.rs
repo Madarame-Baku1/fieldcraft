@@ -223,6 +223,8 @@ pub enum Collection {
     Stitch,
     /// A face split (`geometry.face.split`).
     FaceSplit,
+    /// A size control (`mesh.size.set`).
+    SizeControl,
 }
 
 impl Collection {
@@ -251,6 +253,7 @@ impl Collection {
             Collection::FaceMerge => "face merge",
             Collection::Stitch => "stitch",
             Collection::FaceSplit => "face split",
+            Collection::SizeControl => "size control",
         }
     }
 }
@@ -283,6 +286,7 @@ impl Session {
             Collection::FaceMerge => Box::new(m.face_merges().iter().map(|f| f.name.as_str())),
             Collection::Stitch => Box::new(m.stitches().iter().map(|f| f.name.as_str())),
             Collection::FaceSplit => Box::new(m.face_splits().iter().map(|f| f.name.as_str())),
+            Collection::SizeControl => Box::new(m.size_controls().keys().map(String::as_str)),
         };
         names.take(MAX_NAMES).map(str::to_string).collect()
     }

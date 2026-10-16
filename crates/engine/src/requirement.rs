@@ -40,6 +40,8 @@ pub enum Requirement {
     FaceSplit,
     /// An edge seed.
     Seed,
+    /// A size control.
+    SizeControl,
     /// At least one mesh node.
     Nodes,
     /// At least one element.
@@ -89,6 +91,7 @@ impl Requirement {
             Requirement::Stitch => !m.stitches().is_empty(),
             Requirement::FaceSplit => !m.face_splits().is_empty(),
             Requirement::Seed => !m.seeds().is_empty(),
+            Requirement::SizeControl => !m.size_controls().is_empty(),
             Requirement::Nodes => !m.nodes().is_empty(),
             Requirement::Mesh => has_elements,
             Requirement::Analysable => {
@@ -132,6 +135,7 @@ impl Requirement {
             Requirement::Stitch => "a stitch",
             Requirement::FaceSplit => "a face split",
             Requirement::Seed => "an edge seed",
+            Requirement::SizeControl => "a local size",
             Requirement::Nodes => "mesh nodes",
             Requirement::Mesh | Requirement::Analysable => "a mesh",
             Requirement::ElementMaterial | Requirement::Material => "a material",
@@ -165,6 +169,7 @@ impl Requirement {
             Requirement::Stitch => "geometry.stitch",
             Requirement::FaceSplit => "geometry.face.split",
             Requirement::Seed => "mesh.seed.edge",
+            Requirement::SizeControl => "mesh.size.set",
             Requirement::Nodes => "mesh.node.add",
             Requirement::Mesh | Requirement::Analysable => "mesh.tet.generate",
             Requirement::ElementMaterial | Requirement::Material => "model.material.create",
@@ -224,6 +229,7 @@ impl crate::schema::Collection {
             C::FaceMerge => Requirement::FaceMerge,
             C::Stitch => Requirement::Stitch,
             C::FaceSplit => Requirement::FaceSplit,
+            C::SizeControl => Requirement::SizeControl,
         }
     }
 }
