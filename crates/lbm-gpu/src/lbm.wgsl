@@ -59,6 +59,9 @@ struct Params {
 @group(0) @binding(15) var<storage, read_write> partials: array<f32>;
 
 var<workgroup> red: array<vec4<f32>, 256>;
+// The largest squared speed of a workgroup's cells (collide): one atomic per workgroup, not
+// per cell, which serialise on a single address.
+var<workgroup> speed: array<f32, 256>;
 
 fn c_of(q: u32) -> vec3<i32> {
     switch q {
@@ -109,8 +112,19 @@ fn is_fluid(cell: u32) -> bool {
 @compute @workgroup_size(256)
 fn collide(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>) {
     let cell = cell_of(lid, wg);
-    if cell >= params.n { return; }
-    if !is_fluid(cell) { return; }
+    speed[lid] = 0.0;
+    if cell < params.n && is_fluid(cell) {
+        collide_cell(cell, lid);
+    }
+    workgroupBarrier();
+    for (var k = 128u; k > 0u; k = k >> 1u) {
+        if lid < k { speed[lid] = max(speed[lid], speed[lid + k]); }
+        workgroupBarrier();
+    }
+    if lid == 0u { atomicMax(&stats[0], bitcast<u32>(speed[0])); }
+}
+
+fn collide_cell(cell: u32, lid: u32) {
     let n = params.n;
     var fq: array<f32, 19>;
     var drho = 0.0;
@@ -130,7 +144,7 @@ fn collide(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg:
     let force = rho * a;
     let u = (j + 0.5 * force) / rho;
     let uu = dot(u, u);
-    atomicMax(&stats[0], bitcast<u32>(uu));
+    speed[lid] = uu;
     let uf = dot(u, force);
     let forced = params.acc.w > 0.5;
     let wp = params.omega_plus;
