@@ -55,6 +55,8 @@ pub struct FluidStats {
     pub mach: f64,
     /// Fluid cells times steps.
     pub cell_updates: u64,
+    /// What stepped the flow: `cpu`, or `gpu: <adapter>`.
+    pub backend: String,
 }
 
 /// The result of a fluid step.
@@ -209,6 +211,7 @@ pub fn run(setup: &Setup, flow: &mut dyn Backend, limits: &Limits) -> Result<Flu
             lattice_velocity: setup.lattice_velocity,
             mach: setup.mach,
             cell_updates: (flow.fluid_cells() as u64).saturating_mul(total),
+            backend: flow.name(),
         },
         warnings,
     })

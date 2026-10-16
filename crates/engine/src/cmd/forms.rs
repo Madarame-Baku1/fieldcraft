@@ -1953,6 +1953,9 @@ pub const SOLVE_EXPLICIT: &[Field] = &[
 pub const SOLVE_HISTORY: &[Field] = &[SOLVED.req(), int("every", "Keep one in", 1, 1_000_000_000).help("Keep one history sample in this many.")];
 pub const SOLVE_FLUID: &[Field] = &[
     STEP,
+    choice("backend", "Backend", &[("cpu", "CPU"), ("gpu", "GPU")])
+        .help("The CPU (double precision, the same result on every machine) or the GPU the build and FIELDCRAFT_GPU pick (single precision).")
+        .def("\"cpu\""),
     int("max_cells", "Max cells", 1, 16_000_000).help("Cap on the lattice cells."),
     int("max_steps", "Max steps", 1, 10_000_000).help("Cap on the lattice time steps."),
     positive("max_cell_updates", "Max cell updates", D::None).help("Cap on cells × steps."),

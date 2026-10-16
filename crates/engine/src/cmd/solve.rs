@@ -100,7 +100,7 @@ pub const HISTORY: CommandSpec = CommandSpec {
 pub const FLUID: CommandSpec = CommandSpec {
     id: "solve.fluid",
     label: "Solve Fluid Step",
-    params: r#"{"step": "Flow", "max_cells": 16000000, "max_steps": 10000000, "max_cell_updates": 1e12, "max_frame_bytes": 2e9, "threads": 8} — runs a fluid step with the lattice Boltzmann solver (the only fluid step when `step` is left out): obstacles are triangulated from the open design or taken from imported surfaces; returns the time step, relaxation time, Mach number, mass and the final force on every wall; the caps may only be lowered; `threads` as for solve.static"#,
+    params: r#"{"step": "Flow", "backend": "cpu", "max_cells": 16000000, "max_steps": 10000000, "max_cell_updates": 1e12, "max_frame_bytes": 2e9, "threads": 8} — runs a fluid step with the lattice Boltzmann solver (the only fluid step when `step` is left out): obstacles are triangulated from the open design or taken from imported surfaces; returns the time step, relaxation time, Mach number, mass and the final force on every wall; `backend` is `cpu` (the default: double precision, the same result on every machine) or `gpu` (the step on the GPU `FIELDCRAFT_GPU` picks, single precision, within the backend's stated tolerance of the CPU; an error when the build has none); the caps may only be lowered; `threads` as for solve.static"#,
     form: Some(super::forms::SOLVE_FLUID),
     kind: CommandKind::Model,
     requires: &[Requirement::FluidDomain, Requirement::Step],
@@ -487,10 +487,15 @@ fn run_fluid(s: &mut Session, p: &Value) -> Result<Value> {
         max_frame_bytes: cap(p, "max_frame_bytes", defaults.max_frame_bytes)?,
     };
     let step = opt::<String>(p, "step")?;
+    let backend = match opt::<String>(p, "backend")? {
+        None => fieldcraft_lbm::Choice::Cpu,
+        Some(b) => fieldcraft_lbm::Choice::parse(&b)
+            .ok_or_else(|| EngineError::Params(format!("`backend` must be `cpu` or `gpu`, not `{}`", b.chars().take(40).collect::<String>())))?,
+    };
     let (_, domain) = fieldcraft_lbm::fluid_step(&s.model, step.as_deref())?;
     let obstacles = obstacles(s, domain)?;
     let model = &s.model;
-    let r = with_threads(threads(s, p)?, || fieldcraft_lbm::solve_fluid(model, step.as_deref(), &obstacles, &limits))?;
+    let r = with_threads(threads(s, p)?, || fieldcraft_lbm::solve_fluid_on(model, step.as_deref(), &obstacles, &limits, backend))?;
     let summary = fluid_summary(&r);
     s.store_result(StepResult::Fluid(r));
     Ok(summary)
@@ -517,6 +522,7 @@ fn fluid_summary(r: &FluidResult) -> Value {
     let (m0, m1) = (r.frames.first().map_or(0.0, |f| f.mass), last.map_or(0.0, |f| f.mass));
     json!({
         "step": r.step,
+        "backend": r.stats.backend,
         "cells": r.stats.cells,
         "fluid_cells": r.stats.fluid_cells,
         "steps": r.stats.steps,
@@ -1175,6 +1181,10 @@ pub(crate) mod tests {
             json!({"step": "Shear", "threads": 0}),
             json!({"step": "Shear", "threads": 100000}),
             json!({"step": "Shear", "threads": null}),
+            json!({"step": "Shear", "backend": "tpu"}),
+            json!({"step": "Shear", "backend": 7}),
+            // no device backend is registered in this test binary: an error, not a panic
+            json!({"step": "Shear", "backend": "gpu"}),
         ];
         for id in ["solve.fluid", "solve.probe", "solve.static", "solve.frequency"] {
             for p in &hostile {

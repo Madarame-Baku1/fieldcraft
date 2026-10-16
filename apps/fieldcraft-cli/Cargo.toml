@@ -10,6 +10,7 @@ workspace = true
 
 [dependencies]
 fieldcraft-engine = { workspace = true }
+fieldcraft-lbm-gpu = { workspace = true }
 fieldcraft-gpu = { workspace = true }
 fieldcraft-render = { workspace = true }
 fieldcraft-io = { workspace = true }
