@@ -48,15 +48,17 @@
 // Population arrays are indexed by cell and direction counts fixed when they are allocated.
 #![allow(clippy::needless_range_loop)]
 
+pub mod backend;
 pub mod flow;
 pub mod lattice;
 pub mod setup;
 pub mod solve;
 pub mod voxel;
 
-pub use flow::{Flow, Group};
+pub use backend::{Backend, Choice, Fields, register_backend};
+pub use flow::{Flow, Group, Link, OpenCell, Rule, Target};
 pub use setup::{Obstacle, Setup, fluid_step};
-pub use solve::{FluidResult, FluidStats, ForceHistory, Frame, run, solve_fluid};
+pub use solve::{FluidResult, FluidStats, ForceHistory, Frame, run, solve_fluid, solve_fluid_on};
 pub use voxel::Grid;
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]

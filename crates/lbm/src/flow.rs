@@ -45,9 +45,10 @@ use crate::setup::{MAX_LATTICE_SPEED, Obstacle, Setup};
 use crate::voxel::{Grid, TriangleTree, voxelise};
 use crate::{Error, Result};
 
-/// Where a population of a cell next to a wall or box face comes from.
+/// Where a population of a cell next to a wall or box face comes from (every other population
+/// streams from the neighbour at `−c_q`). Public so a device backend can apply the same rules.
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Rule {
+pub enum Rule {
     /// The same direction from another cell (a neighbour or a periodic image).
     Pull { from: u32 },
     /// Bounce-back at a wall of force group `group`; `du` is the moving-wall term.
@@ -59,25 +60,26 @@ enum Rule {
 }
 
 /// A population, direction `q` of `cell`, and where it comes from.
-#[derive(Debug, Clone, Copy)]
-struct Link {
-    cell: u32,
-    q: u8,
-    rule: Rule,
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Link {
+    pub cell: u32,
+    pub q: u8,
+    pub rule: Rule,
 }
 
 /// An inlet or outlet cell.
-#[derive(Debug, Clone, Copy)]
-struct OpenCell {
-    cell: u32,
-    axis: usize,
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OpenCell {
+    pub cell: u32,
+    pub axis: usize,
     /// +1 at a min face (the inward normal points up the axis), −1 at a max face.
-    inward: f64,
-    target: Target,
+    pub inward: f64,
+    pub target: Target,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum Target {
+/// What an open cell holds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Target {
     /// The velocity (lattice units).
     Velocity([f64; 3]),
     /// The density.
@@ -377,6 +379,36 @@ impl Flow {
         self.steps_done
     }
 
+    /// The links that do not stream from the neighbour at `−c_q`, in cell order.
+    pub fn links(&self) -> &[Link] {
+        &self.links
+    }
+
+    /// The inlet and outlet cells.
+    pub fn open_cells(&self) -> &[OpenCell] {
+        &self.open
+    }
+
+    /// Per direction, the index offset of the neighbour a population streams from.
+    pub fn offsets(&self) -> [isize; Q] {
+        self.offset
+    }
+
+    /// `1/τ⁺` and `1/τ⁻`.
+    pub fn omegas(&self) -> (f64, f64) {
+        (self.omega_plus, self.omega_minus)
+    }
+
+    /// The body acceleration in lattice units.
+    pub fn acceleration(&self) -> [f64; 3] {
+        self.acceleration
+    }
+
+    /// Population `q` of `cell` (zero in a solid cell).
+    pub fn population(&self, q: usize, cell: usize) -> f64 {
+        self.f.get(q * self.stride + cell).copied().unwrap_or(0.0)
+    }
+
     /// Set every fluid cell to the equilibrium of `state(cell) = (density, velocity)` in lattice
     /// units (velocity as defined with the half force).
     pub fn set_equilibrium(&mut self, state: impl Fn(usize) -> (f64, [f64; 3])) {
@@ -640,5 +672,59 @@ impl Flow {
                 }
             }
         }
+    }
+}
+
+impl crate::backend::Backend for Flow {
+    fn name(&self) -> String {
+        "cpu".into()
+    }
+
+    fn advance(&mut self, steps: u64) -> Result<()> {
+        for _ in 0..steps {
+            self.step()?;
+        }
+        Ok(())
+    }
+
+    fn steps_done(&self) -> u64 {
+        self.steps_done
+    }
+
+    fn fields(&mut self) -> Result<crate::backend::Fields> {
+        let n = self.n;
+        let mut density = filled(n, 0.0, "density field")?;
+        let mut velocity = filled(n, [0.0; 3], "velocity field")?;
+        for cell in 0..n {
+            if let (Some((rho, u)), Some(d), Some(v)) = (self.moments(cell), density.get_mut(cell), velocity.get_mut(cell)) {
+                *d = rho;
+                *v = u;
+            }
+        }
+        Ok(crate::backend::Fields { density, velocity })
+    }
+
+    fn mass(&mut self) -> Result<f64> {
+        Ok(Flow::mass(self))
+    }
+
+    fn forces(&mut self) -> Result<Vec<[f64; 3]>> {
+        Ok(self.forces.clone())
+    }
+
+    fn groups(&self) -> &[Group] {
+        &self.groups
+    }
+
+    fn fluid_cells(&self) -> usize {
+        self.fluid_cells
+    }
+
+    fn is_fluid(&self, cell: usize) -> bool {
+        Flow::is_fluid(self, cell)
+    }
+
+    fn empty_obstacles(&self) -> &[String] {
+        &self.empty_obstacles
     }
 }

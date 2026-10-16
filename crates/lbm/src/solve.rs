@@ -2,6 +2,7 @@
 
 use fieldcraft_model::Model;
 
+use crate::backend::{Backend, Choice, Fields};
 use crate::flow::Flow;
 use crate::setup::{Obstacle, Setup};
 use crate::voxel::Grid;
@@ -83,39 +84,44 @@ impl FluidResult {
 }
 
 /// Solve the fluid step named `step` (or the model's only fluid step) with the obstacles' surfaces
-/// prepared by the caller.
+/// prepared by the caller, on the CPU.
 pub fn solve_fluid(model: &Model, step: Option<&str>, obstacles: &[Obstacle], limits: &Limits) -> Result<FluidResult> {
-    let setup = Setup::new(model, step, obstacles, limits)?;
-    let mut flow = Flow::new(&setup, obstacles)?;
-    run(&setup, &mut flow, limits)
+    solve_fluid_on(model, step, obstacles, limits, Choice::Cpu)
 }
 
-fn frame(setup: &Setup, flow: &Flow, step: u64) -> Result<Frame> {
+/// [`solve_fluid`] on the backend `choice` names (the registered device backend, or the CPU).
+pub fn solve_fluid_on(model: &Model, step: Option<&str>, obstacles: &[Obstacle], limits: &Limits, choice: Choice) -> Result<FluidResult> {
+    let setup = Setup::new(model, step, obstacles, limits)?;
+    let flow = Flow::new(&setup, obstacles)?;
+    let mut backend = crate::backend::backend(choice, flow, &setup)?;
+    run(&setup, backend.as_mut(), limits)
+}
+
+fn frame(setup: &Setup, flow: &mut dyn Backend, step: u64) -> Result<Frame> {
     let n = setup.grid.len();
     let mut velocity = Vec::new();
     let mut pressure = Vec::new();
     velocity.try_reserve_exact(n).map_err(|_| Error::Limit("not enough memory for an output frame".into()))?;
     pressure.try_reserve_exact(n).map_err(|_| Error::Limit("not enough memory for an output frame".into()))?;
     let vs = setup.velocity_scale();
+    let Fields { density, velocity: u } = flow.fields()?;
     for cell in 0..n {
-        match flow.moments(cell) {
-            Some((rho, u)) => {
-                velocity.push(u.map(|c| (c * vs) as f32));
-                pressure.push(setup.gauge_pressure(rho) as f32);
-            }
-            None => {
-                velocity.push([0.0; 3]);
-                pressure.push(0.0);
-            }
+        if flow.is_fluid(cell) {
+            velocity.push(u.get(cell).copied().unwrap_or([0.0; 3]).map(|c| (c * vs) as f32));
+            pressure.push(setup.gauge_pressure(density.get(cell).copied().unwrap_or(1.0)) as f32);
+        } else {
+            velocity.push([0.0; 3]);
+            pressure.push(0.0);
         }
     }
-    let mass = flow.mass() * setup.density * setup.grid.spacing.powi(3);
+    let mass = flow.mass()? * setup.density * setup.grid.spacing.powi(3);
     Ok(Frame { time: step as f64 * setup.time_step, step, velocity, pressure, mass })
 }
 
-/// Run a prepared flow (fresh from [`Flow::new`], possibly with its own initial state) through
-/// the setup's steps, recording frames and force histories.
-pub fn run(setup: &Setup, flow: &mut Flow, limits: &Limits) -> Result<FluidResult> {
+/// Run a prepared flow (fresh from [`Flow::new`], possibly with its own initial state, on any
+/// backend) through the setup's steps, recording frames and force histories. The steps go to
+/// the backend in chunks, up to the next frame, history sample or progress check.
+pub fn run(setup: &Setup, flow: &mut dyn Backend, limits: &Limits) -> Result<FluidResult> {
     let n = setup.grid.len();
     let total = setup.steps;
     let frames = u64::from(setup.frames).min(total).max(1);
@@ -135,21 +141,30 @@ pub fn run(setup: &Setup, flow: &mut Flow, limits: &Limits) -> Result<FluidResul
     let mut history_times = Vec::new();
     let mut forces: Vec<Vec<[f64; 3]>> = vec![Vec::new(); flow.groups().len()];
     let mut next_frame = 1u64;
+    // Frame j (1..=frames) at step round(j · total / frames).
+    let frame_step = |j: u64| (j * total + frames / 2) / frames;
     fieldcraft_model::progress::stage("Fluid steps", Some(total as f64), "");
-    for k in 1..=total {
+    let mut k = 0u64;
+    while k < total {
         fieldcraft_model::progress::check()?;
-        flow.step()?;
-        if k % 64 == 0 {
+        // Up to the next event: a history sample, a frame, a progress count.
+        let mut next = total.min(k + 64 - k % 64);
+        next = next.min((k / every + 1) * every);
+        if next_frame <= frames {
+            next = next.min(frame_step(next_frame).max(k + 1));
+        }
+        flow.advance(next - k)?;
+        k = next;
+        if k.is_multiple_of(64) || k == total {
             fieldcraft_model::progress::count(k as f64);
         }
-        if k % every == 0 || k == total {
+        if k.is_multiple_of(every) || k == total {
             history_times.push(k as f64 * setup.time_step);
-            for (h, f) in forces.iter_mut().zip(flow.forces()) {
+            for (h, f) in forces.iter_mut().zip(flow.forces()?) {
                 h.push(f.map(|c| c * fs));
             }
         }
-        // Frame j (1..=frames) at step round(j · total / frames).
-        while next_frame <= frames && k == (next_frame * total + frames / 2) / frames {
+        while next_frame <= frames && k == frame_step(next_frame) {
             out_frames.push(frame(setup, flow, k)?);
             next_frame += 1;
         }
@@ -158,7 +173,8 @@ pub fn run(setup: &Setup, flow: &mut Flow, limits: &Limits) -> Result<FluidResul
     let mut warnings = setup.warnings.clone();
     // The weakly compressible scheme turns pressure differences into density differences of
     // Δp / (ρ c_s²) in lattice units; large ones show the time step is too long for the flow.
-    let spread = (0..n).filter_map(|c| flow.moments(c)).map(|(rho, _)| (rho - 1.0).abs()).fold(0.0, f64::max);
+    let end = flow.fields()?;
+    let spread = (0..n).filter(|c| flow.is_fluid(*c)).filter_map(|c| end.density.get(c)).map(|rho| (rho - 1.0).abs()).fold(0.0, f64::max);
     if spread > COMPRESSIBILITY_WARNING {
         warnings.push(format!(
             "the density varies by {:.1}% at the end: the weakly compressible error is visible; a shorter time step reduces it (quadratically)",
@@ -167,6 +183,10 @@ pub fn run(setup: &Setup, flow: &mut Flow, limits: &Limits) -> Result<FluidResul
     }
     for body in flow.empty_obstacles() {
         warnings.push(format!("obstacle `{body}` covers no cell centre: it is smaller than the spacing or outside the box"));
+    }
+    if flow.name() != "cpu" {
+        warnings
+            .push(format!("solved on {}: single precision, deterministic on this device, within the backend's tolerance of the CPU", flow.name()));
     }
     let solid: Vec<bool> = (0..n).map(|c| !flow.is_fluid(c)).collect();
     Ok(FluidResult {
