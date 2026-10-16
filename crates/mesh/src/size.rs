@@ -29,6 +29,13 @@ use crate::{Error, Result};
 /// treat anything else as invalid input.
 pub trait SizeField {
     fn size(&self, p: [f64; 3]) -> f64;
+
+    /// The smallest and largest size anywhere, when the field knows them (a mesher that builds
+    /// from a root size, such as the octree, starts from the largest and plans its depth from
+    /// the smallest).
+    fn range(&self) -> Option<(f64, f64)> {
+        None
+    }
 }
 
 impl<F: Fn([f64; 3]) -> f64> SizeField for F {
@@ -44,6 +51,10 @@ pub struct UniformSize(pub f64);
 impl SizeField for UniformSize {
     fn size(&self, _: [f64; 3]) -> f64 {
         self.0
+    }
+
+    fn range(&self) -> Option<(f64, f64)> {
+        Some((self.0, self.0))
     }
 }
 
@@ -347,6 +358,10 @@ impl SizeField for RegionSize {
             h = h.min(l.size + self.growth * l.region.distance(p));
         }
         h
+    }
+
+    fn range(&self) -> Option<(f64, f64)> {
+        Some((self.finest(), self.global))
     }
 }
 

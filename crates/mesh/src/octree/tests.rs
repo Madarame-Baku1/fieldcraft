@@ -159,3 +159,26 @@ fn meshing_is_deterministic() {
     let b = octree_hex_mesh(&s, &UniformSize(2.0), &OctreeOptions::default()).unwrap();
     assert_eq!(a, b);
 }
+
+/// A size box refines the grid inside it to the level its size needs (closure may carry that
+/// level further), and the root cells keep the global size; a size deeper than `max_depth` allows is refused before meshing.
+#[test]
+fn a_size_box_refines_the_grid_inside_it() {
+    use crate::size::{LocalSize, Region, RegionSize};
+    let s = box_surface([0.0; 3], [18.0, 18.0, 18.0]);
+    let local = LocalSize { region: Region::Box { lo: [0.0; 3], hi: [6.0; 3] }, size: 2.0 };
+    let field = RegionSize::new(6.0, 0.3, vec![local.clone()]).unwrap();
+    let m = octree_hex_mesh(&s, &field, &OctreeOptions::default()).unwrap();
+    let edge = |h: &[u32; 8]| {
+        let (a, b) = (m.nodes[h[0] as usize], m.nodes[h[1] as usize]);
+        ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+    };
+    let centre = |h: &[u32; 8]| [0, 1, 2].map(|k| h.iter().map(|&v| m.nodes[v as usize][k]).sum::<f64>() / 8.0);
+    let inside: Vec<f64> = m.hexes.iter().filter(|h| centre(h).iter().all(|&c| (1.0..5.0).contains(&c))).map(edge).collect();
+    assert!(!inside.is_empty() && inside.iter().all(|&e| e < 2.0 * 1.2), "{inside:?}");
+    assert_eq!((m.report.root_size, m.report.levels), (6.0, 1), "{:?}", m.report);
+    let shallow = OctreeOptions { max_depth: 1, curvature_levels: 1, ..OctreeOptions::default() };
+    let deep = RegionSize::new(6.0, 0.3, vec![LocalSize { size: 0.5, ..local }]).unwrap();
+    let e = octree_hex_mesh(&s, &deep, &shallow).unwrap_err().to_string();
+    assert!(e.contains("max_depth"), "{e}");
+}

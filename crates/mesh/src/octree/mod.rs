@@ -236,7 +236,8 @@ enum Attempt {
 }
 
 /// Mesh the solid bounded by `surface` with hexahedra of about `field`'s size (the root cell
-/// size is the field at the centre of the part's box; finer cells follow the part's curvature,
+/// size is the field's largest size ([`SizeField::range`]), else the field at the centre of the
+/// part's box; cells are refined where the field is smaller than they are; finer cells follow the part's curvature,
 /// thickness and narrow faces). See the module docs.
 pub fn octree_hex_mesh(surface: &BoundarySurface, field: &dyn SizeField, options: &OctreeOptions) -> Result<OctreeHexMesh> {
     check_options(options)?;
@@ -323,7 +324,26 @@ fn plan<'a>(g: &'a Geometry<'a>, field: &'a dyn SizeField, options: &'a OctreeOp
     let frame = choose_frame(g);
     let (lo, hi) = frame_box(g, &frame);
     let centre = from_frame(&frame, [0, 1, 2].map(|k| 0.5 * (lo[k] + hi[k])));
-    let h = checked_size(field, centre)?;
+    // The root cells at the largest size; the depth reaches the smallest (size controls).
+    let h = match field.range() {
+        Some((_, coarsest)) if coarsest > 0.0 && coarsest.is_finite() => coarsest,
+        _ => checked_size(field, centre)?,
+    };
+    if let Some((finest, _)) = field.range()
+        && finest > 0.0
+        && finest < h
+    {
+        match levels_below(h, finest) {
+            Some(d) if d <= options.max_depth => {}
+            d => {
+                let n = d.map_or_else(|| format!("more than {}", grid::MAX_LEVEL), |l| l.to_string());
+                return Err(Error::Limit(format!(
+                    "a size of {finest:.4} below the root size {h:.4} needs {n} levels (each a third); `max_depth` is {}: raise it, or use a larger local size",
+                    options.max_depth
+                )));
+            }
+        }
+    }
     let needs = Needs::of(g, thickness, options);
     let deep = levels_below(h, needs.edge);
     let mut anchors: Vec<(f64, Option<u8>)> = vec![(h, deep)];
