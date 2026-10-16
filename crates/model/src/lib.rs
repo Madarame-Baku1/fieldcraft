@@ -50,6 +50,7 @@ pub mod rename;
 pub mod sections;
 pub mod seeds;
 pub mod sets;
+pub mod sizes;
 pub mod steps;
 pub mod tie;
 pub mod units;
@@ -78,6 +79,7 @@ pub use relaxations::{Relaxation, RelaxationCell};
 pub use sections::{BeamProfile, Extent, Formulation, Integration, Section, SectionKind};
 pub use seeds::{Bias, BiasToward, Divisions, Seed, SeedConstraint};
 pub use sets::Set;
+pub use sizes::{SizeControl, SizeRegion};
 pub use steps::{
     ArcConstraint, ArcLength, BulkViscosity, DisplacementLimit, ExplicitDynamic, Hourglass, HourglassKind, Imperfection, InitialVelocity,
     MAX_LOAD_PATH_POINTS, MAX_NONLINEAR_INCREMENTS, MAX_NONLINEAR_ITERATIONS, MassScaling, NonlinearStatic, OutputVariable, Procedure, RigidWall,
@@ -168,6 +170,12 @@ pub struct Model {
     /// Edge seeds, sorted by edge.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     seeds: Vec<Seed>,
+    /// Size controls (`mesh.size.set`), by name.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    size_controls: BTreeMap<String, SizeControl>,
+    /// The size field's growth rate (`mesh.size.growth`); `None`: the default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size_growth: Option<f64>,
     /// Relaxation fields (`mesh.node.relax`), by name.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     relaxations: BTreeMap<String, Relaxation>,
@@ -231,6 +239,10 @@ struct ModelData {
     suppressed_datums: BTreeSet<String>,
     #[serde(default)]
     seeds: Vec<Seed>,
+    #[serde(default)]
+    size_controls: BTreeMap<String, SizeControl>,
+    #[serde(default)]
+    size_growth: Option<f64>,
     #[serde(default)]
     relaxations: BTreeMap<String, Relaxation>,
     #[serde(default)]
@@ -324,6 +336,10 @@ impl TryFrom<ModelData> for Model {
         for s in d.seeds {
             m.set_seed(s)?;
         }
+        for (n, v) in d.size_controls {
+            m.set_size_control(&n, v)?;
+        }
+        m.set_size_growth(d.size_growth)?;
         for (n, v) in d.relaxations {
             m.set_relaxation(&n, v)?;
         }
@@ -469,6 +485,8 @@ impl Model {
             partitions: self.partitions.clone(),
             suppressed_datums: self.suppressed_datums.clone(),
             seeds: self.seeds.clone(),
+            size_controls: self.size_controls.clone(),
+            size_growth: self.size_growth,
             relaxations: self.relaxations.clone(),
             mesh_plans: self.mesh_plans.clone(),
             face_merges: self.face_merges.clone(),
@@ -524,7 +542,7 @@ impl Model {
     }
 
     /// Counts of each kind of definition, for summaries.
-    pub fn definition_counts(&self) -> [(&'static str, usize); 19] {
+    pub fn definition_counts(&self) -> [(&'static str, usize); 20] {
         [
             ("sets", self.sets.len()),
             ("materials", self.materials.len()),
@@ -542,6 +560,7 @@ impl Model {
             ("datums", self.datums.len()),
             ("partitions", self.partitions.len()),
             ("seeds", self.seeds.len()),
+            ("size_controls", self.size_controls.len()),
             ("face_merges", self.face_merges.len()),
             ("stitches", self.stitches.len()),
             ("face_splits", self.face_splits.len()),
