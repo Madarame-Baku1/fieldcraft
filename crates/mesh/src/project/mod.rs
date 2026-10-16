@@ -72,8 +72,9 @@ const MAX_STRETCH: f64 = 2.0;
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProjectOptions {
     /// The element size: each class of parallel block edges gets `round(length / size)`
-    /// divisions (at least one), `length` the geometric mean of its projected edges' lengths,
-    /// and enough that no element is longer than twice the size.
+    /// divisions (at least one), `length / size` the geometric mean of its projected edges'
+    /// lengths in sizes (measured by `field` when there is one), and enough that no element is
+    /// longer than twice the size.
     pub size: f64,
     /// The largest angle (radians) the surface may turn through across one element on a curved
     /// target face: a class takes enough divisions that its elements are no longer than the
@@ -98,6 +99,10 @@ pub struct ProjectOptions {
     /// corners lie on one (within a tenth of the size) keeps its nodes on it through smoothing, so
     /// the mesh can be cut there into two meshes with planar faces.
     pub planes: Vec<(P, P)>,
+    /// A graded size field (size controls) in place of the uniform `size` when the divisions are
+    /// chosen: an edge's length is then measured in units of the field ([`crate::size::ideal_divisions`]).
+    /// Its global size is `size`.
+    pub field: Option<crate::size::RegionSize>,
 }
 
 impl Default for ProjectOptions {
@@ -113,6 +118,7 @@ impl Default for ProjectOptions {
             min_quality: DEFAULT_MIN_QUALITY,
             fixed: Vec::new(),
             planes: Vec::new(),
+            field: None,
         }
     }
 }
@@ -511,6 +517,7 @@ pub fn project_mesh(t: &Topology, surface: &BoundarySurface, g: &dyn Geometry, o
     // longer than [`MAX_STRETCH`] sizes, so a coarse size still follows the geometry.
     let (classes, nclass) = edge_classes(t);
     let mut class_log = vec![(0.0f64, 0usize); nclass];
+    // Per class, its longest edge in element sizes.
     let mut class_max = vec![0.0f64; nclass];
     let mut seen: BTreeSet<[u32; 2]> = BTreeSet::new();
     for (block, cls) in t.blocks.iter().zip(&classes) {
@@ -528,17 +535,23 @@ pub fn project_mesh(t: &Topology, surface: &BoundarySurface, g: &dyn Geometry, o
                 let (pa, pb) = (vpos.get(a as usize).copied().unwrap_or_default(), vpos.get(b as usize).copied().unwrap_or_default());
                 let c = edge_c(edge_key(a, b));
                 let mut len = 0.0;
-                let mut prev = pa;
+                let mut line = Vec::with_capacity(17);
+                line.push(pa);
                 for q in 1..=16 {
                     let x = if q == 16 { pb } else { place(g, &targets, c, lerp(pa, pb, q as f64 / 16.0), tol) };
-                    len += dist(prev, x);
-                    prev = x;
+                    len += dist(*line.last().unwrap_or(&pa), x);
+                    line.push(x);
                 }
+                // The edge's length in element sizes.
+                let measured = match &opts.field {
+                    Some(f) if len > tol => crate::size::ideal_divisions(f, &line)?,
+                    _ => len / opts.size,
+                };
                 if let Some(m) = class_max.get_mut(cls[d]) {
-                    *m = m.max(len);
+                    *m = m.max(measured);
                 }
                 if let Some(l) = class_log.get_mut(cls[d]).filter(|_| len > tol) {
-                    l.0 += (len / opts.size).ln();
+                    l.0 += measured.ln();
                     l.1 += 1;
                 }
             }
@@ -604,7 +617,7 @@ pub fn project_mesh(t: &Topology, surface: &BoundarySurface, g: &dyn Geometry, o
         .zip(&class_arc)
         .map(|((&(sum, k), &longest), &arc)| {
             let mean = if k == 0 { 1.0 } else { (sum / k as f64).exp().round() };
-            (mean.max((longest / (MAX_STRETCH * opts.size)).ceil()) as usize).max(arc).clamp(1, crate::block::MAX_DIVISIONS)
+            (mean.max((longest / MAX_STRETCH).ceil()) as usize).max(arc).clamp(1, crate::block::MAX_DIVISIONS)
         })
         .collect();
     for &(b, d, n) in &opts.divisions {
