@@ -1402,6 +1402,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fieldcraft-lbm-gpu"
+version = "0.6.0"
+dependencies = [
+ "fieldcraft-gpu",
+ "fieldcraft-lbm",
+ "fieldcraft-mesh",
+ "fieldcraft-model",
+ "log",
+ "pollster 1.0.1",
+ "wgpu",
+]
+
+[[package]]
 name = "fieldcraft-mcp"
 version = "0.6.0"
 dependencies = [

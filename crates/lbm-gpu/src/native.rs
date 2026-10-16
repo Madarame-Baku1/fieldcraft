@@ -1,0 +1,578 @@
+//! The device backend (native targets).
+
+use std::collections::HashMap;
+
+use fieldcraft_gpu::select::{self, Policy};
+use fieldcraft_lbm::backend::{Backend, Fields};
+use fieldcraft_lbm::lattice::{C, Q, W};
+use fieldcraft_lbm::setup::MAX_LATTICE_SPEED;
+use fieldcraft_lbm::{Error, Flow, Group, Result, Rule, Target};
+use wgpu::util::DeviceExt;
+
+const SHADER: &str = include_str!("lbm.wgsl");
+const WG: u32 = 256;
+const MAX_GROUPS_X: u32 = 32768;
+const KIND_PULL: u32 = 0;
+const KIND_BOUNCE: u32 = 1;
+const KIND_REFLECT: u32 = 2;
+const KIND_OPEN: u32 = 3;
+
+fn gpu_error(e: impl std::fmt::Display) -> Error {
+    Error::Invalid(format!("GPU: {e}"))
+}
+
+/// Steps per submission: the stability check and a cancel take effect between submissions.
+const MAX_CHUNK: u64 = 64;
+
+/// How long one wait for the device may take before the solve gives up on it.
+const DEVICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// A vector of `len` copies of `value`, or [`Error::Limit`] when memory runs out (the host
+/// arrays are sized by the grid: 16 M cells is over a gigabyte of populations).
+fn filled<T: Clone>(len: usize, value: T, what: &str) -> Result<Vec<T>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(len).map_err(|_| Error::Limit(format!("not enough memory for the {what} ({len} entries)")))?;
+    v.resize(len, value);
+    Ok(v)
+}
+
+/// An empty vector with room for `len`, or [`Error::Limit`].
+fn reserved<T>(len: usize, what: &str) -> Result<Vec<T>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(len).map_err(|_| Error::Limit(format!("not enough memory for the {what} ({len} entries)")))?;
+    Ok(v)
+}
+
+/// Workgroup counts (x, y) covering `count` items.
+fn groups(count: usize) -> Result<(u32, u32)> {
+    let total = u32::try_from(count.div_ceil(WG as usize).max(1)).map_err(|_| Error::Limit("too many cells for one dispatch".into()))?;
+    let gx = total.min(MAX_GROUPS_X);
+    let gy = total.div_ceil(gx);
+    if gy > 65535 {
+        return Err(Error::Limit("too many cells for one dispatch".into()));
+    }
+    Ok((gx, gy))
+}
+
+fn bytes_u32(v: &[u32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+fn bytes_f32(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+/// Register this backend with `fieldcraft_lbm` (an application does this once at start), so
+/// `solve.fluid` with `backend: "gpu"` steps on the device `FIELDCRAFT_GPU` picks.
+pub fn register() {
+    fieldcraft_lbm::register_backend(Box::new(|flow, _setup| GpuFlow::from_env(flow).map(|g| Box::new(g) as Box<dyn Backend>)));
+}
+
+/// A prepared flow on the device.
+pub struct GpuFlow {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    adapter: String,
+    pipelines: HashMap<&'static str, wgpu::ComputePipeline>,
+    /// Bind groups with (f, g) = (buffer 0, buffer 1) and the other way round.
+    bind: [wgpu::BindGroup; 2],
+    /// Which bind group's `f` holds the state.
+    current: usize,
+    n: usize,
+    cells: (u32, u32),
+    link_count: usize,
+    links_groups: (u32, u32),
+    open_count: usize,
+    open_groups: (u32, u32),
+    group_count: usize,
+    force_groups: (u32, u32),
+    stats: wgpu::Buffer,
+    moments: wgpu::Buffer,
+    forces: wgpu::Buffer,
+    partials: wgpu::Buffer,
+    partial_count: usize,
+    fluid: Vec<bool>,
+    fluid_cells: usize,
+    groups: Vec<Group>,
+    empty_obstacles: Vec<String>,
+    steps_done: u64,
+    /// The forces of the last step, once read back (zero before the first step).
+    forces_cache: Option<Vec<[f64; 3]>>,
+    /// Each group's share of the exchange from the populations' weights, which the kernel leaves
+    /// out (`link_forces` sums the deviations): added to what it reads back.
+    weight_forces: Vec<[f64; 3]>,
+}
+
+impl GpuFlow {
+    /// `flow` on the device `FIELDCRAFT_GPU` picks.
+    pub fn from_env(flow: &Flow) -> Result<GpuFlow> {
+        let policy = Policy::from_env().map_err(gpu_error)?;
+        GpuFlow::new(flow, policy)
+    }
+
+    /// `flow` (its grid, rules and initial state: everything the step needs) on the device
+    /// `policy` picks.
+    pub fn new(flow: &Flow, policy: Policy) -> Result<GpuFlow> {
+        let Some((adapter, tier)) = select::adapter(policy).map_err(gpu_error)? else {
+            return Err(Error::Invalid(format!("{}=cpu: no GPU device; solve with `backend: \"cpu\"`", select::ENV)));
+        };
+        let info = adapter.get_info();
+        let have = adapter.limits();
+        let mut limits = wgpu::Limits::default().using_resolution(have.clone());
+        limits.max_buffer_size = have.max_buffer_size;
+        limits.max_storage_buffer_binding_size = have.max_storage_buffer_binding_size;
+        limits.max_storage_buffers_per_shader_stage = have.max_storage_buffers_per_shader_stage.max(limits.max_storage_buffers_per_shader_stage);
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("fieldcraft lbm"),
+            required_features: wgpu::Features::empty(),
+            required_limits: limits,
+            ..Default::default()
+        }))
+        .map_err(gpu_error)?;
+        let adapter_name = format!("{}{}", info.name, if tier == select::Tier::Software { " (software)" } else { "" });
+
+        let n = flow.grid().len();
+        let elem = 4u64;
+        let pop_bytes = elem * (Q * n) as u64;
+        let cap = device.limits().max_storage_buffer_binding_size.min(device.limits().max_buffer_size);
+        if pop_bytes > cap {
+            return Err(Error::Limit(format!(
+                "{n} cells need {} MB of populations per buffer; this GPU allows {} MB per buffer: coarsen the spacing",
+                pop_bytes >> 20,
+                cap >> 20
+            )));
+        }
+
+        // The state and the flags.
+        // Populations as deviations from their weights (see lbm.wgsl); solid cells stay zero.
+        let mut f = filled(Q * n, 0.0f32, "populations")?;
+        for q in 0..Q {
+            let w = fieldcraft_lbm::lattice::W.get(q).copied().unwrap_or(0.0);
+            for cell in 0..n {
+                if let (Some(slot), true) = (f.get_mut(q * n + cell), flow.is_fluid(cell)) {
+                    *slot = (flow.population(q, cell) - w) as f32;
+                }
+            }
+        }
+        let mut fluid = filled(n, false, "cell flags")?;
+        let mut fluid_u32 = filled(n, 0u32, "cell flags")?;
+        for cell in 0..n {
+            if let (Some(b), Some(u)) = (fluid.get_mut(cell), fluid_u32.get_mut(cell)) {
+                *b = flow.is_fluid(cell);
+                *u = u32::from(*b);
+            }
+        }
+
+        // The links, by cell, and the ones with a force by group.
+        let links = flow.links();
+        let mut link_u = reserved(4 * links.len(), "links")?;
+        let mut link_f = reserved(links.len(), "links")?;
+        let mut by_group: Vec<(u32, u32)> = reserved(links.len(), "links by group")?;
+        let group_count = flow.groups().len();
+        let mut weight_forces = filled(group_count, [0.0f64; 3], "force groups")?;
+        let c = |q: u32| C.get(q as usize).copied().unwrap_or([0; 3]).map(f64::from);
+        let w = |q: u32| W.get(q as usize).copied().unwrap_or(0.0);
+        for (l, link) in links.iter().enumerate() {
+            let (kind, from, group, q2, du) = match link.rule {
+                Rule::Pull { from } => (KIND_PULL, from, 0, 0, 0.0),
+                Rule::Bounce { group, du } => (KIND_BOUNCE, 0, group, 0, du),
+                Rule::Reflect { from, q, group } => (KIND_REFLECT, from, group, u32::from(q), 0.0),
+                Rule::Open => (KIND_OPEN, 0, 0, 0, 0.0),
+            };
+            // What the weights add to the link's exchange (see `link_forces`).
+            let weight = match link.rule {
+                Rule::Bounce { .. } => c(u32::from(link.q)).map(|x| -2.0 * w(u32::from(link.q)) * x),
+                Rule::Reflect { .. } => std::array::from_fn(|a| (c(q2)[a] - c(u32::from(link.q))[a]) * w(q2)),
+                _ => [0.0; 3],
+            };
+            if matches!(link.rule, Rule::Bounce { .. } | Rule::Reflect { .. }) {
+                by_group.push((group, l as u32));
+                if let Some(g) = weight_forces.get_mut(group as usize) {
+                    for (s, x) in g.iter_mut().zip(weight) {
+                        *s += x;
+                    }
+                }
+            }
+            link_u.extend_from_slice(&[u32::from(link.q) | (kind << 8) | (q2 << 16), from, group, link.cell]);
+            link_f.push(du as f32);
+        }
+        by_group.sort();
+        let mut group_start = filled(group_count + 1, 0u32, "force groups")?;
+        for (group, _) in &by_group {
+            if let Some(next) = group_start.get_mut(*group as usize + 1) {
+                *next += 1;
+            }
+        }
+        for g in 0..group_count {
+            let prev = group_start.get(g).copied().unwrap_or(0);
+            if let Some(next) = group_start.get_mut(g + 1) {
+                *next += prev;
+            }
+        }
+        let by_group: Vec<u32> = by_group.iter().map(|(_, l)| *l).collect();
+
+        // The open cells.
+        let open = flow.open_cells();
+        let mut open_u = reserved(4 * open.len(), "open cells")?;
+        let mut open_f = reserved(4 * open.len(), "open cells")?;
+        for oc in open {
+            let (kind, target) = match oc.target {
+                Target::Velocity(u) => (0u32, [u[0] as f32, u[1] as f32, u[2] as f32]),
+                Target::Density(rho) => (1u32, [rho as f32, 0.0, 0.0]),
+            };
+            open_u.extend_from_slice(&[oc.cell, oc.axis as u32, kind, 0]);
+            open_f.extend_from_slice(&[target[0], target[1], target[2], oc.inward as f32]);
+        }
+
+        let (omega_plus, omega_minus) = flow.omegas();
+        let acc = flow.acceleration();
+        let forced = acc != [0.0; 3];
+        let cells = groups(n)?;
+        let links_groups = groups(links.len())?;
+        let open_groups = groups(open.len())?;
+        let force_groups = groups((group_count * WG as usize).max(1))?;
+        let partial_count = (cells.0 as usize) * (cells.1 as usize);
+        let mut params = Vec::with_capacity(64);
+        let u = |v: usize| u32::try_from(v).map_err(|_| Error::Limit("too many cells for the GPU solver".into()));
+        for v in [
+            u(n)?,
+            u(flow.grid().cells[0])?,
+            u(flow.grid().cells[1])?,
+            u(flow.grid().cells[2])?,
+            cells.0,
+            u(links.len())?,
+            u(open.len())?,
+            u(group_count)?,
+        ] {
+            params.extend_from_slice(&v.to_le_bytes());
+        }
+        for v in [
+            omega_plus as f32,
+            omega_minus as f32,
+            (1.0 - 0.5 * omega_plus) as f32,
+            (1.0 - 0.5 * omega_minus) as f32,
+            acc[0] as f32,
+            acc[1] as f32,
+            acc[2] as f32,
+            if forced { 1.0 } else { 0.0 },
+        ] {
+            params.extend_from_slice(&v.to_le_bytes());
+        }
+
+        // Buffers, with the device's out-of-memory errors caught.
+        let scopes = [wgpu::ErrorFilter::OutOfMemory, wgpu::ErrorFilter::Validation].map(|f| device.push_error_scope(f));
+        let storage = |label: &str, bytes: &[u8]| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: if bytes.is_empty() { &[0u8; 16][..] } else { bytes },
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            })
+        };
+        let empty = |label: &str, size: u64| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: size.max(16),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("lbm params"),
+            contents: &params,
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let fluid_buf = storage("lbm fluid", &bytes_u32(&fluid_u32));
+        let pops = [storage("lbm f", &bytes_f32(&f)), empty("lbm g", pop_bytes)];
+        let link_u = storage("lbm links", &bytes_u32(&link_u));
+        let link_f = storage("lbm link du", &bytes_f32(&link_f));
+        let open_u = storage("lbm open cells", &bytes_u32(&open_u));
+        let open_f = storage("lbm open targets", &bytes_f32(&open_f));
+        let moments = empty("lbm moments", 16 * n as u64);
+        let stats = storage("lbm stats", &bytes_u32(&[0, 0, 0, 0]));
+        let contrib = empty("lbm link forces", 16 * links.len() as u64);
+        let by_group = storage("lbm links by group", &bytes_u32(&by_group));
+        let group_start = storage("lbm group start", &bytes_u32(&group_start));
+        let forces = empty("lbm forces", 16 * group_count as u64);
+        let partials = empty("lbm partials", 4 * partial_count as u64);
+
+        let module = device
+            .create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("fieldcraft lbm"), source: wgpu::ShaderSource::Wgsl(SHADER.into()) });
+        let entry = |binding: u32, ty: wgpu::BufferBindingType| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer { ty, has_dynamic_offset: false, min_binding_size: None },
+            count: None,
+        };
+        let read = wgpu::BufferBindingType::Storage { read_only: true };
+        let write = wgpu::BufferBindingType::Storage { read_only: false };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("fieldcraft lbm"),
+            entries: &[
+                entry(0, wgpu::BufferBindingType::Uniform),
+                entry(1, read),
+                entry(2, write),
+                entry(3, write),
+                entry(5, read),
+                entry(6, read),
+                entry(7, read),
+                entry(8, read),
+                entry(9, write),
+                entry(10, write),
+                entry(11, write),
+                entry(12, read),
+                entry(13, read),
+                entry(14, write),
+                entry(15, write),
+            ],
+        });
+        let bind = [0usize, 1].map(|k| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("fieldcraft lbm"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: fluid_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: pops[k].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: pops[1 - k].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 5, resource: link_u.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 6, resource: link_f.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 7, resource: open_u.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 8, resource: open_f.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 9, resource: moments.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 10, resource: stats.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 11, resource: contrib.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 12, resource: by_group.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 13, resource: group_start.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 14, resource: forces.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 15, resource: partials.as_entire_binding() },
+                ],
+            })
+        });
+        let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("fieldcraft lbm"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let mut pipelines = HashMap::new();
+        for name in ["collide", "stream", "stream_links", "open_boundaries", "link_forces", "group_forces", "cell_moments", "mass"] {
+            let p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(name),
+                layout: Some(&pl),
+                module: &module,
+                entry_point: Some(name),
+                compilation_options: Default::default(),
+                cache: None,
+            });
+            pipelines.insert(name, p);
+        }
+        for scope in scopes.into_iter().rev() {
+            if let Some(e) = pollster::block_on(scope.pop()) {
+                return Err(gpu_error(e));
+            }
+        }
+        Ok(GpuFlow {
+            device,
+            queue,
+            adapter: adapter_name,
+            pipelines,
+            bind,
+            current: 0,
+            n,
+            cells,
+            link_count: links.len(),
+            links_groups,
+            open_count: open.len(),
+            open_groups,
+            group_count,
+            force_groups,
+            stats,
+            moments,
+            forces,
+            partials,
+            partial_count,
+            fluid_cells: flow.fluid_cells(),
+            fluid,
+            groups: flow.groups().to_vec(),
+            empty_obstacles: flow.empty_obstacles().to_vec(),
+            steps_done: 0,
+            forces_cache: Some(vec![[0.0; 3]; group_count]),
+            weight_forces,
+        })
+    }
+
+    /// The adapter's name.
+    pub fn adapter_name(&self) -> &str {
+        &self.adapter
+    }
+
+    fn pipeline(&self, name: &str) -> Result<&wgpu::ComputePipeline> {
+        self.pipelines.get(name).ok_or_else(|| Error::Invalid(format!("GPU: no kernel {name}")))
+    }
+
+    fn dispatch(&self, pass: &mut wgpu::ComputePass<'_>, bind: usize, name: &str, (gx, gy): (u32, u32)) -> Result<()> {
+        pass.set_bind_group(0, self.bind.get(bind).ok_or_else(|| Error::Invalid("GPU: no bind group".into()))?, &[]);
+        pass.set_pipeline(self.pipeline(name)?);
+        pass.dispatch_workgroups(gx, gy, 1);
+        Ok(())
+    }
+
+    /// Copy `size` bytes of `src` back to the host.
+    fn read(&self, src: &wgpu::Buffer, size: u64) -> Result<Vec<u8>> {
+        let size = size.max(16);
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("lbm readback"),
+            size,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("lbm readback") });
+        enc.copy_buffer_to_buffer(src, 0, &staging, 0, size);
+        self.queue.submit([enc.finish()]);
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        // A bounded wait: a hung or lost device is an error, never a hang.
+        match self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(DEVICE_TIMEOUT) }) {
+            Ok(_) => {}
+            Err(e) => return Err(gpu_error(format!("the device did not answer within {} s: {e}", DEVICE_TIMEOUT.as_secs()))),
+        }
+        rx.try_recv().map_err(|_| gpu_error("the readback did not complete"))?.map_err(gpu_error)?;
+        let bytes = slice.get_mapped_range().map_err(gpu_error)?.to_vec();
+        staging.unmap();
+        Ok(bytes)
+    }
+
+    fn read_f32(&self, src: &wgpu::Buffer, count: usize) -> Result<Vec<f32>> {
+        let bytes = self.read(src, 4 * count as u64)?;
+        Ok(bytes.as_chunks::<4>().0.iter().take(count).map(|b| f32::from_le_bytes(*b)).collect())
+    }
+
+    /// The moments of the current state into the moments buffer.
+    fn compute_moments(&self) -> Result<()> {
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("lbm moments") });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("lbm moments"), timestamp_writes: None });
+            self.dispatch(&mut pass, self.current, "cell_moments", self.cells)?;
+        }
+        self.queue.submit([enc.finish()]);
+        Ok(())
+    }
+}
+
+impl GpuFlow {
+    /// One submission of `steps` (≤ MAX_CHUNK) time steps, then the stability check.
+    fn advance_chunk(&mut self, steps: u64) -> Result<()> {
+        self.queue.write_buffer(&self.stats, 0, &bytes_u32(&[0, 0, 0, 0]));
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("lbm steps") });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("lbm steps"), timestamp_writes: None });
+            for _ in 0..steps {
+                self.dispatch(&mut pass, self.current, "collide", self.cells)?;
+                self.dispatch(&mut pass, self.current, "stream", self.cells)?;
+                if self.link_count > 0 {
+                    self.dispatch(&mut pass, self.current, "stream_links", self.links_groups)?;
+                }
+                if self.open_count > 0 {
+                    self.dispatch(&mut pass, self.current, "open_boundaries", self.open_groups)?;
+                }
+                self.current ^= 1;
+            }
+            // The momentum exchange of the last step, from its post-collision populations.
+            if self.link_count > 0 && self.group_count > 0 {
+                self.dispatch(&mut pass, self.current ^ 1, "link_forces", self.links_groups)?;
+                self.dispatch(&mut pass, self.current ^ 1, "group_forces", self.force_groups)?;
+            }
+        }
+        self.queue.submit([enc.finish()]);
+        self.steps_done += steps;
+        self.forces_cache = None;
+        let stats = self.read(&self.stats, 16)?;
+        let word = |k: usize| stats.get(4 * k..4 * k + 4).and_then(|b| b.try_into().ok()).map(u32::from_le_bytes).unwrap_or(0);
+        let max_u2 = f32::from_bits(word(0));
+        if word(1) != 0 || !(f64::from(max_u2) <= MAX_LATTICE_SPEED * MAX_LATTICE_SPEED) {
+            return Err(Error::Unstable(format!(
+                "the flow went unstable by time step {}: the lattice speed reached {:.3} (limit {MAX_LATTICE_SPEED}) or a density stopped being a positive number; lower the time step, refine the spacing or check the boundary conditions",
+                self.steps_done,
+                max_u2.sqrt()
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl Backend for GpuFlow {
+    fn name(&self) -> String {
+        format!("gpu: {}", self.adapter)
+    }
+
+    fn advance(&mut self, steps: u64) -> Result<()> {
+        // Submissions of at most MAX_CHUNK steps: the stability check runs after each, so a
+        // run that blows up is caught within that many steps whatever the caller asks for.
+        let mut left = steps;
+        while left > 0 {
+            let chunk = left.min(MAX_CHUNK);
+            self.advance_chunk(chunk)?;
+            left -= chunk;
+        }
+        Ok(())
+    }
+
+    fn steps_done(&self) -> u64 {
+        self.steps_done
+    }
+
+    fn fields(&mut self) -> Result<Fields> {
+        self.compute_moments()?;
+        let m = self.read_f32(&self.moments, 4 * self.n)?;
+        let density = m.as_chunks::<4>().0.iter().map(|v| f64::from(v[3])).collect();
+        let velocity = m.as_chunks::<4>().0.iter().map(|v| [f64::from(v[0]), f64::from(v[1]), f64::from(v[2])]).collect();
+        Ok(Fields { density, velocity })
+    }
+
+    fn mass(&mut self) -> Result<f64> {
+        self.compute_moments()?;
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("lbm mass") });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("lbm mass"), timestamp_writes: None });
+            self.dispatch(&mut pass, self.current, "mass", self.cells)?;
+        }
+        self.queue.submit([enc.finish()]);
+        let partials = self.read_f32(&self.partials, self.partial_count)?;
+        // Summed in a fixed order on the host, so the result is deterministic on this device.
+        Ok(partials.iter().map(|v| f64::from(*v)).sum())
+    }
+
+    fn forces(&mut self) -> Result<Vec<[f64; 3]>> {
+        if let Some(f) = &self.forces_cache {
+            return Ok(f.clone());
+        }
+        let v = self.read_f32(&self.forces, 4 * self.group_count)?;
+        let forces: Vec<[f64; 3]> = v
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(&self.weight_forces)
+            .map(|(g, w)| [f64::from(g[0]) + w[0], f64::from(g[1]) + w[1], f64::from(g[2]) + w[2]])
+            .collect();
+        self.forces_cache = Some(forces.clone());
+        Ok(forces)
+    }
+
+    fn groups(&self) -> &[Group] {
+        &self.groups
+    }
+
+    fn fluid_cells(&self) -> usize {
+        self.fluid_cells
+    }
+
+    fn is_fluid(&self, cell: usize) -> bool {
+        self.fluid.get(cell).copied().unwrap_or(false)
+    }
+
+    fn empty_obstacles(&self) -> &[String] {
+        &self.empty_obstacles
+    }
+}

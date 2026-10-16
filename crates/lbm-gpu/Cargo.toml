@@ -1,0 +1,20 @@
+[package]
+name = "fieldcraft-lbm-gpu"
+description = "FieldCraft's lattice Boltzmann solver on the GPU: the CPU scheme's step as wgpu compute shaders, driven through fieldcraft-lbm's Backend trait and checked against it"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+fieldcraft-lbm = { workspace = true }
+fieldcraft-gpu = { workspace = true }
+wgpu = { workspace = true }
+pollster = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+fieldcraft-model = { workspace = true }
+fieldcraft-mesh = { workspace = true }

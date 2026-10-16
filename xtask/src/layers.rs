@@ -57,6 +57,7 @@ pub const TABLE: &[(&str, Class)] = &[
     ("io", Class::Layer(5)),
     ("engine", Class::Layer(6)),
     ("gpu", Class::Layer(7)),
+    ("lbm-gpu", Class::Layer(7)),
     ("ui-egui", Class::Layer(7)),
     ("mcp", Class::Layer(7)),
     ("testkit", Class::Testkit),
@@ -73,6 +74,8 @@ pub const INTRA_LAYER_ORDER: &[&[&str]] = &[
     &["gpu", "ui-egui"],
     // The MCP server's headless screenshots draw with them too.
     &["gpu", "mcp"],
+    // The lattice Boltzmann GPU backend opens its device with the GPU crate's adapter policy.
+    &["gpu", "lbm-gpu"],
 ];
 
 fn intra_layer_allowed(from: &str, to: &str) -> bool {
