@@ -97,6 +97,9 @@ pub struct QualityOptions {
     /// grows from it at the grading rate. A seed finer than the global size refines along its
     /// edge; one coarser leaves it to the global size.
     pub seeds: Vec<crate::seeds::EdgeSeed>,
+    /// Local sizes (size controls): the size field is at most each one's size in its region and
+    /// grows from it at the grading rate.
+    pub locals: Vec<crate::size::LocalSize>,
     /// B-rep face tags whose boundary triangles are kept exactly: their vertices stay where they
     /// are and no triangle of theirs is split, flipped or removed. The faces a pyramid
     /// transition shares with the tetrahedra ([`crate::transition`]) are frozen, so the two
@@ -122,6 +125,7 @@ impl Default for QualityOptions {
             max_tets: 5_000_000,
             max_points: 1_000_000,
             seeds: Vec::new(),
+            locals: Vec::new(),
             frozen_faces: Vec::new(),
         }
     }
@@ -237,7 +241,8 @@ fn bounds(points: &[[f64; 3]]) -> ([f64; 3], [f64; 3]) {
     (lo, hi)
 }
 
-/// The size field of a boundary: `global` limited by curvature, graded.
+/// The size field of a boundary: `global` limited by curvature, thin walls, edge seeds and local
+/// sizes, graded.
 pub fn size_field(surface: &BoundarySurface, geometry: &Tessellation, global: f64, o: &QualityOptions) -> GradedSize {
     let (lo, hi) = bounds(surface.points());
     let floor = o.min_size * global;
@@ -268,7 +273,7 @@ pub fn size_field(surface: &BoundarySurface, geometry: &Tessellation, global: f6
             }
         }
     }
-    GradedSize::new(global, &samples, lo, hi, o.grading)
+    GradedSize::new(global, &samples, &o.locals, lo, hi, o.grading)
 }
 
 /// Put the seeds' nodes on their feature curves, pinned (corner vertices, which neither

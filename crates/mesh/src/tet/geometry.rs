@@ -13,7 +13,7 @@
 //! analytic (von Neumann's alternating projections converge to the intersection for surfaces
 //! meeting transversally); the result is kept only when it stays close to the polyline.
 
-use crate::size::SizeField;
+use crate::size::{LocalSize, Region, SizeField};
 use crate::surface::BoundarySurface;
 
 use super::measure::{self, P, add, cross, dot, norm, scale, sub};
@@ -842,9 +842,13 @@ pub const MAX_GRID_NODES: usize = 1 << 21;
 impl GradedSize {
     /// `samples`: points with their local size. `grading`: the largest change of size per unit
     /// length.
-    pub fn new(global: f64, samples: &[(P, f64)], lo: P, hi: P, grading: f64) -> GradedSize {
+    ///
+    /// `locals`: regions with their size ([`crate::size::LocalSize`]), seeded at every grid node
+    /// within a cell of the region (boxes and balls: inside too) at the local size plus the
+    /// grading times the distance, then graded with the rest.
+    pub fn new(global: f64, samples: &[(P, f64)], locals: &[LocalSize], lo: P, hi: P, grading: f64) -> GradedSize {
         let diag = measure::dist(lo, hi).max(f64::MIN_POSITIVE);
-        let finest = samples.iter().map(|s| s.1).fold(global, f64::min).max(diag * 1e-4);
+        let finest = samples.iter().map(|s| s.1).chain(locals.iter().map(|l| l.size)).filter(|h| *h > 0.0).fold(global, f64::min).max(diag * 1e-4);
         let mut cell = finest.max(diag / 64.0) * 0.5;
         let dims_for = |c: f64| [0, 1, 2].map(|k| (((hi[k] - lo[k]) / c).ceil().max(1.0) as usize) + 2);
         let mut dims = dims_for(cell);
@@ -876,6 +880,47 @@ impl GradedSize {
                             *s = s.min(v);
                         }
                     }
+                }
+            }
+        }
+        // Seed: the grid nodes near each local region.
+        let reach = cell * 3f64.sqrt();
+        let range = |a: f64, b: f64, k: usize| -> (usize, usize) {
+            let first = ((a - reach - lo[k]) / cell).ceil().max(0.0);
+            let last = ((b + reach - lo[k]) / cell).floor().min((dims[k] - 1) as f64);
+            if first.is_finite() && last.is_finite() && first <= last { (first as usize, last as usize) } else { (1, 0) }
+        };
+        let mut seed_near = |a: P, b: P, h: f64, distance: &dyn Fn(P) -> f64| {
+            let r = [0, 1, 2].map(|k| range(a[k], b[k], k));
+            for k in r[2].0..=r[2].1 {
+                for j in r[1].0..=r[1].1 {
+                    for i in r[0].0..=r[0].1 {
+                        let node = [lo[0] + i as f64 * cell, lo[1] + j as f64 * cell, lo[2] + k as f64 * cell];
+                        let d = distance(node);
+                        if d <= reach
+                            && let Some(s) = values.get_mut(idx(i, j, k))
+                        {
+                            *s = s.min(h + g * d);
+                        }
+                    }
+                }
+            }
+        };
+        for l in locals {
+            if !(l.size > 0.0 && l.size.is_finite() && l.size < global) {
+                continue;
+            }
+            match &l.region {
+                Region::Triangles(tris) => {
+                    for t in tris {
+                        let a = [0, 1, 2].map(|k| t[0][k].min(t[1][k]).min(t[2][k]));
+                        let b = [0, 1, 2].map(|k| t[0][k].max(t[1][k]).max(t[2][k]));
+                        seed_near(a, b, l.size, &|p| measure::dist(p, closest_on_triangle(p, t[0], t[1], t[2])));
+                    }
+                }
+                region => {
+                    let (a, b) = region.bounds();
+                    seed_near(a, b, l.size, &|p| region.distance(p));
                 }
             }
         }
@@ -984,8 +1029,23 @@ mod tests {
     }
 
     #[test]
+    fn graded_size_takes_local_regions() {
+        let boxed = LocalSize { region: Region::Box { lo: [8.0; 3], hi: [12.0; 3] }, size: 2.0 };
+        let face = LocalSize { region: Region::Triangles(vec![[[0.0, 0.0, 20.0], [20.0, 0.0, 20.0], [0.0, 20.0, 20.0]]]), size: 1.0 };
+        let f = GradedSize::new(8.0, &[], &[boxed, face], [0.0; 3], [20.0, 20.0, 20.0], 0.5);
+        let inside = f.size([10.0, 10.0, 10.0]);
+        assert!((inside - 2.0).abs() < 0.3, "{inside}");
+        let on_face = f.size([5.0, 5.0, 20.0]);
+        assert!((on_face - 1.0).abs() < 0.3, "{on_face}");
+        // Four units off the box: about 2 + 0.5 × 4.
+        let off = f.size([10.0, 10.0, 4.0]);
+        assert!((off - 4.0).abs() < 0.6, "{off}");
+        assert_eq!(f.size([20.0, 20.0, 0.0]), 8.0);
+    }
+
+    #[test]
     fn graded_size_grows_away_from_samples() {
-        let f = GradedSize::new(10.0, &[([0.0; 3], 1.0)], [0.0; 3], [20.0, 20.0, 20.0], 0.5);
+        let f = GradedSize::new(10.0, &[([0.0; 3], 1.0)], &[], [0.0; 3], [20.0, 20.0, 20.0], 0.5);
         let near = f.size([0.0; 3]);
         let mid = f.size([4.0, 0.0, 0.0]);
         let far = f.size([20.0, 20.0, 20.0]);
