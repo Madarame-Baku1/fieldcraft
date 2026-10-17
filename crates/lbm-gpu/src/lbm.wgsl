@@ -2,8 +2,15 @@
 // time collision with Guo forcing, pull streaming with the per-link rules the CPU prepared
 // (bounce-back with Ladd's moving-wall term, specular reflection, open placeholders), the Zou–He
 // open boundaries, and the momentum exchange per force group. Populations are stored direction-
-// major (f[q n + cell]) in two buffers, A–B: a step collides `f` in place, streams `f` into `g`
-// and applies the open boundaries to `g`; the next step binds the buffers the other way round.
+// major. The default AA pattern uses one population buffer (Bailey et al., ICPP 2009;
+// Wittmann et al., Comput. Math. Appl. 65 (2013), 924–935). Even steps read a cell and
+// write its opposite directions; odd steps read opposite directions at the upstream
+// neighbours and write each outgoing direction at the downstream neighbour. Each thread
+// writes exactly the addresses it read, so distinct cells never race. Physical coordinates
+// wrap; the existing per-link rules still supply walls, reflection and open placeholders.
+// A gather pass saves those boundary values before a scatter pass overrides their targets:
+// overwriting in the gather itself could destroy another link's post-collision source.
+// The optional A–B diagnostic path retains the original two-buffer collide/pull scheme.
 //
 // Single precision, with every population stored as its deviation from the weight, h_q = f_q − w_q
 // (Krüger et al. 2017, §13.3.4: the deviations are small, so f32 keeps their digits instead of
@@ -19,6 +26,8 @@
 // back for an adiabatic face, a flux added to the bounced population), takes its inlet
 // temperatures and outlet neighbours, and gives each group the heat its links exchanged (in
 // contrib.w and forces.w). The temperature feeds back as the buoyant acceleration −β g θ.
+
+override AA_MODE: bool = true;
 
 const Q: u32 = 19u;
 const QT: u32 = 7u;
@@ -47,6 +56,8 @@ struct Params {
     buoy: vec4<f32>,
     // The scalar lattice: its relaxation rate (x), T₀ (y), whether there is heat (z).
     therm: vec4<f32>,
+    // Current AA orientation (x: 0 normal, 1 opposite directions at upstream neighbours).
+    phase: vec4<u32>,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -71,7 +82,7 @@ struct Params {
 @group(0) @binding(14) var<storage, read_write> forces: array<vec4<f32>>;
 // Per workgroup, the mass of its cells.
 @group(0) @binding(15) var<storage, read_write> partials: array<f32>;
-// The scalar populations, A–B like f and g (t[q n + cell]; see the notes above).
+// The scalar populations remain A–B (t[q n + cell]; see the notes above).
 @group(0) @binding(16) var<storage, read_write> t: array<f32>;
 @group(0) @binding(17) var<storage, read_write> t2: array<f32>;
 // Per force group: its thermal condition (x: 0 adiabatic, 1 temperature, 2 flux) and the value
@@ -164,6 +175,60 @@ fn is_fluid(cell: u32) -> bool {
     return fluid[cell] != 0u;
 }
 
+// A cell's grid coordinates (integer divisions once per cell, not once per direction).
+fn coords(cell: u32) -> vec3<i32> {
+    let plane = params.nx * params.ny;
+    return vec3<i32>(i32(cell % params.nx), i32((cell % plane) / params.nx), i32(cell / plane));
+}
+
+// The cell at `p`, wrapped periodically. A lattice step moves at most one cell per axis, so a
+// compare and an add per axis replace the remainder.
+fn wrapped(p: vec3<i32>) -> u32 {
+    let size = vec3<i32>(i32(params.nx), i32(params.ny), i32(params.nz));
+    var w = select(p, p + size, p < vec3<i32>(0));
+    w = select(w, w - size, w >= size);
+    return u32((w.z * size.y + w.y) * size.x + w.x);
+}
+
+// Where population q of the cell at `xyz` is stored in the given AA orientation: in place when
+// even, reversed at the upstream neighbour when odd.
+fn population_index(q: u32, cell: u32, xyz: vec3<i32>, phase: u32) -> u32 {
+    if phase == 0u { return q * params.n + cell; }
+    return opp(q) * params.n + wrapped(xyz - c_of(q));
+}
+
+fn population(q: u32, cell: u32, xyz: vec3<i32>) -> f32 {
+    if AA_MODE { return f[population_index(q, cell, xyz, params.phase.x)]; }
+    return f[q * params.n + cell];
+}
+
+// Collision's output at its source cell, before the boundary rules.
+fn post_index(q: u32, cell: u32, xyz: vec3<i32>) -> u32 {
+    if !AA_MODE { return q * params.n + cell; }
+    if params.phase.x == 0u { return opp(q) * params.n + cell; }
+    return q * params.n + wrapped(xyz + c_of(q));
+}
+
+fn post(q: u32, cell: u32) -> f32 {
+    return f[post_index(q, cell, aa_coords(cell))];
+}
+
+fn streamed(q: u32, cell: u32, xyz: vec3<i32>) -> f32 {
+    if AA_MODE { return f[population_index(q, cell, xyz, params.phase.x ^ 1u)]; }
+    return g[q * params.n + cell];
+}
+
+fn store_streamed(q: u32, cell: u32, xyz: vec3<i32>, v: f32) {
+    if AA_MODE { f[population_index(q, cell, xyz, params.phase.x ^ 1u)] = v; }
+    else { g[q * params.n + cell] = v; }
+}
+
+// The coordinates the AA addressing needs; none in the two-buffer layout.
+fn aa_coords(cell: u32) -> vec3<i32> {
+    if AA_MODE { return coords(cell); }
+    return vec3<i32>(0);
+}
+
 // Two-relaxation-time collision with Guo forcing, in place in f (Ginzburg et al. 2008; Guo et
 // al. 2002; Krüger et al. 2017 ch. 10), and the chunk's largest speed.
 @compute @workgroup_size(256)
@@ -183,11 +248,14 @@ fn collide(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg:
 
 fn collide_cell(cell: u32, lid: u32) {
     let n = params.n;
+    // Only the odd AA orientation addresses neighbours.
+    var xyz = vec3<i32>(0);
+    if AA_MODE && params.phase.x == 1u { xyz = coords(cell); }
     var fq: array<f32, 19>;
     var drho = 0.0;
     var j = vec3<f32>(0.0);
     for (var q = 0u; q < Q; q = q + 1u) {
-        let v = f[q * n + cell];
+        let v = population(q, cell, xyz);
         fq[q] = v;
         drho = drho + v;
         j = j + vec3<f32>(c_of(q)) * v;
@@ -213,7 +281,7 @@ fn collide_cell(cell: u32, lid: u32) {
     let eq0 = w_of(0u) * (drho - 1.5 * rho * uu);
     var out0 = fq[0] - wp * (fq[0] - eq0);
     if forced { out0 = out0 + sp * w_of(0u) * (-3.0 * uf); }
-    f[cell] = out0;
+    f[post_index(0u, cell, xyz)] = out0;
     for (var q = 1u; q < Q; q = q + 2u) {
         let o = q + 1u;
         let cv = vec3<f32>(c_of(q));
@@ -232,8 +300,8 @@ fn collide_cell(cell: u32, lid: u32) {
             s_plus = sp * w * (9.0 * cu * cf - 3.0 * uf);
             s_minus = sm * w * 3.0 * cf;
         }
-        f[q * n + cell] = fq[q] - relax_plus - relax_minus + s_plus + s_minus;
-        f[o * n + cell] = fq[o] - relax_plus + relax_minus + s_plus - s_minus;
+        f[post_index(q, cell, xyz)] = fq[q] - relax_plus - relax_minus + s_plus + s_minus;
+        f[post_index(o, cell, xyz)] = fq[o] - relax_plus + relax_minus + s_plus - s_minus;
     }
 }
 
@@ -266,7 +334,17 @@ fn stream(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: 
 // write the same population.
 @compute @workgroup_size(256)
 fn stream_links(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>) {
-    let l = cell_of(lid, wg);
+    gather_link(cell_of(lid, wg), false);
+}
+
+// The same on the step whose wall forces are read back (a chunk's last): the AA layout
+// overwrites the post-collision sources in the scatter, so the momentum exchange is taken here.
+@compute @workgroup_size(256)
+fn stream_links_exchange(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>) {
+    gather_link(cell_of(lid, wg), true);
+}
+
+fn gather_link(l: u32, exchange: bool) {
     if l >= params.links { return; }
     let n = params.n;
     let lu = link_u[l];
@@ -276,16 +354,30 @@ fn stream_links(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id
     let cell = lu.w;
     var v = 0.0;
     if kind == KIND_PULL {
-        v = f[q * n + lu.y];
+        v = post(q, lu.y);
     } else if kind == KIND_BOUNCE {
-        v = f[opp(q) * n + cell] + link_f[l];
+        v = post(opp(q), cell) + link_f[l];
     } else if kind == KIND_REFLECT {
         // The mirrored direction has the same weight, so h reflects like f.
-        v = f[q2 * n + lu.y];
+        v = post(q2, lu.y);
     } else {
-        v = f[opp(q) * n + cell];
+        v = post(opp(q), cell);
     }
-    g[q * n + cell] = v;
+    if AA_MODE {
+        g[l] = v;
+        if exchange { contrib[l] = vec4<f32>(momentum_exchange(l, lu, q, kind, q2), 0.0); }
+    } else {
+        g[q * n + cell] = v;
+    }
+}
+
+// The gather above must complete before any AA boundary population is overwritten.
+@compute @workgroup_size(256)
+fn scatter_links(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>) {
+    let l = cell_of(lid, wg);
+    if l >= params.links { return; }
+    let lu = link_u[l];
+    store_streamed(lu.x & 0xffu, lu.w, aa_coords(lu.w), g[l]);
 }
 
 // Zou–He velocity and pressure boundaries on the streamed populations in g (Zou & He 1997;
@@ -301,6 +393,7 @@ fn open_boundaries(@builtin(local_invocation_index) lid: u32, @builtin(workgroup
     let axis = ou.y;
     let sign = ot.w;
     let a_half = 0.5 * acc_of(cell);
+    let xyz = aa_coords(cell);
     // The sums of h over the tangential (c_n = 0) and outgoing (c_n < 0) directions. The sums of
     // f add the weights' (2/3 and 1/6 for D3Q19, so tangential + 2 outgoing gains exactly 1): the
     // weight is added after the deviations are summed, not before, which in single precision would
@@ -308,7 +401,7 @@ fn open_boundaries(@builtin(local_invocation_index) lid: u32, @builtin(workgroup
     var tangential = 0.0;
     var outgoing = 0.0;
     for (var q = 0u; q < Q; q = q + 1u) {
-        let v = g[q * n + cell];
+        let v = streamed(q, cell, xyz);
         let cn = f32(c_of(q)[axis]) * sign;
         if cn == 0.0 {
             tangential = tangential + v;
@@ -333,22 +426,35 @@ fn open_boundaries(@builtin(local_invocation_index) lid: u32, @builtin(workgroup
         let c = c_of(q);
         if f32(c[axis]) * sign > 0.0 {
             let cu = dot(vec3<f32>(c), bare);
-            g[q * n + cell] = g[opp(q) * n + cell] + 6.0 * w_of(q) * rho * cu;
+            store_streamed(q, cell, xyz, streamed(opp(q), cell, xyz) + 6.0 * w_of(q) * rho * cu);
         }
     }
     for (var t = 0u; t < 3u; t = t + 1u) {
         if t == axis { continue; }
         var m = -rho * bare[t];
         for (var q = 0u; q < Q; q = q + 1u) {
-            m = m + g[q * n + cell] * f32(c_of(q)[t]);
+            m = m + streamed(q, cell, xyz) * f32(c_of(q)[t]);
         }
         for (var q = 1u; q < Q; q = q + 1u) {
             let c = c_of(q);
             if f32(c[axis]) * sign > 0.0 && c[t] != 0 {
-                g[q * n + cell] = g[q * n + cell] - 0.5 * m * f32(c[t]);
+                store_streamed(q, cell, xyz, streamed(q, cell, xyz) - 0.5 * m * f32(c[t]));
             }
         }
     }
+}
+
+fn momentum_exchange(l: u32, lu: vec4<u32>, q: u32, kind: u32, q2: u32) -> vec3<f32> {
+    var v = vec3<f32>(0.0);
+    if kind == KIND_BOUNCE {
+        let out = post(opp(q), lu.w);
+        let back = out + link_f[l];
+        v = -vec3<f32>(c_of(q)) * (out + back);
+    } else if kind == KIND_REFLECT {
+        let out = post(q2, lu.y);
+        v = vec3<f32>(c_of(q2)) * out - vec3<f32>(c_of(q)) * out;
+    }
+    return v;
 }
 
 // The momentum each link transferred to its group in the last step, from the post-collision
@@ -366,16 +472,9 @@ fn link_forces(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id)
     // The deviations only: the weights' share of the exchange (2 w_q c_q per bounced link, which
     // cancels between a wall's links in exact arithmetic but is 10⁴ times the shear they carry)
     // is added on the host in double precision, so the sum keeps the deviations' digits.
-    var v = vec3<f32>(0.0);
+    var v = contrib[l].xyz;
+    if !AA_MODE { v = momentum_exchange(l, lu, q, kind, q2); }
     var heat = 0.0;
-    if kind == KIND_BOUNCE {
-        let out = f[opp(q) * n + cell];
-        let back = out + link_f[l];
-        v = -vec3<f32>(c_of(q)) * (out + back);
-    } else if kind == KIND_REFLECT {
-        let out = f[q2 * n + lu.y];
-        v = vec3<f32>(c_of(q2)) * out - vec3<f32>(c_of(q)) * out;
-    }
     // The heat the link gave its wall: what left the fluid minus what came back.
     if has_heat() && q < QT && (kind == KIND_BOUNCE || kind == KIND_REFLECT) {
         heat = t[opp(q) * n + cell] - thermal_rule(lu, q, kind, cell);
@@ -525,8 +624,9 @@ fn cell_moments(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id
     let n = params.n;
     var drho = 0.0;
     var j = vec3<f32>(0.0);
+    let xyz = aa_coords(cell);
     for (var q = 0u; q < Q; q = q + 1u) {
-        let v = f[q * n + cell];
+        let v = population(q, cell, xyz);
         drho = drho + v;
         j = j + vec3<f32>(c_of(q)) * v;
     }

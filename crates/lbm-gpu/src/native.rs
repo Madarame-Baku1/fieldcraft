@@ -31,6 +31,9 @@ const MAX_CHUNK: u64 = 64;
 /// How long one wait for the device may take before the solve gives up on it.
 const DEVICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// A bounded chunk's dispatches, shared by the normal and timestamped paths.
+type Dispatch = (usize, &'static str, (u32, u32));
+
 /// A vector of `len` copies of `value`, or [`Error::Limit`] when memory runs out (the host
 /// arrays are sized by the grid: 16 M cells is over a gigabyte of populations).
 fn filled<T: Clone>(len: usize, value: T, what: &str) -> Result<Vec<T>> {
@@ -72,13 +75,48 @@ pub fn register() {
     fieldcraft_lbm::register_backend(Box::new(|flow, _setup| GpuFlow::from_env(flow).map(|g| Box::new(g) as Box<dyn Backend>)));
 }
 
+/// How the momentum populations stream (see `lbm.wgsl`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Streaming {
+    /// In place: measured faster on every device tried (RTX 4090, GB10, M4 Max; #563).
+    #[default]
+    Auto,
+    /// One population buffer, collided and streamed in place (the AA pattern).
+    InPlace,
+    /// Two population buffers: collide in place, then pull into the other (A–B).
+    TwoBuffers,
+}
+
+/// How a [`GpuFlow`] runs; the defaults are what a solve uses.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Options {
+    pub streaming: Streaming,
+    /// Time every kernel with timestamp queries ([`GpuFlow::kernel_times`]). Each dispatch then
+    /// gets its own pass and every chunk waits for its timestamps: for measurements, not solves.
+    pub profile: bool,
+}
+
+/// GPU time per kernel, summed over the dispatches since the flow was created (with
+/// [`Options::profile`]).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct KernelTime {
+    pub dispatches: u64,
+    pub seconds: f64,
+}
+
 /// A prepared flow on the device.
 pub struct GpuFlow {
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// With [`Options::profile`]: the GPU time of each kernel so far.
+    kernel_times: Option<std::cell::RefCell<std::collections::BTreeMap<&'static str, KernelTime>>>,
+    /// How long creating the compute pipelines (compiling the shader) took.
+    pipeline_seconds: f64,
+    aa: bool,
     adapter: String,
     pipelines: HashMap<&'static str, wgpu::ComputePipeline>,
-    /// Bind groups with (f, g) = (buffer 0, buffer 1) and the other way round.
+    /// AB swaps populations; AA keeps one population buffer and changes its orientation.
+    /// Both modes swap the separate scalar lattice buffers.
     bind: [wgpu::BindGroup; 2],
     /// Which bind group's `f` holds the state.
     current: usize,
@@ -95,7 +133,7 @@ pub struct GpuFlow {
     forces: wgpu::Buffer,
     partials: wgpu::Buffer,
     partial_count: usize,
-    /// The scalar populations, A–B like the flow's, with heat; and T₀ they are shifted by.
+    /// The scalar populations remain A–B with heat; and T₀ they are shifted by.
     thermal: Option<[wgpu::Buffer; 2]>,
     initial_temperature: f64,
     fluid: Vec<bool>,
@@ -121,10 +159,20 @@ impl GpuFlow {
     /// `flow` (its grid, rules and initial state: everything the step needs) on the device
     /// `policy` picks.
     pub fn new(flow: &Flow, policy: Policy) -> Result<GpuFlow> {
+        GpuFlow::with_options(flow, policy, Options::default())
+    }
+
+    /// [`GpuFlow::new`] with `options`.
+    pub fn with_options(flow: &Flow, policy: Policy, options: Options) -> Result<GpuFlow> {
         let Some((adapter, tier)) = select::adapter(policy).map_err(gpu_error)? else {
             return Err(Error::Invalid(format!("{}=cpu: no GPU device; solve with `backend: \"cpu\"`", select::ENV)));
         };
         let info = adapter.get_info();
+        let profile = options.profile;
+        let features = if profile { wgpu::Features::TIMESTAMP_QUERY } else { wgpu::Features::empty() };
+        if !adapter.features().contains(features) {
+            return Err(gpu_error("profiling needs timestamp queries, which this adapter does not offer"));
+        }
         let have = adapter.limits();
         let mut limits = wgpu::Limits::default().using_resolution(have.clone());
         limits.max_buffer_size = have.max_buffer_size;
@@ -132,13 +180,17 @@ impl GpuFlow {
         limits.max_storage_buffers_per_shader_stage = have.max_storage_buffers_per_shader_stage.max(limits.max_storage_buffers_per_shader_stage);
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("fieldcraft lbm"),
-            required_features: wgpu::Features::empty(),
+            required_features: features,
             required_limits: limits,
             ..Default::default()
         }))
         .map_err(gpu_error)?;
         let adapter_name = format!("{}{}", info.name, if tier == select::Tier::Software { " (software)" } else { "" });
 
+        let aa = match options.streaming {
+            Streaming::Auto | Streaming::InPlace => true,
+            Streaming::TwoBuffers => false,
+        };
         let n = flow.grid().len();
         let elem = 4u64;
         let pop_bytes = elem * (Q * n) as u64;
@@ -328,13 +380,18 @@ impl GpuFlow {
                 mapped_at_creation: false,
             })
         };
-        let params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("lbm params"),
-            contents: &params,
-            usage: wgpu::BufferUsages::UNIFORM,
+        let params = [0u32, 1].map(|phase| {
+            let mut bytes = params.clone();
+            bytes.extend_from_slice(&bytes_u32(&[phase, 0, 0, 0]));
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("lbm params"),
+                contents: &bytes,
+                usage: wgpu::BufferUsages::UNIFORM,
+            })
         });
         let fluid_buf = storage("lbm fluid", &bytes_u32(&fluid_u32));
-        let pops = [storage("lbm f", &bytes_f32(&f)), empty("lbm g", pop_bytes)];
+        // AA reuses binding g for boundary scratch only, never another full population field.
+        let pops = [storage("lbm f", &bytes_f32(&f)), empty("lbm g / AA boundary scratch", if aa { 4 * links.len() as u64 } else { pop_bytes })];
         let link_u = storage("lbm links", &bytes_u32(&link_u));
         let link_f = storage("lbm link du", &bytes_f32(&link_f));
         let open_u = storage("lbm open cells", &bytes_u32(&open_u));
@@ -394,10 +451,10 @@ impl GpuFlow {
                 label: Some("fieldcraft lbm"),
                 layout: &layout,
                 entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: params.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 0, resource: params[k].as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 1, resource: fluid_buf.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 2, resource: pops[k].as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 3, resource: pops[1 - k].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: pops[if aa { 0 } else { k }].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: pops[if aa { 1 } else { 1 - k }].as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 5, resource: link_u.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 6, resource: link_f.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 7, resource: open_u.as_entire_binding() },
@@ -422,10 +479,13 @@ impl GpuFlow {
             immediate_size: 0,
         });
         let mut pipelines = HashMap::new();
+        let pipeline_start = std::time::Instant::now();
         for name in [
             "collide",
             "stream",
             "stream_links",
+            "stream_links_exchange",
+            "scatter_links",
             "open_boundaries",
             "link_forces",
             "group_forces",
@@ -442,7 +502,7 @@ impl GpuFlow {
                 layout: Some(&pl),
                 module: &module,
                 entry_point: Some(name),
-                compilation_options: Default::default(),
+                compilation_options: wgpu::PipelineCompilationOptions { constants: &[("AA_MODE", if aa { 1.0 } else { 0.0 })], ..Default::default() },
                 cache: None,
             });
             pipelines.insert(name, p);
@@ -452,9 +512,13 @@ impl GpuFlow {
                 return Err(gpu_error(e));
             }
         }
+        let pipeline_seconds = pipeline_start.elapsed().as_secs_f64();
         Ok(GpuFlow {
             device,
             queue,
+            kernel_times: profile.then(Default::default),
+            pipeline_seconds,
+            aa,
             adapter: adapter_name,
             pipelines,
             bind,
@@ -489,6 +553,21 @@ impl GpuFlow {
         &self.adapter
     }
 
+    /// Whether the populations stream in place (see [`Streaming`]).
+    pub fn streams_in_place(&self) -> bool {
+        self.aa
+    }
+
+    /// How long creating the compute pipelines took, in seconds.
+    pub fn pipeline_seconds(&self) -> f64 {
+        self.pipeline_seconds
+    }
+
+    /// With [`Options::profile`], the GPU time of each kernel so far, by kernel name.
+    pub fn kernel_times(&self) -> Option<std::collections::BTreeMap<&'static str, KernelTime>> {
+        self.kernel_times.as_ref().map(|t| t.borrow().clone())
+    }
+
     fn pipeline(&self, name: &str) -> Result<&wgpu::ComputePipeline> {
         self.pipelines.get(name).ok_or_else(|| Error::Invalid(format!("GPU: no kernel {name}")))
     }
@@ -497,6 +576,57 @@ impl GpuFlow {
         pass.set_bind_group(0, self.bind.get(bind).ok_or_else(|| Error::Invalid("GPU: no bind group".into()))?, &[]);
         pass.set_pipeline(self.pipeline(name)?);
         pass.dispatch_workgroups(gx, gy, 1);
+        Ok(())
+    }
+
+    /// Timestamped passes are diagnostic: their extra pass boundaries and readback are not
+    /// used for throughput measurements. Normally every chunk remains one compute pass.
+    fn submit(&self, label: &str, commands: &[Dispatch]) -> Result<()> {
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+        let Some(times) = &self.kernel_times else {
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(label), timestamp_writes: None });
+                for &(bind, name, groups) in commands {
+                    self.dispatch(&mut pass, bind, name, groups)?;
+                }
+            }
+            self.queue.submit([enc.finish()]);
+            return Ok(());
+        };
+        let count = u32::try_from(commands.len() * 2).map_err(|_| gpu_error("too many timestamp queries"))?;
+        if count == 0 || count > wgpu::QUERY_SET_MAX_QUERIES {
+            return Err(gpu_error("timestamp query count is outside the device limit"));
+        }
+        let query = self.device.create_query_set(&wgpu::QuerySetDescriptor { label: Some(label), ty: wgpu::QueryType::Timestamp, count });
+        let result = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("lbm timestamps"),
+            size: u64::from(count) * 8,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        for (i, &(bind, name, groups)) in commands.iter().enumerate() {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some(name),
+                timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                    query_set: &query,
+                    beginning_of_pass_write_index: Some(2 * i as u32),
+                    end_of_pass_write_index: Some(2 * i as u32 + 1),
+                }),
+            });
+            self.dispatch(&mut pass, bind, name, groups)?;
+        }
+        enc.resolve_query_set(&query, 0..count, &result, 0);
+        self.queue.submit([enc.finish()]);
+        let bytes = self.read(&result, u64::from(count) * 8)?;
+        let period = f64::from(self.queue.get_timestamp_period());
+        let mut totals = times.borrow_mut();
+        for ((_, name, _), pair) in commands.iter().zip(bytes.as_chunks::<16>().0) {
+            let [begin, end] = pair.as_chunks::<8>().0 else { return Err(gpu_error("invalid timestamp pair")) };
+            let ticks = u64::from_le_bytes(*end).checked_sub(u64::from_le_bytes(*begin)).ok_or_else(|| gpu_error("invalid GPU timestamps"))?;
+            let total = totals.entry(name).or_default();
+            total.dispatches += 1;
+            total.seconds += ticks as f64 * period * 1e-9;
+        }
         Ok(())
     }
 
@@ -551,13 +681,7 @@ impl GpuFlow {
 
     /// The moments of the current state into the moments buffer.
     fn compute_moments(&self) -> Result<()> {
-        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("lbm moments") });
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("lbm moments"), timestamp_writes: None });
-            self.dispatch(&mut pass, self.current, "cell_moments", self.cells)?;
-        }
-        self.queue.submit([enc.finish()]);
-        Ok(())
+        self.submit("lbm moments", &[(self.current, "cell_moments", self.cells)])
     }
 }
 
@@ -565,41 +689,45 @@ impl GpuFlow {
     /// One submission of `steps` (≤ MAX_CHUNK) time steps, then the stability check.
     fn advance_chunk(&mut self, steps: u64) -> Result<()> {
         self.queue.write_buffer(&self.stats, 0, &bytes_u32(&[0, 0, 0, 0]));
-        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("lbm steps") });
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("lbm steps"), timestamp_writes: None });
-            for _ in 0..steps {
-                self.dispatch(&mut pass, self.current, "collide", self.cells)?;
-                self.dispatch(&mut pass, self.current, "stream", self.cells)?;
-                if self.link_count > 0 {
-                    self.dispatch(&mut pass, self.current, "stream_links", self.links_groups)?;
-                }
-                if self.open_count > 0 {
-                    self.dispatch(&mut pass, self.current, "open_boundaries", self.open_groups)?;
-                }
-                if self.thermal.is_some() {
-                    self.dispatch(&mut pass, self.current, "collide_thermal", self.cells)?;
-                    self.dispatch(&mut pass, self.current, "stream_thermal", self.cells)?;
-                    if self.link_count > 0 {
-                        self.dispatch(&mut pass, self.current, "stream_links_thermal", self.links_groups)?;
-                    }
-                    if self.open_count > 0 {
-                        self.dispatch(&mut pass, self.current, "open_thermal", self.open_groups)?;
-                    }
-                }
-                self.current ^= 1;
+        let mut commands = Vec::with_capacity(8 * MAX_CHUNK as usize + 3);
+        for step in 0..steps {
+            commands.push((self.current, "collide", self.cells));
+            if !self.aa {
+                commands.push((self.current, "stream", self.cells));
             }
-            // The momentum (and heat) exchange of the last step, from its post-collision
-            // populations.
-            if self.link_count > 0 && self.group_count > 0 {
-                self.dispatch(&mut pass, self.current ^ 1, "link_forces", self.links_groups)?;
-                self.dispatch(&mut pass, self.current ^ 1, "group_forces", self.force_groups)?;
+            if self.link_count > 0 {
+                // The last step's momentum exchange is the one read back.
+                let exchange = self.aa && step + 1 == steps;
+                commands.push((self.current, if exchange { "stream_links_exchange" } else { "stream_links" }, self.links_groups));
+                if self.aa {
+                    commands.push((self.current, "scatter_links", self.links_groups));
+                }
+            }
+            if self.open_count > 0 {
+                commands.push((self.current, "open_boundaries", self.open_groups));
             }
             if self.thermal.is_some() {
-                self.dispatch(&mut pass, self.current, "thermal_check", self.cells)?;
+                commands.push((self.current, "collide_thermal", self.cells));
+                commands.push((self.current, "stream_thermal", self.cells));
+                if self.link_count > 0 {
+                    commands.push((self.current, "stream_links_thermal", self.links_groups));
+                }
+                if self.open_count > 0 {
+                    commands.push((self.current, "open_thermal", self.open_groups));
+                }
             }
+            self.current ^= 1;
         }
-        self.queue.submit([enc.finish()]);
+        // The momentum (and heat) exchange of the last step, from its post-collision
+        // populations.
+        if self.link_count > 0 && self.group_count > 0 {
+            commands.push((self.current ^ 1, "link_forces", self.links_groups));
+            commands.push((self.current ^ 1, "group_forces", self.force_groups));
+        }
+        if self.thermal.is_some() {
+            commands.push((self.current, "thermal_check", self.cells));
+        }
+        self.submit("lbm steps", &commands)?;
         self.steps_done += steps;
         self.exchange_cache = None;
         let stats = self.read(&self.stats, 16)?;
@@ -624,7 +752,7 @@ impl GpuFlow {
 
 impl Backend for GpuFlow {
     fn name(&self) -> String {
-        format!("gpu: {}", self.adapter)
+        format!("gpu: {}, {} streaming", self.adapter, if self.aa { "in-place" } else { "two-buffer" })
     }
 
     fn advance(&mut self, steps: u64) -> Result<()> {
@@ -671,12 +799,7 @@ impl Backend for GpuFlow {
 
     fn mass(&mut self) -> Result<f64> {
         self.compute_moments()?;
-        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("lbm mass") });
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("lbm mass"), timestamp_writes: None });
-            self.dispatch(&mut pass, self.current, "mass", self.cells)?;
-        }
-        self.queue.submit([enc.finish()]);
+        self.submit("lbm mass", &[(self.current, "mass", self.cells)])?;
         let partials = self.read_f32(&self.partials, self.partial_count)?;
         // Summed in a fixed order on the host, so the result is deterministic on this device.
         Ok(partials.iter().map(|v| f64::from(*v)).sum())

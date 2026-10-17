@@ -18,7 +18,7 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 #[cfg(not(target_arch = "wasm32"))]
-pub use native::{GpuFlow, register};
+pub use native::{GpuFlow, KernelTime, Options, Streaming, register};
 
 /// In the browser there is no device backend yet (WebGPU later): registering is a no-op and
 /// `solve.fluid` with `backend: "gpu"` reports that none is available.
