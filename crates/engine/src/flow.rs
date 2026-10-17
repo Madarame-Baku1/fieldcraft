@@ -437,6 +437,7 @@ pub(crate) mod tests {
             lattice_velocity: 0.1,
             mach: 0.1,
             cell_updates: 0,
+            backend: "cpu".into(),
         };
         FluidResult {
             step: "Flow".into(),
