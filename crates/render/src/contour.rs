@@ -5,7 +5,7 @@
 //! sharp iso-lines on any renderer, with no shader support: the GPU viewport and the CPU
 //! rasterizer draw the same flat-coloured pieces.
 
-use crate::{Rgb, Vec3};
+use crate::{Rgb, SceneTri, Vec3};
 
 /// Equal bands from `min` to `max`.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -92,6 +92,19 @@ pub fn split_triangle(p: [Vec3; 3], v: [f64; 3], bands: &Bands, out: &mut impl F
             out(&pts, Some(k));
         }
     }
+}
+
+/// [`split_triangle`] with each piece fanned into scene triangles of `normal`, coloured by `color`
+/// of its band (`None`: a value that is not a number).
+pub fn banded(p: [Vec3; 3], v: [f64; 3], normal: Vec3, bands: &Bands, color: &impl Fn(Option<u32>) -> Rgb, out: &mut Vec<SceneTri>) {
+    split_triangle(p, v, bands, &mut |piece, band| {
+        let color = color(band);
+        for k in 1..piece.len().saturating_sub(1) {
+            if let (Some(&a), Some(&b), Some(&c)) = (piece.first(), piece.get(k), piece.get(k + 1)) {
+                out.push(SceneTri { p: [a, b, c], normal, color });
+            }
+        }
+    });
 }
 
 /// The part of a convex polygon where the value is at least (`keep_above`) or at most `level`
@@ -189,6 +202,12 @@ mod tests {
             assert_eq!(k, None);
         });
         assert_eq!(n, 2);
+        // Fanned into scene triangles, keeping the area and the bands.
+        let mut tris = Vec::new();
+        banded(p, [0.0, 10.0, 0.0], Vec3::Z, &b, &|k| Rgb(k.map_or(0, |k| k as u8), 0, 0), &mut tris);
+        assert!((tris.iter().map(|t| area(&t.p)).sum::<f64>() - 50.0).abs() < 1e-9);
+        assert_eq!(tris.iter().map(|t| t.color.0).max(), Some(4));
+        assert!(tris.iter().all(|t| t.normal == Vec3::Z));
     }
 
     /// A clamped range puts the values above it in the "over" band, split exactly at the

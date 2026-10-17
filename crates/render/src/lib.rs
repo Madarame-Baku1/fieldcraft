@@ -1,7 +1,8 @@
 //! Display data for FieldCraft, with no GPU dependency: what a finite element model looks like
 //! on screen ([`DisplayMesh`]: the visible faces, element edges, line elements and nodes), an
 //! orbit camera with perspective or orthographic projection, picking ([`pick`]: what a ray through
-//! a pixel hits), and a CPU rasterizer for headless snapshots. The desktop viewport draws the
+//! a pixel hits), flow fields on a grid of cells ([`flow`]: slices, surface values and
+//! streamlines), and a CPU rasterizer for headless snapshots. The desktop viewport draws the
 //! same [`Scene`] on the GPU.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
@@ -9,6 +10,7 @@
 mod camera;
 pub mod contour;
 mod display;
+pub mod flow;
 mod font;
 pub mod glyphs;
 pub mod pick;
