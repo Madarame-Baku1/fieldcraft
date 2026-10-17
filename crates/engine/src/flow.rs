@@ -403,9 +403,24 @@ pub fn plot_with_surfaces(
 /// Per displayed surface triangle, the temperature its obstacle face is held at, when the step's
 /// domain holds that face at one and the result is of the current model.
 fn held_temperatures(session: &crate::Session, r: &FluidResult, base: &fieldcraft_render::DisplayMesh, bodies: &[&str]) -> Vec<Option<f64>> {
-    let none = || vec![None; base.surface_tris.len()];
+    let faces = held_faces(session, r);
+    let held: std::collections::BTreeMap<_, _> = faces.iter().map(|h| ((h.body.as_str(), h.index), h.value)).collect();
+    base.surface_tris.iter().map(|t| bodies.get(t.body as usize).and_then(|name| held.get(&(*name, t.face)).copied())).collect()
+}
+
+/// An obstacle face the step's fluid domain holds at a temperature.
+pub struct HeldFace {
+    pub body: String,
+    pub face: String,
+    pub index: u32,
+    pub value: f64,
+}
+
+/// The faces the step's fluid domain holds at a temperature, when the result is of the current
+/// model (a stale result was solved with other conditions).
+pub fn held_faces(session: &crate::Session, r: &FluidResult) -> Vec<HeldFace> {
     if session.latest_result(&r.step).is_some_and(|(_, current)| !current) {
-        return none();
+        return Vec::new();
     }
     let Some(thermal) = session
         .model
@@ -414,10 +429,10 @@ fn held_temperatures(session: &crate::Session, r: &FluidResult, base: &fieldcraf
         .and_then(|d| session.model.fluid_domain(d))
         .and_then(|d| d.thermal.as_ref())
     else {
-        return none();
+        return Vec::new();
     };
     let design = session.design.as_deref();
-    let mut held = std::collections::BTreeMap::new();
+    let mut out = Vec::new();
     for sb in &thermal.surfaces {
         let (fieldcraft_model::ThermalCondition::Temperature { value }, fieldcraft_model::Entity::Face(face)) = (&sb.condition, &sb.face.entity)
         else {
@@ -425,10 +440,10 @@ fn held_temperatures(session: &crate::Session, r: &FluidResult, base: &fieldcraf
         };
         let index = design.and_then(|d| d.bodies.iter().find(|b| b.name == sb.face.body)).and_then(|b| b.face_index(face));
         if let Some(index) = index {
-            held.insert((sb.face.body.as_str(), index), *value);
+            out.push(HeldFace { body: sb.face.body.clone(), face: face.clone(), index, value: *value });
         }
     }
-    base.surface_tris.iter().map(|t| bodies.get(t.body as usize).and_then(|name| held.get(&(*name, t.face)).copied())).collect()
+    out
 }
 
 /// The colours a flow plot is drawn in.
@@ -650,6 +665,9 @@ pub(crate) mod tests {
         assert!(at.is_some(), "{:?}", c.max);
         let held: Vec<f64> = fp.wall_values.iter().filter_map(|(_, v)| *v).collect();
         assert!(!held.is_empty() && held.iter().all(|t| *t == 80.0), "{held:?}");
+        // A script reads the same maximum as the app shows: the held face.
+        let reply = s.results_report();
+        assert_eq!(reply["contour"]["range"]["max"], json!({"body": "Body1", "face": face, "value": 80.0}), "{reply}");
         // The headless picture draws the held face in the top band's colour.
         let p = crate::view::Palette::LIGHT;
         let top = bands_color(&p.contour, p.contour_over, &c.bands, c.bands.band(80.0).unwrap());
