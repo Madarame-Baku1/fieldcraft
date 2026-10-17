@@ -301,10 +301,12 @@ fn open_boundaries(@builtin(local_invocation_index) lid: u32, @builtin(workgroup
     let axis = ou.y;
     let sign = ot.w;
     let a_half = 0.5 * acc_of(cell);
-    // The sums of f over the tangential (c_n = 0) and outgoing (c_n < 0) directions: the sums of
-    // h plus the weights' (2/3 and 1/6 for D3Q19).
-    var tangential = 2.0 / 3.0;
-    var outgoing = 1.0 / 6.0;
+    // The sums of h over the tangential (c_n = 0) and outgoing (c_n < 0) directions. The sums of
+    // f add the weights' (2/3 and 1/6 for D3Q19, so tangential + 2 outgoing gains exactly 1): the
+    // weight is added after the deviations are summed, not before, which in single precision would
+    // round away the deviations' last digits at low speed.
+    var tangential = 0.0;
+    var outgoing = 0.0;
     for (var q = 0u; q < Q; q = q + 1u) {
         let v = g[q * n + cell];
         let cn = f32(c_of(q)[axis]) * sign;
@@ -319,10 +321,10 @@ fn open_boundaries(@builtin(local_invocation_index) lid: u32, @builtin(workgroup
     if ou.z == 0u {
         bare = ot.xyz - a_half;
         let un = sign * bare[axis];
-        rho = (tangential + 2.0 * outgoing) / (1.0 - un);
+        rho = (1.0 + (tangential + 2.0 * outgoing)) / (1.0 - un);
     } else {
         rho = ot.x;
-        let un = 1.0 - (tangential + 2.0 * outgoing) / rho;
+        let un = ((rho - 1.0) - (tangential + 2.0 * outgoing)) / rho;
         // Not `bare[axis] = …`: DX12's shader compiler (FXC) refuses a write through a
         // dynamic index into a local vector (X3500).
         bare = select(-a_half, vec3<f32>(sign * un), vec3<u32>(0u, 1u, 2u) == vec3<u32>(axis));
