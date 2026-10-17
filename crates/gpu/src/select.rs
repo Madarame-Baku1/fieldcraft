@@ -8,6 +8,11 @@
 //! Backends are Metal on macOS, DX12 and Vulkan on Windows, Vulkan and GL elsewhere;
 //! `WGPU_BACKEND` narrows them. A discrete GPU outranks an integrated one, then a virtual one,
 //! then any other; a CPU device is the software tier.
+//!
+//! wgpu's backend options follow its environment variables: on DX12, `WGPU_DX12_COMPILER`
+//! (`fxc` or `dxc`; unset, DXC when `dxcompiler.dll` is on the DLL search path, else FXC, see
+//! #561). `staticdxc` is refused: it needs wgpu's `static-dxc` feature, which FieldCraft does not
+//! build, and wgpu would panic on it.
 
 use crate::{GpuError, Result};
 
@@ -100,7 +105,11 @@ pub fn adapter(policy: Policy) -> Result<Option<(wgpu::Adapter, Tier)>> {
     if policy == Policy::Cpu {
         return Ok(None);
     }
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor { backends: backends(), ..wgpu::InstanceDescriptor::new_without_display_handle() });
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: backends(),
+        backend_options: backend_options(wgpu::BackendOptions::from_env_or_default())?,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
     let mut adapters = pollster::block_on(instance.enumerate_adapters(backends()));
     let types: Vec<_> = adapters.iter().map(|a| a.get_info().device_type).collect();
     let Some(i) = pick(&types, policy)? else { return Ok(None) };
@@ -108,11 +117,31 @@ pub fn adapter(policy: Policy) -> Result<Option<(wgpu::Adapter, Tier)>> {
     Ok((i < adapters.len()).then(|| (adapters.swap_remove(i), tier)))
 }
 
+/// `options`, unless they ask for a DX12 compiler this build does not have.
+fn backend_options(options: wgpu::BackendOptions) -> Result<wgpu::BackendOptions> {
+    if matches!(options.dx12.shader_compiler, wgpu::Dx12Compiler::StaticDxc) {
+        return Err(GpuError::Device("WGPU_DX12_COMPILER=staticdxc is not built in: use dxc with dxcompiler.dll, or fxc".into()));
+    }
+    Ok(options)
+}
+
 #[cfg(test)]
 mod tests {
     use wgpu::DeviceType::*;
 
     use super::*;
+
+    #[test]
+    fn a_dx12_compiler_that_is_not_built_in_is_refused() {
+        let with = |shader_compiler| {
+            let mut o = wgpu::BackendOptions::default();
+            o.dx12.shader_compiler = shader_compiler;
+            backend_options(o)
+        };
+        assert!(with(wgpu::Dx12Compiler::Fxc).is_ok());
+        assert!(with(wgpu::Dx12Compiler::Auto).is_ok());
+        assert!(with(wgpu::Dx12Compiler::StaticDxc).is_err());
+    }
 
     #[test]
     fn policies_walk_the_tiers() {
