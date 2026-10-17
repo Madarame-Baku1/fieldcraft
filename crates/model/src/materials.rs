@@ -510,11 +510,7 @@ impl Model {
 
     pub fn replace_material(&mut self, name: &str, material: Material) -> Result<()> {
         material.validate().map_err(|e| context("material", name, e))?;
-        if material.fluid.is_none()
-            && let Some(d) = self.fluid_domains_of_material(name).next()
-        {
-            return Err(Error::Invalid(format!("material `{name}`: fluid domain `{d}` needs its fluid behaviour")));
-        }
+        self.check_material_fits_fluid_domains(name, &material)?;
         replace_existing(&mut self.materials, "material", name, material)
     }
 

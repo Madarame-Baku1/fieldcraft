@@ -16,7 +16,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::geometry::{Entity, GeometryRef};
-use crate::{Error, Model, Result, context, finite, insert_new, not_in_use, positive, remove_existing, replace_existing, require};
+use crate::{Error, Material, Model, Result, context, finite, insert_new, not_in_use, positive, remove_existing, replace_existing, require};
 
 /// Most obstacle bodies in one domain.
 pub const MAX_OBSTACLES: usize = 1000;
@@ -243,6 +243,177 @@ pub struct SurfaceBoundary {
     pub condition: SurfaceCondition,
 }
 
+/// What a boundary does to the fluid's temperature.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ThermalCondition {
+    /// No heat crosses it (every boundary, unless told otherwise); at an inlet the fluid enters
+    /// at the initial temperature, at an outlet it leaves at the temperature it has.
+    Adiabatic {},
+    /// Held at this temperature (at an inlet, the fluid enters at it).
+    Temperature { value: f64 },
+    /// A heat flux into the fluid (power per area; negative draws heat out).
+    Flux { value: f64 },
+}
+
+impl ThermalCondition {
+    pub fn name(&self) -> &'static str {
+        match self {
+            ThermalCondition::Adiabatic {} => "adiabatic",
+            ThermalCondition::Temperature { .. } => "temperature",
+            ThermalCondition::Flux { .. } => "flux",
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        match self {
+            ThermalCondition::Adiabatic {} => Ok(()),
+            ThermalCondition::Temperature { value } | ThermalCondition::Flux { value } => finite(self.name(), *value).map(|_| ()),
+        }
+    }
+}
+
+impl Default for ThermalCondition {
+    fn default() -> Self {
+        ThermalCondition::Adiabatic {}
+    }
+}
+
+/// The thermal condition of each box face.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct BoxThermalFaces {
+    pub x_min: ThermalCondition,
+    pub x_max: ThermalCondition,
+    pub y_min: ThermalCondition,
+    pub y_max: ThermalCondition,
+    pub z_min: ThermalCondition,
+    pub z_max: ThermalCondition,
+}
+
+impl BoxThermalFaces {
+    pub fn get(&self, face: BoxFace) -> &ThermalCondition {
+        match face {
+            BoxFace::XMin => &self.x_min,
+            BoxFace::XMax => &self.x_max,
+            BoxFace::YMin => &self.y_min,
+            BoxFace::YMax => &self.y_max,
+            BoxFace::ZMin => &self.z_min,
+            BoxFace::ZMax => &self.z_max,
+        }
+    }
+
+    pub fn get_mut(&mut self, face: BoxFace) -> &mut ThermalCondition {
+        match face {
+            BoxFace::XMin => &mut self.x_min,
+            BoxFace::XMax => &mut self.x_max,
+            BoxFace::YMin => &mut self.y_min,
+            BoxFace::YMax => &mut self.y_max,
+            BoxFace::ZMin => &mut self.z_min,
+            BoxFace::ZMax => &mut self.z_max,
+        }
+    }
+}
+
+/// A thermal condition on one named face of an obstacle body.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceThermalBoundary {
+    pub face: GeometryRef,
+    pub condition: ThermalCondition,
+}
+
+/// Heat in the fluid: a temperature field advected with the flow and diffused with the
+/// material's diffusivity k / (ρ c), its conditions on the boundaries, and buoyancy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FluidThermal {
+    /// The temperature everywhere at the start, and the reference of the buoyancy.
+    pub initial_temperature: f64,
+    /// Gravity for the buoyancy (Boussinesq: a force per mass of −β (T − T₀) g on the fluid);
+    /// zero for none. Separate from the domain's `acceleration`, which is a plain body force.
+    pub gravity: [f64; 3],
+    /// The fluid's volumetric thermal expansion coefficient β (per temperature); needed with
+    /// a gravity.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expansion: Option<f64>,
+    pub faces: BoxThermalFaces,
+    /// Conditions on named faces of the obstacles (adiabatic unless listed).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub surfaces: Vec<SurfaceThermalBoundary>,
+}
+
+impl Default for FluidThermal {
+    fn default() -> Self {
+        FluidThermal { initial_temperature: 0.0, gravity: [0.0; 3], expansion: None, faces: BoxThermalFaces::default(), surfaces: Vec::new() }
+    }
+}
+
+impl FluidThermal {
+    fn validate(&self, obstacles: &[String]) -> Result<()> {
+        finite("initial temperature", self.initial_temperature)?;
+        vector("gravity", self.gravity)?;
+        if let Some(b) = self.expansion {
+            finite("expansion coefficient", b)?;
+            if b < 0.0 {
+                return Err(Error::Invalid(format!("the expansion coefficient {b} is negative")));
+            }
+        }
+        if self.gravity != [0.0; 3] && self.expansion.is_none() {
+            return Err(Error::Invalid("buoyancy needs the fluid's expansion coefficient (`expansion`) with its gravity".into()));
+        }
+        for face in BoxFace::ALL {
+            self.faces.get(face).validate().map_err(|e| context("box face", face.name(), e))?;
+        }
+        if self.surfaces.len() > MAX_SURFACE_CONDITIONS {
+            return Err(Error::Limit(format!("a fluid domain holds at most {MAX_SURFACE_CONDITIONS} thermal surface conditions")));
+        }
+        for (i, s) in self.surfaces.iter().enumerate() {
+            s.condition.validate()?;
+            if !matches!(s.face.entity, Entity::Face(_)) {
+                return Err(Error::Invalid(format!("thermal conditions go on faces, not on the {}", s.face)));
+            }
+            if !obstacles.contains(&s.face.body) {
+                return Err(Error::Invalid(format!(
+                    "the {} is not on an obstacle of the domain (list body `{}` in `obstacles`)",
+                    s.face, s.face.body
+                )));
+            }
+            if self.surfaces.get(..i).is_some_and(|before| before.iter().any(|b| b.face == s.face)) {
+                return Err(Error::Invalid(format!("the {} has two thermal conditions", s.face)));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What a fluid domain needs of its material: a density and fluid behaviour, and with heat a
+/// positive isotropic conductivity and specific heat (the diffusivity k / (ρ c)).
+fn material_fits_fluid_domain(m: &Material, name: &str, d: &FluidDomain) -> Result<()> {
+    if m.fluid.is_none() {
+        return Err(Error::Invalid(format!("material `{name}` has no fluid behaviour (a viscosity)")));
+    }
+    if m.density.is_none() {
+        return Err(Error::Invalid(format!("material `{name}` has no density")));
+    }
+    if d.thermal.is_some() {
+        let thermal = m.thermal.as_ref();
+        match thermal.and_then(|t| t.conductivity) {
+            Some(crate::Directional::Isotropic(k)) if k > 0.0 => {}
+            Some(crate::Directional::Isotropic(_)) | None => {
+                return Err(Error::Invalid(format!("material `{name}` needs a positive isotropic conductivity for heat in the fluid")));
+            }
+            Some(crate::Directional::Orthotropic(_)) => {
+                return Err(Error::Invalid(format!("material `{name}`: a fluid's conductivity is isotropic")));
+            }
+        }
+        if !thermal.and_then(|t| t.specific_heat).is_some_and(|c| c > 0.0) {
+            return Err(Error::Invalid(format!("material `{name}` needs a positive specific heat for heat in the fluid")));
+        }
+    }
+    Ok(())
+}
+
 /// Where a boundary condition goes: a face of the box, or a named face of an obstacle.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -279,6 +450,9 @@ pub struct FluidDomain {
     /// The chordal tolerance obstacles are triangulated with (default: a tenth of the spacing).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tolerance: Option<f64>,
+    /// Heat in the fluid (a temperature field, buoyancy); `None` for an isothermal flow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thermal: Option<FluidThermal>,
 }
 
 fn is_zero(v: &[f64; 3]) -> bool {
@@ -346,6 +520,9 @@ impl FluidDomain {
                 return Err(Error::Invalid(format!("obstacle `{b}` is listed twice")));
             }
         }
+        if let Some(t) = &self.thermal {
+            t.validate(&self.obstacles).map_err(|e| context("thermal", "settings", e))?;
+        }
         if self.surfaces.len() > MAX_SURFACE_CONDITIONS {
             return Err(Error::Limit(format!("a fluid domain holds at most {MAX_SURFACE_CONDITIONS} surface conditions")));
         }
@@ -373,6 +550,25 @@ impl FluidDomain {
     }
 
     /// Set the condition on one boundary: a box face, or a named face of an obstacle, which
+    /// Set one boundary's thermal condition (an adiabatic obstacle face removes its entry,
+    /// adiabatic being the default). Needs the domain's thermal settings; the caller validates
+    /// the result ([`Model::set_fluid_thermal_boundary`] does).
+    pub fn set_thermal_boundary(&mut self, at: FluidBoundary, condition: ThermalCondition) -> Result<()> {
+        let Some(t) = &mut self.thermal else {
+            return Err(Error::Invalid("the domain has no thermal settings (`thermal`), so no boundary has a thermal condition".into()));
+        };
+        match at {
+            FluidBoundary::Box(face) => *t.faces.get_mut(face) = condition,
+            FluidBoundary::Surface(face) => {
+                t.surfaces.retain(|s| s.face != face);
+                if condition != (ThermalCondition::Adiabatic {}) {
+                    t.surfaces.push(SurfaceThermalBoundary { face, condition });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// takes a wall or a moving wall (a wall there removes the entry, walls being the default).
     /// The caller validates the result ([`Model::set_fluid_boundary`] does).
     pub fn set_boundary(&mut self, at: FluidBoundary, condition: FaceCondition) -> Result<()> {
@@ -407,10 +603,24 @@ impl Model {
         d.validate()?;
         require(&self.materials, "material", &d.material)?;
         match self.materials.get(&d.material) {
-            Some(m) if m.fluid.is_none() => Err(Error::Invalid(format!("material `{}` has no fluid behaviour (a viscosity)", d.material))),
-            Some(m) if m.density.is_none() => Err(Error::Invalid(format!("material `{}` has no density", d.material))),
-            _ => Ok(()),
+            Some(m) => material_fits_fluid_domain(m, &d.material, d),
+            None => Ok(()),
         }
+    }
+
+    /// The fluid domains `material` must keep fitting when it is replaced.
+    pub(crate) fn check_material_fits_fluid_domains(&self, name: &str, material: &Material) -> Result<()> {
+        for (domain, d) in self.fluid_domains.iter().filter(|(_, d)| d.material == name) {
+            material_fits_fluid_domain(material, name, d).map_err(|e| context("fluid domain", domain, e))?;
+        }
+        Ok(())
+    }
+
+    /// Set the thermal condition on one boundary of a domain.
+    pub fn set_fluid_thermal_boundary(&mut self, name: &str, at: FluidBoundary, condition: ThermalCondition) -> Result<()> {
+        let mut d = self.fluid_domains.get(name).cloned().ok_or_else(|| Error::NotFound(format!("fluid domain `{name}`")))?;
+        d.set_thermal_boundary(at, condition).map_err(|e| context("fluid domain", name, e))?;
+        self.replace_fluid_domain(name, d)
     }
 
     pub fn add_fluid_domain(&mut self, name: &str, domain: FluidDomain) -> Result<()> {
@@ -449,7 +659,7 @@ impl Model {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Fluid, Material, Procedure, Step};
+    use crate::{Directional, Fluid, Material, Procedure, Step};
 
     fn water() -> Material {
         Material { density: Some(1.0e-9), fluid: Some(Fluid::Newtonian { viscosity: 1.0e-9 }), ..Material::default() }
@@ -473,7 +683,70 @@ mod tests {
             initial_velocity: [0.0; 3],
             acceleration: [0.0; 3],
             tolerance: None,
+            thermal: None,
         }
+    }
+
+    #[test]
+    fn thermal_settings_validate_and_need_the_materials_heat_properties() {
+        let mut m = Model::default();
+        m.add_material("Water", water()).unwrap();
+        let thermal = |f: &dyn Fn(&mut FluidThermal)| {
+            let mut d = channel();
+            let mut t = FluidThermal { initial_temperature: 20.0, ..FluidThermal::default() };
+            f(&mut t);
+            d.thermal = Some(t);
+            d
+        };
+        // heat in the fluid needs a conductivity and a specific heat on the material
+        assert!(m.add_fluid_domain("Flow", thermal(&|_| {})).is_err());
+        let mut hot = water();
+        hot.thermal = Some(crate::Thermal { conductivity: Some(Directional::Isotropic(0.6)), specific_heat: Some(4180.0), ..Default::default() });
+        m.replace_material("Water", hot.clone()).unwrap();
+        m.add_fluid_domain("Flow", thermal(&|_| {})).unwrap();
+        m.add_fluid_domain(
+            "Hot",
+            thermal(&|t| {
+                t.faces.y_min = ThermalCondition::Temperature { value: 50.0 };
+                t.gravity = [0.0, -9810.0, 0.0];
+                t.expansion = Some(2e-4);
+            }),
+        )
+        .unwrap();
+        for d in [
+            thermal(&|t| t.initial_temperature = f64::NAN),
+            thermal(&|t| t.gravity = [0.0, -1.0, 0.0]),
+            thermal(&|t| t.expansion = Some(-1.0)),
+            thermal(&|t| t.faces.x_min = ThermalCondition::Flux { value: f64::INFINITY }),
+            thermal(&|t| {
+                t.surfaces = vec![SurfaceThermalBoundary {
+                    face: GeometryRef::face("Nope", "F1").unwrap(),
+                    condition: ThermalCondition::Temperature { value: 1.0 },
+                }]
+            }),
+        ] {
+            assert!(m.add_fluid_domain("Bad", d).is_err());
+        }
+        let mut aniso = hot;
+        aniso.thermal =
+            Some(crate::Thermal { conductivity: Some(Directional::Orthotropic([1.0; 3])), specific_heat: Some(1.0), ..Default::default() });
+        m.add_material("Oil", aniso.clone()).unwrap();
+        let mut d = thermal(&|_| {});
+        d.material = "Oil".into();
+        assert!(m.add_fluid_domain("Aniso", d).is_err(), "a fluid's conductivity is isotropic");
+        assert!(m.replace_material("Water", water()).is_err(), "the domains with heat keep needing the heat properties");
+        assert!(m.replace_material("Water", aniso).is_err());
+        // setting conditions
+        m.set_fluid_thermal_boundary("Flow", FluidBoundary::Box(BoxFace::XMin), ThermalCondition::Temperature { value: 80.0 }).unwrap();
+        assert_eq!(m.fluid_domain("Flow").unwrap().thermal.as_ref().unwrap().faces.x_min, ThermalCondition::Temperature { value: 80.0 });
+        assert!(m.set_fluid_thermal_boundary("Flow", FluidBoundary::Box(BoxFace::XMin), ThermalCondition::Flux { value: f64::NAN }).is_err());
+        let mut plain = channel();
+        plain.thermal = None;
+        m.add_fluid_domain("Plain", plain).unwrap();
+        assert!(
+            m.set_fluid_thermal_boundary("Plain", FluidBoundary::Box(BoxFace::XMin), ThermalCondition::Adiabatic {}).is_err(),
+            "no thermal settings"
+        );
     }
 
     #[test]

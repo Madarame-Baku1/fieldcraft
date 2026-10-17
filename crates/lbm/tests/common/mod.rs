@@ -21,6 +21,7 @@ pub fn domain(min: [f64; 3], max: [f64; 3], spacing: f64) -> FluidDomain {
         initial_velocity: [0.0; 3],
         acceleration: [0.0; 3],
         tolerance: None,
+        thermal: None,
     }
 }
 

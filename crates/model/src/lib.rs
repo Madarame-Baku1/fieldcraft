@@ -66,7 +66,10 @@ pub use constraints::{Coupling, CouplingKind, ReferencePoint};
 pub use contact::{Contact, ContactSurfaces, Friction, InitialPenetration};
 pub use datums::{Datum, Partition};
 pub use discrete::{Direction, Mass, PointMass, ResolvedDirection, ResolvedMass, ResolvedSpring, Spring};
-pub use fluids::{BoxFace, BoxFaces, FaceCondition, FluidBoundary, FluidDomain, Profile, SurfaceBoundary, SurfaceCondition};
+pub use fluids::{
+    BoxFace, BoxFaces, BoxThermalFaces, FaceCondition, FluidBoundary, FluidDomain, FluidThermal, Profile, SurfaceBoundary, SurfaceCondition,
+    SurfaceThermalBoundary, ThermalCondition,
+};
 pub use geometry::{BodyMesh, Classification, Entity, GeometryRef};
 pub use loads::{Distribution, Load, centrifugal_acceleration};
 pub use materials::{Damage, Directional, Elastic, Erosion, Fluid, Hardening, HardeningPoint, Hyperelastic, Material, Plastic, Thermal};
