@@ -7,6 +7,7 @@ use fieldcraft_lbm::backend::{Backend, Fields};
 use fieldcraft_lbm::lattice::{C, Q, W};
 use fieldcraft_lbm::setup::MAX_LATTICE_SPEED;
 use fieldcraft_lbm::{Error, Flow, Group, Result, Rule, Target};
+use fieldcraft_model::ThermalCondition;
 use wgpu::util::DeviceExt;
 
 const SHADER: &str = include_str!("lbm.wgsl");
@@ -16,6 +17,9 @@ const KIND_PULL: u32 = 0;
 const KIND_BOUNCE: u32 = 1;
 const KIND_REFLECT: u32 = 2;
 const KIND_OPEN: u32 = 3;
+/// The scalar lattice's directions (the first seven of D3Q19) and weights.
+const QT: usize = 7;
+const WT: [f64; QT] = [0.25, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125];
 
 fn gpu_error(e: impl std::fmt::Display) -> Error {
     Error::Invalid(format!("GPU: {e}"))
@@ -91,14 +95,18 @@ pub struct GpuFlow {
     forces: wgpu::Buffer,
     partials: wgpu::Buffer,
     partial_count: usize,
+    /// The scalar populations, A–B like the flow's, with heat; and T₀ they are shifted by.
+    thermal: Option<[wgpu::Buffer; 2]>,
+    initial_temperature: f64,
     fluid: Vec<bool>,
     fluid_cells: usize,
     groups: Vec<Group>,
     empty_obstacles: Vec<String>,
     steps_done: u64,
-    /// The forces of the last step, once read back (zero before the first step).
-    forces_cache: Option<Vec<[f64; 3]>>,
-    /// Each group's share of the exchange from the populations' weights, which the kernel leaves
+    /// The momentum (xyz) and heat (w) each group received in the last step, once read back
+    /// (zero before the first step).
+    exchange_cache: Option<Vec<[f64; 4]>>,
+    /// Each group's share of the momentum from the populations' weights, which the kernel leaves
     /// out (`link_forces` sums the deviations): added to what it reads back.
     weight_forces: Vec<[f64; 3]>,
 }
@@ -113,9 +121,6 @@ impl GpuFlow {
     /// `flow` (its grid, rules and initial state: everything the step needs) on the device
     /// `policy` picks.
     pub fn new(flow: &Flow, policy: Policy) -> Result<GpuFlow> {
-        if flow.has_heat() {
-            return Err(Error::Invalid("heat in the fluid is not on the GPU yet: solve this step on the CPU (`backend: \"cpu\"`)".into()));
-        }
         let Some((adapter, tier)) = select::adapter(policy).map_err(gpu_error)? else {
             return Err(Error::Invalid(format!("{}=cpu: no GPU device; solve with `backend: \"cpu\"`", select::ENV)));
         };
@@ -154,6 +159,20 @@ impl GpuFlow {
             for cell in 0..n {
                 if let (Some(slot), true) = (f.get_mut(q * n + cell), flow.is_fluid(cell)) {
                     *slot = (flow.population(q, cell) - w) as f32;
+                }
+            }
+        }
+        // The scalar populations as deviations from w_q T₀ (see lbm.wgsl).
+        let thermal = flow.thermal();
+        let t0 = thermal.map_or(0.0, |t| t.initial());
+        let mut tpop = filled(if thermal.is_some() { QT * n } else { 0 }, 0.0f32, "temperature populations")?;
+        if thermal.is_some() {
+            for q in 0..QT {
+                let w = WT.get(q).copied().unwrap_or(0.0) * t0;
+                for cell in 0..n {
+                    if let (Some(slot), true) = (tpop.get_mut(q * n + cell), flow.is_fluid(cell)) {
+                        *slot = (flow.thermal_population(q, cell) - w) as f32;
+                    }
                 }
             }
         }
@@ -213,6 +232,16 @@ impl GpuFlow {
             }
         }
         let by_group: Vec<u32> = by_group.iter().map(|(_, l)| *l).collect();
+        // Each group's thermal condition (held temperatures shifted by T₀).
+        let mut group_t = reserved(4 * group_count, "thermal conditions")?;
+        for g in 0..group_count {
+            let (kind, value) = match thermal.and_then(|t| t.groups().get(g)).copied().unwrap_or_default() {
+                ThermalCondition::Adiabatic {} => (0.0, 0.0),
+                ThermalCondition::Temperature { value } => (1.0, (value - t0) as f32),
+                ThermalCondition::Flux { value } => (2.0, value as f32),
+            };
+            group_t.extend_from_slice(&[kind, value, 0.0, 0.0]);
+        }
 
         // The open cells.
         let open = flow.open_cells();
@@ -225,6 +254,13 @@ impl GpuFlow {
             };
             open_u.extend_from_slice(&[oc.cell, oc.axis as u32, kind, 0]);
             open_f.extend_from_slice(&[target[0], target[1], target[2], oc.inward as f32]);
+        }
+        let mut open_t = reserved(4 * open.len(), "open cell temperatures")?;
+        for k in 0..open.len() {
+            match thermal.and_then(|t| t.open().get(k)).copied().flatten() {
+                Some(value) => open_t.extend_from_slice(&[1.0, (value - t0) as f32, 0.0, 0.0]),
+                None => open_t.extend_from_slice(&[0.0; 4]),
+            }
         }
 
         let (omega_plus, omega_minus) = flow.omegas();
@@ -258,6 +294,19 @@ impl GpuFlow {
             acc[1] as f32,
             acc[2] as f32,
             if forced { 1.0 } else { 0.0 },
+        ] {
+            params.extend_from_slice(&v.to_le_bytes());
+        }
+        let buoyancy = thermal.map_or([0.0; 3], |t| t.buoyancy());
+        for v in [
+            buoyancy[0] as f32,
+            buoyancy[1] as f32,
+            buoyancy[2] as f32,
+            if buoyancy != [0.0; 3] { 1.0 } else { 0.0 },
+            thermal.map_or(0.0, |t| t.omega()) as f32,
+            t0 as f32,
+            if thermal.is_some() { 1.0 } else { 0.0 },
+            0.0,
         ] {
             params.extend_from_slice(&v.to_le_bytes());
         }
@@ -297,6 +346,14 @@ impl GpuFlow {
         let group_start = storage("lbm group start", &bytes_u32(&group_start));
         let forces = empty("lbm forces", 16 * group_count as u64);
         let partials = empty("lbm partials", 4 * partial_count as u64);
+        let therm_bytes = elem * (QT * n) as u64;
+        let therm = if thermal.is_some() {
+            [storage("lbm t", &bytes_f32(&tpop)), empty("lbm t2", therm_bytes)]
+        } else {
+            [empty("lbm t", 16), empty("lbm t2", 16)]
+        };
+        let group_t = storage("lbm thermal conditions", &bytes_f32(&group_t));
+        let open_t = storage("lbm open temperatures", &bytes_f32(&open_t));
 
         let module = device
             .create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("fieldcraft lbm"), source: wgpu::ShaderSource::Wgsl(SHADER.into()) });
@@ -326,6 +383,10 @@ impl GpuFlow {
                 entry(13, read),
                 entry(14, write),
                 entry(15, write),
+                entry(16, write),
+                entry(17, write),
+                entry(18, read),
+                entry(19, read),
             ],
         });
         let bind = [0usize, 1].map(|k| {
@@ -348,6 +409,10 @@ impl GpuFlow {
                     wgpu::BindGroupEntry { binding: 13, resource: group_start.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 14, resource: forces.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 15, resource: partials.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 16, resource: therm[k].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 17, resource: therm[1 - k].as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 18, resource: group_t.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 19, resource: open_t.as_entire_binding() },
                 ],
             })
         });
@@ -357,7 +422,21 @@ impl GpuFlow {
             immediate_size: 0,
         });
         let mut pipelines = HashMap::new();
-        for name in ["collide", "stream", "stream_links", "open_boundaries", "link_forces", "group_forces", "cell_moments", "mass"] {
+        for name in [
+            "collide",
+            "stream",
+            "stream_links",
+            "open_boundaries",
+            "link_forces",
+            "group_forces",
+            "cell_moments",
+            "mass",
+            "collide_thermal",
+            "stream_thermal",
+            "stream_links_thermal",
+            "open_thermal",
+            "thermal_check",
+        ] {
             let p = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some(name),
                 layout: Some(&pl),
@@ -393,12 +472,14 @@ impl GpuFlow {
             forces,
             partials,
             partial_count,
+            thermal: thermal.map(|_| therm),
+            initial_temperature: t0,
             fluid_cells: flow.fluid_cells(),
             fluid,
             groups: flow.groups().to_vec(),
             empty_obstacles: flow.empty_obstacles().to_vec(),
             steps_done: 0,
-            forces_cache: Some(vec![[0.0; 3]; group_count]),
+            exchange_cache: Some(vec![[0.0; 4]; group_count]),
             weight_forces,
         })
     }
@@ -452,6 +533,22 @@ impl GpuFlow {
         Ok(bytes.as_chunks::<4>().0.iter().take(count).map(|b| f32::from_le_bytes(*b)).collect())
     }
 
+    /// The momentum (xyz) and heat (w) each group received in the last step.
+    fn exchange(&mut self) -> Result<&[[f64; 4]]> {
+        if self.exchange_cache.is_none() {
+            let v = self.read_f32(&self.forces, 4 * self.group_count)?;
+            self.exchange_cache = Some(
+                v.as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(&self.weight_forces)
+                    .map(|(g, w)| [f64::from(g[0]) + w[0], f64::from(g[1]) + w[1], f64::from(g[2]) + w[2], f64::from(g[3])])
+                    .collect(),
+            );
+        }
+        Ok(self.exchange_cache.as_deref().unwrap_or_default())
+    }
+
     /// The moments of the current state into the moments buffer.
     fn compute_moments(&self) -> Result<()> {
         let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("lbm moments") });
@@ -480,17 +577,31 @@ impl GpuFlow {
                 if self.open_count > 0 {
                     self.dispatch(&mut pass, self.current, "open_boundaries", self.open_groups)?;
                 }
+                if self.thermal.is_some() {
+                    self.dispatch(&mut pass, self.current, "collide_thermal", self.cells)?;
+                    self.dispatch(&mut pass, self.current, "stream_thermal", self.cells)?;
+                    if self.link_count > 0 {
+                        self.dispatch(&mut pass, self.current, "stream_links_thermal", self.links_groups)?;
+                    }
+                    if self.open_count > 0 {
+                        self.dispatch(&mut pass, self.current, "open_thermal", self.open_groups)?;
+                    }
+                }
                 self.current ^= 1;
             }
-            // The momentum exchange of the last step, from its post-collision populations.
+            // The momentum (and heat) exchange of the last step, from its post-collision
+            // populations.
             if self.link_count > 0 && self.group_count > 0 {
                 self.dispatch(&mut pass, self.current ^ 1, "link_forces", self.links_groups)?;
                 self.dispatch(&mut pass, self.current ^ 1, "group_forces", self.force_groups)?;
             }
+            if self.thermal.is_some() {
+                self.dispatch(&mut pass, self.current, "thermal_check", self.cells)?;
+            }
         }
         self.queue.submit([enc.finish()]);
         self.steps_done += steps;
-        self.forces_cache = None;
+        self.exchange_cache = None;
         let stats = self.read(&self.stats, 16)?;
         let word = |k: usize| stats.get(4 * k..4 * k + 4).and_then(|b| b.try_into().ok()).map(u32::from_le_bytes).unwrap_or(0);
         let max_u2 = f32::from_bits(word(0));
@@ -499,6 +610,12 @@ impl GpuFlow {
                 "the flow went unstable by time step {}: the lattice speed reached {:.3} (limit {MAX_LATTICE_SPEED}) or a density stopped being a positive number; lower the time step, refine the spacing or check the boundary conditions",
                 self.steps_done,
                 max_u2.sqrt()
+            )));
+        }
+        if word(2) != 0 {
+            return Err(Error::Unstable(format!(
+                "the heat went unstable by time step {}: a temperature stopped being a number; lower the time step, refine the spacing or check the heat fluxes",
+                self.steps_done
             )));
         }
         Ok(())
@@ -531,12 +648,25 @@ impl Backend for GpuFlow {
         let m = self.read_f32(&self.moments, 4 * self.n)?;
         let density = m.as_chunks::<4>().0.iter().map(|v| f64::from(v[3])).collect();
         let velocity = m.as_chunks::<4>().0.iter().map(|v| [f64::from(v[0]), f64::from(v[1]), f64::from(v[2])]).collect();
-        // No temperature lattice on the device yet (the CPU carries heat).
-        Ok(Fields { density, velocity, temperature: Vec::new() })
+        // The temperature from the scalar populations, summed on the host: T₀ + Σ t (T₀ in
+        // solid cells, whose populations stay zero).
+        let temperature = match &self.thermal {
+            None => Vec::new(),
+            Some(therm) => {
+                let t = self.read_f32(therm.get(self.current).ok_or_else(|| Error::Invalid("GPU: no thermal buffer".into()))?, QT * self.n)?;
+                (0..self.n)
+                    .map(|cell| self.initial_temperature + (0..QT).map(|q| t.get(q * self.n + cell).copied().map_or(0.0, f64::from)).sum::<f64>())
+                    .collect()
+            }
+        };
+        Ok(Fields { density, velocity, temperature })
     }
 
     fn heat(&mut self) -> Result<Vec<f64>> {
-        Ok(Vec::new())
+        if self.thermal.is_none() {
+            return Ok(Vec::new());
+        }
+        Ok(self.exchange()?.iter().map(|g| g[3]).collect())
     }
 
     fn mass(&mut self) -> Result<f64> {
@@ -553,19 +683,7 @@ impl Backend for GpuFlow {
     }
 
     fn forces(&mut self) -> Result<Vec<[f64; 3]>> {
-        if let Some(f) = &self.forces_cache {
-            return Ok(f.clone());
-        }
-        let v = self.read_f32(&self.forces, 4 * self.group_count)?;
-        let forces: Vec<[f64; 3]> = v
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .zip(&self.weight_forces)
-            .map(|(g, w)| [f64::from(g[0]) + w[0], f64::from(g[1]) + w[1], f64::from(g[2]) + w[2]])
-            .collect();
-        self.forces_cache = Some(forces.clone());
-        Ok(forces)
+        Ok(self.exchange()?.iter().map(|g| [g[0], g[1], g[2]]).collect())
     }
 
     fn groups(&self) -> &[Group] {

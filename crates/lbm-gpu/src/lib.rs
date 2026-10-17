@@ -1,7 +1,7 @@
 //! The lattice Boltzmann solver on the GPU: [`GpuFlow`] steps a flow that
 //! [`fieldcraft_lbm::Flow`] prepared (grid, links, open cells, initial state) with the compute
 //! shaders of `lbm.wgsl`, which are the CPU scheme's collision, streaming rules, open boundaries
-//! and momentum exchange written for the device; `fieldcraft_lbm::run` drives it through the
+//! and momentum exchange, and with heat its temperature lattice, written for the device; `fieldcraft_lbm::run` drives it through the
 //! [`Backend`] trait in chunks of steps, so populations stay on the device and only frames,
 //! force histories and the stability check come back.
 //!

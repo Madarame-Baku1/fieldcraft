@@ -10,8 +10,18 @@
 // the weight's): ρ = 1 + Σ h, momentum Σ h c (Σ w c = 0), and every rule below is written for h.
 // The CPU scheme (double precision, fixed sums) is the reference; see the crate's tests for the
 // tolerances.
+//
+// With heat, a D3Q7 scalar lattice (the rest direction and the six axes of D3Q19, weights ¼ and
+// ⅛) rides on the flow in the buffers t and t2, stored as deviations from w_q T₀ (T₀ the initial
+// temperature) so that f32 keeps the digits of the differences: θ = T − T₀ = Σ t. It collides
+// (BGK) with the velocity the momentum collision left in `moments`, streams with the links' rules
+// read through the group's thermal condition (anti-bounce-back for a held temperature, bounce-
+// back for an adiabatic face, a flux added to the bounced population), takes its inlet
+// temperatures and outlet neighbours, and gives each group the heat its links exchanged (in
+// contrib.w and forces.w). The temperature feeds back as the buoyant acceleration −β g θ.
 
 const Q: u32 = 19u;
+const QT: u32 = 7u;
 const WG: u32 = 256u;
 const KIND_PULL: u32 = 0u;
 const KIND_BOUNCE: u32 = 1u;
@@ -33,6 +43,10 @@ struct Params {
     s_minus: f32,
     // The body acceleration (xyz) and whether there is one (w).
     acc: vec4<f32>,
+    // The buoyancy −β g in lattice units (xyz) and whether there is any (w).
+    buoy: vec4<f32>,
+    // The scalar lattice: its relaxation rate (x), T₀ (y), whether there is heat (z).
+    therm: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
@@ -57,6 +71,14 @@ struct Params {
 @group(0) @binding(14) var<storage, read_write> forces: array<vec4<f32>>;
 // Per workgroup, the mass of its cells.
 @group(0) @binding(15) var<storage, read_write> partials: array<f32>;
+// The scalar populations, A–B like f and g (t[q n + cell]; see the notes above).
+@group(0) @binding(16) var<storage, read_write> t: array<f32>;
+@group(0) @binding(17) var<storage, read_write> t2: array<f32>;
+// Per force group: its thermal condition (x: 0 adiabatic, 1 temperature, 2 flux) and the value
+// (y: the held temperature − T₀, or the flux as a temperature per step).
+@group(0) @binding(18) var<storage, read> group_t: array<vec4<f32>>;
+// Per open cell: whether it holds a temperature (x) and that temperature − T₀ (y).
+@group(0) @binding(19) var<storage, read> open_t: array<vec4<f32>>;
 
 var<workgroup> red: array<vec4<f32>, 256>;
 // The largest squared speed of a workgroup's cells (collide): one atomic per workgroup, not
@@ -97,6 +119,41 @@ fn w_of(q: u32) -> f32 {
     if q == 0u { return 1.0 / 3.0; }
     if q < 7u { return 1.0 / 18.0; }
     return 1.0 / 36.0;
+}
+
+fn wt_of(q: u32) -> f32 {
+    if q == 0u { return 0.25; }
+    return 0.125;
+}
+
+fn has_heat() -> bool {
+    return params.therm.z > 0.5;
+}
+
+// The temperature of a cell above T₀: the sum of its scalar populations.
+fn theta_of(cell: u32) -> f32 {
+    var s = 0.0;
+    for (var q = 0u; q < QT; q = q + 1u) {
+        s = s + t[q * params.n + cell];
+    }
+    return s;
+}
+
+// The body acceleration of a cell: the constant one plus the buoyant one.
+fn acc_of(cell: u32) -> vec3<f32> {
+    var a = params.acc.xyz;
+    if params.buoy.w > 0.5 { a = a + params.buoy.xyz * theta_of(cell); }
+    return a;
+}
+
+fn forced() -> bool {
+    return params.acc.w > 0.5 || params.buoy.w > 0.5;
+}
+
+// The scalar equilibrium w_q T (1 + 4 c_q·u), shifted by w_q T₀ like the populations.
+fn eq_t(q: u32, theta: f32, u: vec3<f32>) -> f32 {
+    let cu = 4.0 * dot(vec3<f32>(c_of(q)), u);
+    return wt_of(q) * (theta * (1.0 + cu) + params.therm.y * cu);
 }
 
 fn cell_of(lid: u32, wg: vec3<u32>) -> u32 {
@@ -140,13 +197,14 @@ fn collide_cell(cell: u32, lid: u32) {
         atomicStore(&stats[1], 1u);
         return;
     }
-    let a = params.acc.xyz;
+    let a = acc_of(cell);
     let force = rho * a;
     let u = (j + 0.5 * force) / rho;
     let uu = dot(u, u);
     speed[lid] = uu;
+    if has_heat() { moments[cell] = vec4<f32>(u, rho); }
     let uf = dot(u, force);
-    let forced = params.acc.w > 0.5;
+    let forced = forced();
     let wp = params.omega_plus;
     let wm = params.omega_minus;
     let sp = params.s_plus;
@@ -242,7 +300,7 @@ fn open_boundaries(@builtin(local_invocation_index) lid: u32, @builtin(workgroup
     let cell = ou.x;
     let axis = ou.y;
     let sign = ot.w;
-    let a_half = 0.5 * params.acc.xyz;
+    let a_half = 0.5 * acc_of(cell);
     // The sums of f over the tangential (c_n = 0) and outgoing (c_n < 0) directions: the sums of
     // h plus the weights' (2/3 and 1/6 for D3Q19).
     var tangential = 2.0 / 3.0;
@@ -307,6 +365,7 @@ fn link_forces(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id)
     // cancels between a wall's links in exact arithmetic but is 10⁴ times the shear they carry)
     // is added on the host in double precision, so the sum keeps the deviations' digits.
     var v = vec3<f32>(0.0);
+    var heat = 0.0;
     if kind == KIND_BOUNCE {
         let out = f[opp(q) * n + cell];
         let back = out + link_f[l];
@@ -315,7 +374,121 @@ fn link_forces(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id)
         let out = f[q2 * n + lu.y];
         v = vec3<f32>(c_of(q2)) * out - vec3<f32>(c_of(q)) * out;
     }
-    contrib[l] = vec4<f32>(v, 0.0);
+    // The heat the link gave its wall: what left the fluid minus what came back.
+    if has_heat() && q < QT && (kind == KIND_BOUNCE || kind == KIND_REFLECT) {
+        heat = t[opp(q) * n + cell] - thermal_rule(lu, q, kind, cell);
+    }
+    contrib[l] = vec4<f32>(v, heat);
+}
+
+// ---- The scalar lattice ----
+
+// BGK collision of the scalar lattice, in place in t, with the velocity of the momentum
+// collision.
+@compute @workgroup_size(256)
+fn collide_thermal(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>) {
+    let cell = cell_of(lid, wg);
+    if cell >= params.n { return; }
+    if !is_fluid(cell) { return; }
+    let n = params.n;
+    var tq: array<f32, 7>;
+    var theta = 0.0;
+    for (var q = 0u; q < QT; q = q + 1u) {
+        let v = t[q * n + cell];
+        tq[q] = v;
+        theta = theta + v;
+    }
+    let u = moments[cell].xyz;
+    let omega = params.therm.x;
+    for (var q = 0u; q < QT; q = q + 1u) {
+        t[q * n + cell] = tq[q] - omega * (tq[q] - eq_t(q, theta, u));
+    }
+}
+
+// Pull streaming of t into t2, first pass (as `stream`).
+@compute @workgroup_size(256)
+fn stream_thermal(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>) {
+    let cell = cell_of(lid, wg);
+    if cell >= params.n { return; }
+    if !is_fluid(cell) { return; }
+    let n = params.n;
+    let nx = i32(params.nx);
+    let ny = i32(params.ny);
+    let nz = i32(params.nz);
+    let i = i32(cell % params.nx);
+    let jj = i32((cell / params.nx) % params.ny);
+    let k = i32(cell / (params.nx * params.ny));
+    for (var q = 0u; q < QT; q = q + 1u) {
+        let c = c_of(q);
+        let si = (i - c.x + nx) % nx;
+        let sj = (jj - c.y + ny) % ny;
+        let sk = (k - c.z + nz) % nz;
+        let src = u32((sk * ny + sj) * nx + si);
+        t2[q * n + cell] = t[q * n + src];
+    }
+}
+
+// The scalar population a link's rule gives, from t: a pull as the flow's; at a wall or a slip
+// face the group's thermal condition on the bounced population; an open placeholder.
+fn thermal_rule(lu: vec4<u32>, q: u32, kind: u32, cell: u32) -> f32 {
+    let n = params.n;
+    if kind == KIND_PULL { return t[q * n + lu.y]; }
+    let back = t[opp(q) * n + cell];
+    if kind == KIND_OPEN { return back; }
+    let cond = group_t[lu.z];
+    let k = u32(cond.x);
+    if k == 1u { return -back + 2.0 * wt_of(q) * cond.y; }
+    if k == 2u { return back + cond.y; }
+    return back;
+}
+
+// Second pass, one thread per link of the first seven directions.
+@compute @workgroup_size(256)
+fn stream_links_thermal(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>) {
+    let l = cell_of(lid, wg);
+    if l >= params.links { return; }
+    let lu = link_u[l];
+    let q = lu.x & 0xffu;
+    if q >= QT { return; }
+    let kind = (lu.x >> 8u) & 0xffu;
+    let cell = lu.w;
+    t2[q * params.n + cell] = thermal_rule(lu, q, kind, cell);
+}
+
+// Inlets hold their temperature (the equilibrium at the cell's velocity); outlets take the
+// streamed populations of the neighbour one cell inward.
+@compute @workgroup_size(256)
+fn open_thermal(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>) {
+    let o = cell_of(lid, wg);
+    if o >= params.open { return; }
+    let n = params.n;
+    let ou = open_u[o];
+    let cell = ou.x;
+    let held = open_t[o];
+    if held.x > 0.5 {
+        let u = moments[cell].xyz;
+        for (var q = 0u; q < QT; q = q + 1u) {
+            t2[q * n + cell] = eq_t(q, held.y, u);
+        }
+    } else {
+        var step = 1;
+        if ou.y == 1u { step = i32(params.nx); }
+        if ou.y == 2u { step = i32(params.nx * params.ny); }
+        let src = u32(i32(cell) + i32(open_f[o].w) * step);
+        for (var q = 0u; q < QT; q = q + 1u) {
+            t2[q * n + cell] = t2[q * n + src];
+        }
+    }
+}
+
+// Flags a temperature that stopped being a number.
+@compute @workgroup_size(256)
+fn thermal_check(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id) wg: vec3<u32>) {
+    let cell = cell_of(lid, wg);
+    if cell >= params.n { return; }
+    if !is_fluid(cell) { return; }
+    let theta = theta_of(cell);
+    if theta != theta || abs(theta) > 1e30 { atomicStore(&stats[2], 1u); }
 }
 
 // One workgroup per group: the sum of its links' contributions.
@@ -356,7 +529,7 @@ fn cell_moments(@builtin(local_invocation_index) lid: u32, @builtin(workgroup_id
         j = j + vec3<f32>(c_of(q)) * v;
     }
     let rho = 1.0 + drho;
-    let u = (j + 0.5 * rho * params.acc.xyz) / rho;
+    let u = (j + 0.5 * rho * acc_of(cell)) / rho;
     moments[cell] = vec4<f32>(u, rho);
 }
 

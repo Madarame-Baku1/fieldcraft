@@ -3,9 +3,10 @@
 //! deviations from their weights in single precision (measured on lavapipe at 2–5e-6, with
 //! a margin): velocity fields within 2e-5 of the largest speed, densities within 1e-6, wall
 //! forces within 5e-5 of their magnitude (a wall's shear within 5e-5 of itself), mass drift below
-//! 1e-6. Skipped without a GPU adapter
-//! unless `FIELDCRAFT_REQUIRE_GPU=1`, which makes a missing adapter a failure; `FIELDCRAFT_GPU` picks
-//! the adapter (`hardware` refuses a software one).
+//! 1e-6; with heat, temperatures within 2e-5 of the field's range and wall heats within 1e-4 of
+//! the largest (a heat is a difference of populations, so it keeps fewer digits). Skipped without
+//! a GPU adapter unless `FIELDCRAFT_REQUIRE_GPU=1`, which makes a missing adapter a failure;
+//! `FIELDCRAFT_GPU` picks the adapter (`hardware` refuses a software one).
 
 #[path = "../../lbm/tests/common/mod.rs"]
 mod common;
@@ -15,7 +16,9 @@ use fieldcraft_gpu::select::{Policy, gpu_required};
 use fieldcraft_lbm::backend::Backend;
 use fieldcraft_lbm::{Flow, Setup};
 use fieldcraft_lbm_gpu::GpuFlow;
-use fieldcraft_model::{BoxFace, FaceCondition, Procedure, Profile};
+use fieldcraft_model::{
+    BoxFace, Directional, FaceCondition, Fluid, FluidDomain, FluidThermal, Material, Model, Procedure, Profile, Step, Thermal, ThermalCondition,
+};
 
 const PERIODIC: FaceCondition = FaceCondition::Periodic {};
 
@@ -29,10 +32,12 @@ fn gpu(flow: &Flow) -> Option<GpuFlow> {
             Some(g)
         }
         Err(e) if gpu_required() => panic!("a GPU is required: {e}"),
-        Err(e) => {
+        // Only a missing device skips: a shader that does not compile is a failure anywhere.
+        Err(e) if e.to_string().contains("no GPU device") => {
             println!("skipping: {e}");
             None
         }
+        Err(e) => panic!("{e}"),
     }
 }
 
@@ -204,4 +209,140 @@ fn zou_he_channel_matches_the_cpu() {
     let (du, drho) = field_difference(&mut cpu, &mut gpu);
     println!("Zou–He channel: CPU/GPU velocity {du:.2e}, density {drho:.2e}");
     assert!(du < 2e-5 && drho < 1e-6, "{du} {drho}");
+}
+
+// ---- Heat ----
+
+/// A fluid with heat: density ρ, kinematic viscosity ν, thermal diffusivity α (conductivity
+/// ρ α, unit specific heat).
+fn hot_model(density: f64, nu: f64, alpha: f64, domain: FluidDomain, procedure: Procedure) -> Model {
+    let mut m = Model::default();
+    m.add_material(
+        "Fluid",
+        Material {
+            density: Some(density),
+            fluid: Some(Fluid::Newtonian { viscosity: nu * density }),
+            thermal: Some(Thermal { conductivity: Some(Directional::Isotropic(density * alpha)), specific_heat: Some(1.0), ..Default::default() }),
+            ..Material::default()
+        },
+    )
+    .unwrap();
+    m.add_fluid_domain("Flow", domain).unwrap();
+    m.add_step(Step::new("Run", procedure), None).unwrap();
+    m
+}
+
+/// The largest difference of the temperature fields over the CPU's temperature range, and of
+/// the groups' heats over the largest CPU heat.
+fn heat_difference(cpu: &mut Flow, gpu: &mut GpuFlow) -> (f64, f64) {
+    let (a, b) = (cpu.fields().unwrap(), gpu.fields().unwrap());
+    assert_eq!(a.temperature.len(), b.temperature.len());
+    let (lo, hi) = a.temperature.iter().fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), t| (lo.min(*t), hi.max(*t)));
+    let dt = a.temperature.iter().zip(&b.temperature).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max) / (hi - lo).max(1e-30);
+    let (ha, hb) = (cpu.heat().unwrap(), gpu.heat().unwrap());
+    assert_eq!(ha.len(), hb.len());
+    let scale = ha.iter().map(|h| h.abs()).fold(0.0, f64::max).max(1e-30);
+    let dh = ha.iter().zip(&hb).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max) / scale;
+    (dt, dh)
+}
+
+/// Plates held at 20 and 21 with the fluid at rest: the steady temperature is linear between
+/// them (anti-bounce-back puts the walls halfway between cells), the heat through both walls
+/// is k ΔT A / H, and the GPU agrees with the CPU although it stores the small differences
+/// about T₀ = 20 in single precision.
+#[test]
+fn conduction_between_plates_matches_the_analytic_profile_and_the_cpu() {
+    let (h, alpha, n) = (1.0, 0.05, 16usize);
+    let dx = h / n as f64;
+    let mut d = domain([0.0; 3], [dx, h, dx], dx);
+    d.faces.x_min = PERIODIC;
+    d.faces.x_max = PERIODIC;
+    d.faces.z_min = PERIODIC;
+    d.faces.z_max = PERIODIC;
+    let mut t = FluidThermal { initial_temperature: 20.0, ..FluidThermal::default() };
+    t.faces.y_min = ThermalCondition::Temperature { value: 20.0 };
+    t.faces.y_max = ThermalCondition::Temperature { value: 21.0 };
+    d.thermal = Some(t);
+    let m = hot_model(1.0, 0.1, alpha, d, step(8.0 * h * h / alpha, dx * dx / (8.0 * alpha), None));
+    let (setup, cpu) = prepare(&m, &[]);
+    let Some((mut cpu, mut gpu)) = both(&setup, cpu) else { return };
+    let f = gpu.fields().unwrap();
+    let grid = *cpu.grid();
+    let mut err: f64 = 0.0;
+    for j in 0..n {
+        let expected = 20.0 + (j as f64 + 0.5) / n as f64;
+        err = err.max((f.temperature[grid.index([0, j, 0])] - expected).abs());
+    }
+    let q = alpha * 1.0 / h * dx * dx;
+    let heat = gpu.heat().unwrap();
+    let cold = cpu.groups().iter().position(|g| g.name == "y_min").unwrap();
+    let hot = cpu.groups().iter().position(|g| g.name == "y_max").unwrap();
+    // lattice heat (temperature × faces per step) to model units: ρ c h³ / dt
+    let scale = setup.thermal.as_ref().unwrap().heat_scale;
+    let (dt, dh) = heat_difference(&mut cpu, &mut gpu);
+    println!(
+        "conduction: profile error {err:.2e}; heat {:.6e} / {:.6e} vs {q:.6e}; GPU vs CPU: temperature {dt:.2e} heat {dh:.2e}",
+        heat[cold] * scale,
+        heat[hot] * scale
+    );
+    assert!(err < 5e-5, "{err}");
+    assert!((heat[cold] * scale / q - 1.0).abs() < 1e-4 && (heat[hot] * scale / q + 1.0).abs() < 1e-4, "{heat:?}");
+    assert!(dt < 2e-5 && dh < 1e-4, "{dt} {dh}");
+}
+
+/// A heated channel: a velocity inlet carrying 1 in, a pressure outlet, a flux into the fluid
+/// at the bottom wall, the top wall held at 0, periodic across. Every rule of the scalar
+/// lattice (pulls, the three wall conditions, the inlet and the outlet) agrees with the CPU.
+#[test]
+fn a_heated_channel_matches_the_cpu() {
+    let (h, l, umax, nu, alpha) = (1.0, 2.0, 0.1, 0.05, 0.02);
+    let dx = h / 8.0;
+    let mut d = domain([0.0; 3], [l, h, dx], dx);
+    d.faces.x_min = FaceCondition::Velocity { velocity: [umax, 0.0, 0.0], profile: Profile::Parabolic };
+    d.faces.x_max = FaceCondition::Pressure { pressure: 0.0 };
+    d.faces.z_min = PERIODIC;
+    d.faces.z_max = PERIODIC;
+    let mut t = FluidThermal::default();
+    t.faces.x_min = ThermalCondition::Temperature { value: 1.0 };
+    t.faces.y_min = ThermalCondition::Flux { value: 0.05 };
+    t.faces.y_max = ThermalCondition::Temperature { value: 0.0 };
+    d.thermal = Some(t);
+    let m = hot_model(1.0, nu, alpha, d, step(2.0 * l / umax, 0.05 * dx / umax, None));
+    let (setup, cpu) = prepare(&m, &[]);
+    let Some((mut cpu, mut gpu)) = both(&setup, cpu) else { return };
+    let (du, drho) = field_difference(&mut cpu, &mut gpu);
+    let (dt, dh) = heat_difference(&mut cpu, &mut gpu);
+    println!("heated channel: GPU vs CPU: velocity {du:.2e} density {drho:.2e} temperature {dt:.2e} heat {dh:.2e}");
+    assert!(du < 2e-5 && drho < 1e-6, "{du} {drho}");
+    assert!(dt < 2e-5 && dh < 1e-4, "{dt} {dh}");
+}
+
+/// A differentially heated cavity with buoyancy (the de Vahl Davis geometry at Ra 10³ on 16
+/// cells, over the first diffusive time): the temperature drives the flow on both backends
+/// alike.
+#[test]
+fn natural_convection_matches_the_cpu() {
+    let (h, pr, alpha, n, u_max) = (1.0, 0.71, 1.0, 16usize, 3.65);
+    let nu = pr * alpha;
+    let g_beta = 1e3 * nu * alpha / (h * h * h);
+    let dx = h / n as f64;
+    let mut d = domain([0.0; 3], [h, h, dx], dx);
+    d.faces.z_min = PERIODIC;
+    d.faces.z_max = PERIODIC;
+    let mut t = FluidThermal { initial_temperature: 0.5, gravity: [0.0, -g_beta, 0.0], expansion: Some(1.0), ..FluidThermal::default() };
+    t.faces.x_min = ThermalCondition::Temperature { value: 1.0 };
+    t.faces.x_max = ThermalCondition::Temperature { value: 0.0 };
+    d.thermal = Some(t);
+    let dt = (0.05 * dx / (u_max * alpha / h)).min(dx * dx / (4.0 * alpha));
+    let m = hot_model(1.0, nu, alpha, d, step(h * h / alpha, dt, None));
+    let (setup, cpu) = prepare(&m, &[]);
+    let Some((mut cpu, mut gpu)) = both(&setup, cpu) else { return };
+    let (du, drho) = field_difference(&mut cpu, &mut gpu);
+    let (dt, dh) = heat_difference(&mut cpu, &mut gpu);
+    // the fields are in lattice units: the time step puts the cavity's fastest flow at 0.05
+    let speed = cpu.fields().unwrap().velocity.iter().map(|v| (v[0] * v[0] + v[1] * v[1]).sqrt()).fold(0.0, f64::max);
+    println!("cavity: fastest lattice speed {speed:.3e}; GPU vs CPU: velocity {du:.2e} density {drho:.2e} temperature {dt:.2e} heat {dh:.2e}");
+    assert!(speed > 0.01, "the buoyancy drives a flow: {speed}");
+    assert!(du < 2e-5 && drho < 1e-6, "{du} {drho}");
+    assert!(dt < 2e-5 && dh < 1e-4, "{dt} {dh}");
 }

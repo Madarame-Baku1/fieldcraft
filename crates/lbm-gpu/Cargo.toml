@@ -10,11 +10,11 @@ workspace = true
 
 [dependencies]
 fieldcraft-lbm = { workspace = true }
+fieldcraft-model = { workspace = true }
 fieldcraft-gpu = { workspace = true }
 wgpu = { workspace = true }
 pollster = { workspace = true }
 log = { workspace = true }
 
 [dev-dependencies]
-fieldcraft-model = { workspace = true }
 fieldcraft-mesh = { workspace = true }

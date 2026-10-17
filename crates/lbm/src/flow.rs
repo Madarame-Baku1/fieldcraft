@@ -143,6 +143,33 @@ pub struct ThermalState {
     heat: Vec<f64>,
 }
 
+impl ThermalState {
+    /// The scalar relaxation rate 1 / τ_T.
+    pub fn omega(&self) -> f64 {
+        self.omega
+    }
+
+    /// The initial temperature (and the reference of the buoyancy).
+    pub fn initial(&self) -> f64 {
+        self.initial
+    }
+
+    /// `−β g` in lattice units; zero without buoyancy.
+    pub fn buoyancy(&self) -> [f64; 3] {
+        self.buoyancy
+    }
+
+    /// Each force group's thermal condition (fluxes in lattice units).
+    pub fn groups(&self) -> &[ThermalCondition] {
+        &self.groups
+    }
+
+    /// Per open cell, the temperature it holds, or `None` to take its neighbour's.
+    pub fn open(&self) -> &[Option<f64>] {
+        &self.open
+    }
+}
+
 /// The flow state.
 #[derive(Debug, Clone)]
 pub struct Flow {
@@ -472,6 +499,16 @@ impl Flow {
     /// Whether the flow carries heat.
     pub fn has_heat(&self) -> bool {
         self.thermal.is_some()
+    }
+
+    /// The temperature lattice and its settings, with heat.
+    pub fn thermal(&self) -> Option<&ThermalState> {
+        self.thermal.as_ref()
+    }
+
+    /// Scalar population `q` (0..7) of a cell; zero without heat.
+    pub fn thermal_population(&self, q: usize, cell: usize) -> f64 {
+        self.thermal.as_ref().and_then(|t| t.g.get(q * self.stride + cell).copied()).unwrap_or(0.0)
     }
 
     /// The heat each group received in the last step (lattice units), empty without heat.
