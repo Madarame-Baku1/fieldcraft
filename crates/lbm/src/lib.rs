@@ -56,9 +56,10 @@ pub mod solve;
 pub mod voxel;
 
 pub use backend::{Backend, Choice, Fields, register_backend};
-pub use flow::{Flow, Group, Link, OpenCell, Rule, Target};
+pub use flow::{Flow, Group, Link, OpenCell, Rule, Target, ThermalState};
+pub use setup::ThermalSetup;
 pub use setup::{Obstacle, Setup, fluid_step};
-pub use solve::{FluidResult, FluidStats, ForceHistory, Frame, run, solve_fluid, solve_fluid_on};
+pub use solve::{FluidResult, FluidStats, ForceHistory, Frame, HeatHistory, run, solve_fluid, solve_fluid_on};
 pub use voxel::Grid;
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]

@@ -113,6 +113,9 @@ impl GpuFlow {
     /// `flow` (its grid, rules and initial state: everything the step needs) on the device
     /// `policy` picks.
     pub fn new(flow: &Flow, policy: Policy) -> Result<GpuFlow> {
+        if flow.has_heat() {
+            return Err(Error::Invalid("heat in the fluid is not on the GPU yet: solve this step on the CPU (`backend: \"cpu\"`)".into()));
+        }
         let Some((adapter, tier)) = select::adapter(policy).map_err(gpu_error)? else {
             return Err(Error::Invalid(format!("{}=cpu: no GPU device; solve with `backend: \"cpu\"`", select::ENV)));
         };
@@ -528,7 +531,12 @@ impl Backend for GpuFlow {
         let m = self.read_f32(&self.moments, 4 * self.n)?;
         let density = m.as_chunks::<4>().0.iter().map(|v| f64::from(v[3])).collect();
         let velocity = m.as_chunks::<4>().0.iter().map(|v| [f64::from(v[0]), f64::from(v[1]), f64::from(v[2])]).collect();
-        Ok(Fields { density, velocity })
+        // No temperature lattice on the device yet (the CPU carries heat).
+        Ok(Fields { density, velocity, temperature: Vec::new() })
+    }
+
+    fn heat(&mut self) -> Result<Vec<f64>> {
+        Ok(Vec::new())
     }
 
     fn mass(&mut self) -> Result<f64> {

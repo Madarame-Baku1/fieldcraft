@@ -23,8 +23,19 @@ pub struct Frame {
     pub velocity: Vec<[f32; 3]>,
     /// Gauge pressure.
     pub pressure: Vec<f32>,
+    /// Temperature, when the flow carries heat (empty otherwise).
+    pub temperature: Vec<f32>,
     /// The total fluid mass (density times volume).
     pub mass: f64,
+}
+
+/// The heat the fluid gives one wall over time (power; positive into the wall).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeatHistory {
+    pub name: String,
+    pub body: Option<String>,
+    /// One value per [`FluidResult::history_times`].
+    pub power: Vec<f64>,
 }
 
 /// The force the fluid exerts on one wall over time.
@@ -57,6 +68,8 @@ pub struct FluidStats {
     pub cell_updates: u64,
     /// What stepped the flow: `cpu`, or `gpu: <adapter>`.
     pub backend: String,
+    /// The scalar lattice's relaxation time, with heat.
+    pub tau_thermal: Option<f64>,
 }
 
 /// The result of a fluid step.
@@ -71,17 +84,19 @@ pub struct FluidResult {
     pub history_times: Vec<f64>,
     /// Every box wall and every obstacle face.
     pub forces: Vec<ForceHistory>,
+    /// The heat every wall receives, with heat (empty otherwise), the same walls and times.
+    pub heat: Vec<HeatHistory>,
     pub stats: FluidStats,
     pub warnings: Vec<String>,
 }
 
 impl FluidResult {
-    /// The cell containing a point and the frame's velocity and pressure there (`None` outside
-    /// the grid; zeros in a solid cell).
-    pub fn probe(&self, frame: usize, p: [f64; 3]) -> Option<(usize, [f32; 3], f32)> {
+    /// The cell containing a point and the frame's velocity, pressure and temperature (`None`
+    /// without heat) there (`None` outside the grid; zeros in a solid cell).
+    pub fn probe(&self, frame: usize, p: [f64; 3]) -> Option<(usize, [f32; 3], f32, Option<f32>)> {
         let cell = self.grid.cell_at(p)?;
         let f = self.frames.get(frame)?;
-        Some((cell, *f.velocity.get(cell)?, *f.pressure.get(cell)?))
+        Some((cell, *f.velocity.get(cell)?, *f.pressure.get(cell)?, f.temperature.get(cell).copied()))
     }
 }
 
@@ -106,7 +121,11 @@ fn frame(setup: &Setup, flow: &mut dyn Backend, step: u64) -> Result<Frame> {
     velocity.try_reserve_exact(n).map_err(|_| Error::Limit("not enough memory for an output frame".into()))?;
     pressure.try_reserve_exact(n).map_err(|_| Error::Limit("not enough memory for an output frame".into()))?;
     let vs = setup.velocity_scale();
-    let Fields { density, velocity: u } = flow.fields()?;
+    let Fields { density, velocity: u, temperature: t } = flow.fields()?;
+    let mut temperature = Vec::new();
+    if !t.is_empty() {
+        temperature.try_reserve_exact(n).map_err(|_| Error::Limit("not enough memory for an output frame".into()))?;
+    }
     for cell in 0..n {
         if flow.is_fluid(cell) {
             velocity.push(u.get(cell).copied().unwrap_or([0.0; 3]).map(|c| (c * vs) as f32));
@@ -115,9 +134,12 @@ fn frame(setup: &Setup, flow: &mut dyn Backend, step: u64) -> Result<Frame> {
             velocity.push([0.0; 3]);
             pressure.push(0.0);
         }
+        if !t.is_empty() {
+            temperature.push(t.get(cell).copied().unwrap_or(0.0) as f32);
+        }
     }
     let mass = flow.mass()? * setup.density * setup.grid.spacing.powi(3);
-    Ok(Frame { time: step as f64 * setup.time_step, step, velocity, pressure, mass })
+    Ok(Frame { time: step as f64 * setup.time_step, step, velocity, pressure, temperature, mass })
 }
 
 /// Run a prepared flow (fresh from [`Flow::new`], possibly with its own initial state, on any
@@ -127,7 +149,7 @@ pub fn run(setup: &Setup, flow: &mut dyn Backend, limits: &Limits) -> Result<Flu
     let n = setup.grid.len();
     let total = setup.steps;
     let frames = u64::from(setup.frames).min(total).max(1);
-    let frame_bytes = (frames + 1) as f64 * n as f64 * 16.0;
+    let frame_bytes = (frames + 1) as f64 * n as f64 * if setup.thermal.is_some() { 20.0 } else { 16.0 };
     if !(frame_bytes <= limits.max_frame_bytes as f64) {
         return Err(Error::Limit(format!(
             "{} frames of {n} cells need {:.0} MB, above the cap of {:.0} MB; write fewer frames or raise `max_frame_bytes`",
@@ -138,10 +160,12 @@ pub fn run(setup: &Setup, flow: &mut dyn Backend, limits: &Limits) -> Result<Flu
     }
     let every = total.div_ceil(MAX_HISTORY).max(1);
     let fs = setup.force_scale();
+    let hs = setup.thermal.as_ref().map_or(0.0, |t| t.heat_scale);
 
     let mut out_frames = vec![frame(setup, flow, 0)?];
     let mut history_times = Vec::new();
     let mut forces: Vec<Vec<[f64; 3]>> = vec![Vec::new(); flow.groups().len()];
+    let mut heats: Vec<Vec<f64>> = vec![Vec::new(); if setup.thermal.is_some() { flow.groups().len() } else { 0 }];
     let mut next_frame = 1u64;
     // Frame j (1..=frames) at step round(j · total / frames).
     let frame_step = |j: u64| (j * total + frames / 2) / frames;
@@ -164,6 +188,11 @@ pub fn run(setup: &Setup, flow: &mut dyn Backend, limits: &Limits) -> Result<Flu
             history_times.push(k as f64 * setup.time_step);
             for (h, f) in forces.iter_mut().zip(flow.forces()?) {
                 h.push(f.map(|c| c * fs));
+            }
+            if !heats.is_empty() {
+                for (h, q) in heats.iter_mut().zip(flow.heat()?) {
+                    h.push(q * hs);
+                }
             }
         }
         while next_frame <= frames && k == frame_step(next_frame) {
@@ -198,6 +227,7 @@ pub fn run(setup: &Setup, flow: &mut dyn Backend, limits: &Limits) -> Result<Flu
         frames: out_frames,
         history_times,
         forces: flow.groups().iter().zip(forces).map(|(g, force)| ForceHistory { name: g.name.clone(), body: g.body.clone(), force }).collect(),
+        heat: flow.groups().iter().zip(heats).map(|(g, power)| HeatHistory { name: g.name.clone(), body: g.body.clone(), power }).collect(),
         stats: FluidStats {
             cells: n,
             fluid_cells: flow.fluid_cells(),
@@ -212,6 +242,7 @@ pub fn run(setup: &Setup, flow: &mut dyn Backend, limits: &Limits) -> Result<Flu
             mach: setup.mach,
             cell_updates: (flow.fluid_cells() as u64).saturating_mul(total),
             backend: flow.name(),
+            tau_thermal: setup.thermal.as_ref().map(|t| t.tau),
         },
         warnings,
     })

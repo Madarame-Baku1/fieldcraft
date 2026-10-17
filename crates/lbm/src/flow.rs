@@ -27,6 +27,20 @@
 //!   65:041203, 2002): a population `f*` leaving a fluid cell toward the wall and the one `f'`
 //!   coming back transfer `c_out f* − c_in f'` to the wall.
 //!
+//! # Heat
+//! With thermal settings a second lattice carries the temperature: D3Q7 (the rest direction and
+//! the six axis directions, the first seven of D3Q19), weights ¼ and ⅛, `c_s² = ¼`, equilibrium
+//! `w_q T (1 + 4 c_q·u)` with the velocity the momentum lattice just collided to, BGK collision
+//! with `τ_T = 4 α + ½` (Krüger et al. 2017, ch. 8: the passive-scalar double-distribution
+//! model). Its streaming follows the momentum lattice's links: a wall held at a temperature is
+//! anti-bounce-back (`g_q = −g*_q̄ + 2 w_q T_w`, which puts the temperature halfway between the
+//! cells), an adiabatic wall bounces back, a heat flux through a wall face adds the flux to the
+//! bounced population (one axis direction crosses each wall face, so the cell gains exactly that
+//! heat), an inlet holds its temperature (equilibrium at the cell's velocity) and an outlet takes
+//! its neighbour's. Buoyancy is the Boussinesq force per mass `−β (T − T₀) g`, added to the body
+//! force of every cell (Guo forcing as for the constant acceleration). The heat each wall face
+//! receives is summed over its links like the momentum exchange.
+//!
 //! # Layout and determinism
 //! Two arrays of populations, structure of arrays (`f[q n + cell]`), A–B pattern. Streaming
 //! pulls: every population of a cell comes from one source (a neighbour, a periodic image, the
@@ -36,7 +50,7 @@
 //! only its own populations; the wall forces are summed in link order. There are no parallel
 //! reductions, so the result is the same bit for bit on any number of threads and platform.
 
-use fieldcraft_model::{BoxFace, FaceCondition, Profile};
+use fieldcraft_model::{BoxFace, FaceCondition, Profile, ThermalCondition};
 
 use fieldcraft_parallel as parallel;
 
@@ -95,6 +109,40 @@ pub struct Group {
     pub body: Option<String>,
 }
 
+/// The scalar lattice: directions 0..7 of D3Q19 (rest and the axes).
+const QT: usize = 7;
+/// Its weights.
+const WT: [f64; QT] = [0.25, 0.125, 0.125, 0.125, 0.125, 0.125, 0.125];
+
+/// The scalar equilibrium `w_q T (1 + c_q·u / c_s²)`, `c_s² = ¼`.
+#[inline(always)]
+fn equilibrium_t(q: usize, t: f64, u: [f64; 3]) -> f64 {
+    let cq = c(q);
+    WT.get(q).copied().unwrap_or(0.0) * t * (1.0 + 4.0 * (cq[0] * u[0] + cq[1] * u[1] + cq[2] * u[2]))
+}
+
+/// The temperature lattice and what it needs (see the module notes).
+#[derive(Debug, Clone)]
+pub struct ThermalState {
+    /// `g[q stride + cell]` and the streaming target, A–B like the momentum lattice.
+    g: Vec<f64>,
+    g2: Vec<f64>,
+    /// The temperature of every cell after the last step (the initial one in solid cells).
+    temperature: Vec<f64>,
+    omega: f64,
+    initial: f64,
+    /// `−β g` in lattice units; zero without buoyancy.
+    buoyancy: [f64; 3],
+    /// Each force group's thermal condition (fluxes in lattice units).
+    groups: Vec<ThermalCondition>,
+    /// Per open cell: the temperature it holds (an inlet), or `None` to take its neighbour's
+    /// (an outlet).
+    open: Vec<Option<f64>>,
+    /// The heat each group received in the last step (lattice units: temperature times cell
+    /// faces per step).
+    heat: Vec<f64>,
+}
+
 /// The flow state.
 #[derive(Debug, Clone)]
 pub struct Flow {
@@ -120,6 +168,13 @@ pub struct Flow {
     steps_done: u64,
     /// Obstacles that cover no cell centre (smaller than the spacing, or outside the box).
     empty_obstacles: Vec<String>,
+    /// The temperature lattice, with thermal settings.
+    thermal: Option<ThermalState>,
+    /// With buoyancy: every cell's body acceleration (the constant one plus the buoyant one),
+    /// refreshed from the temperature before each step.
+    cell_force: Vec<[f64; 3]>,
+    /// With heat: every cell's velocity from the last collision, for the scalar equilibrium.
+    cell_u: Vec<[f64; 3]>,
 }
 
 const NONE: u32 = u32::MAX;
@@ -328,6 +383,57 @@ impl Flow {
                 f[q * stride + cell] = if fluid[cell] { equilibrium(q, 1.0, setup.initial_velocity) } else { 0.0 };
             }
         }
+
+        // Heat: the scalar lattice at the initial temperature, each group's condition (the
+        // box faces, then every obstacle face), each open cell's temperature.
+        let (thermal, cell_force, cell_u) = match &setup.thermal {
+            None => (None, Vec::new(), Vec::new()),
+            Some(ts) => {
+                let mut group_conditions: Vec<ThermalCondition> = ts.faces.to_vec();
+                for faces in &setup.obstacles {
+                    group_conditions.extend(faces.thermal.iter().copied());
+                }
+                group_conditions.resize(groups.len(), ThermalCondition::Adiabatic {});
+                let open_t: Vec<Option<f64>> = open
+                    .iter()
+                    .map(|oc| {
+                        let face = BoxFace::of(oc.axis, oc.inward < 0.0);
+                        match (oc.target, ts.faces.get(face.index()).copied().unwrap_or_default()) {
+                            (_, ThermalCondition::Temperature { value }) => Some(value),
+                            (Target::Velocity(_), _) => Some(ts.initial_temperature),
+                            (Target::Density(_), _) => None,
+                        }
+                    })
+                    .collect();
+                let t_n = stride.checked_mul(QT).ok_or_else(|| Error::Limit("the grid is too large".into()))?;
+                let mut tg = filled(t_n, 0.0, "temperature populations")?;
+                let tg2 = filled(t_n, 0.0, "temperature populations")?;
+                for cell in 0..n {
+                    if fluid[cell] {
+                        for q in 0..QT {
+                            tg[q * stride + cell] = equilibrium_t(q, ts.initial_temperature, setup.initial_velocity);
+                        }
+                    }
+                }
+                let buoyant = ts.buoyancy != [0.0; 3];
+                let state = ThermalState {
+                    g: tg,
+                    g2: tg2,
+                    temperature: filled(n, ts.initial_temperature, "temperature")?,
+                    omega: 1.0 / ts.tau,
+                    initial: ts.initial_temperature,
+                    buoyancy: ts.buoyancy,
+                    groups: group_conditions,
+                    open: open_t,
+                    heat: vec![0.0; groups.len()],
+                };
+                (
+                    Some(state),
+                    if buoyant { filled(n, setup.acceleration, "cell forces")? } else { Vec::new() },
+                    filled(n, [0.0; 3], "cell velocities")?,
+                )
+            }
+        };
         Ok(Flow {
             grid,
             n,
@@ -346,7 +452,56 @@ impl Flow {
             fluid_cells,
             steps_done: 0,
             empty_obstacles,
+            thermal,
+            cell_force,
+            cell_u,
         })
+    }
+
+    /// The body acceleration of a cell: the constant one, plus the buoyant one with heat.
+    #[inline(always)]
+    fn force_at(&self, cell: usize) -> [f64; 3] {
+        self.cell_force.get(cell).copied().unwrap_or(self.acceleration)
+    }
+
+    /// The temperature of a cell (model units), or `None` without heat.
+    pub fn temperature(&self, cell: usize) -> Option<f64> {
+        self.thermal.as_ref().and_then(|t| t.temperature.get(cell).copied())
+    }
+
+    /// Whether the flow carries heat.
+    pub fn has_heat(&self) -> bool {
+        self.thermal.is_some()
+    }
+
+    /// The heat each group received in the last step (lattice units), empty without heat.
+    pub fn heat(&self) -> &[f64] {
+        self.thermal.as_ref().map_or(&[], |t| &t.heat)
+    }
+
+    /// Set every fluid cell's temperature (and its populations to the equilibrium at its
+    /// velocity). Nothing without heat.
+    pub fn set_temperature(&mut self, temperature: impl Fn(usize) -> f64) {
+        let n = self.n;
+        let s = self.stride;
+        let velocities: Vec<[f64; 3]> = (0..n).map(|c| self.moments(c).map_or([0.0; 3], |m| m.1)).collect();
+        let fluid = &self.fluid;
+        let Some(t) = &mut self.thermal else { return };
+        for cell in 0..n {
+            if !fluid.get(cell).copied().unwrap_or(false) {
+                continue;
+            }
+            let value = temperature(cell);
+            if let Some(slot) = t.temperature.get_mut(cell) {
+                *slot = value;
+            }
+            let u = velocities.get(cell).copied().unwrap_or([0.0; 3]);
+            for q in 0..QT {
+                if let Some(g) = t.g.get_mut(q * s + cell) {
+                    *g = equilibrium_t(q, value, u);
+                }
+            }
+        }
     }
 
     pub fn grid(&self) -> &Grid {
@@ -419,7 +574,8 @@ impl Flow {
                 continue;
             }
             let (rho, u) = state(cell);
-            let bare = [0, 1, 2].map(|a| u[a] - 0.5 * self.acceleration[a]);
+            let force = self.force_at(cell);
+            let bare = [0, 1, 2].map(|a| u[a] - 0.5 * force[a]);
             for q in 0..Q {
                 self.f[q * s + cell] = equilibrium(q, rho, bare);
             }
@@ -441,7 +597,8 @@ impl Flow {
             j[1] += fq * cq[1];
             j[2] += fq * cq[2];
         }
-        let u = [0, 1, 2].map(|a| (j[a] + 0.5 * rho * self.acceleration[a]) / rho);
+        let force = self.force_at(cell);
+        let u = [0, 1, 2].map(|a| (j[a] + 0.5 * rho * force[a]) / rho);
         Some((rho, u))
     }
 
@@ -461,6 +618,7 @@ impl Flow {
     /// One time step. Fails with [`Error::Unstable`] when a density stops being a positive
     /// number or a lattice speed exceeds [`MAX_LATTICE_SPEED`].
     pub fn step(&mut self) -> Result<()> {
+        self.refresh_buoyancy();
         let max_u2 = self.collide();
         if !(max_u2 <= MAX_LATTICE_SPEED * MAX_LATTICE_SPEED) {
             return Err(Error::Unstable(format!(
@@ -472,8 +630,175 @@ impl Flow {
         self.stream();
         self.open_boundaries();
         std::mem::swap(&mut self.f, &mut self.g);
+        if self.thermal.is_some() {
+            self.collide_thermal();
+            self.stream_thermal();
+            self.open_boundaries_thermal();
+            if let Some(t) = &mut self.thermal {
+                std::mem::swap(&mut t.g, &mut t.g2);
+            }
+            if !self.update_temperature() {
+                return Err(Error::Unstable(format!(
+                    "the heat went unstable at time step {}: a temperature stopped being a number; lower the time step, refine the spacing or check the heat fluxes",
+                    self.steps_done + 1
+                )));
+            }
+        }
         self.steps_done += 1;
         Ok(())
+    }
+
+    /// With buoyancy: every cell's acceleration from its temperature.
+    fn refresh_buoyancy(&mut self) {
+        let Some(t) = &self.thermal else { return };
+        if self.cell_force.is_empty() {
+            return;
+        }
+        let (a, b, t0) = (self.acceleration, t.buoyancy, t.initial);
+        for (force, temp) in self.cell_force.iter_mut().zip(&t.temperature) {
+            let dt = temp - t0;
+            *force = [a[0] + b[0] * dt, a[1] + b[1] * dt, a[2] + b[2] * dt];
+        }
+    }
+
+    /// BGK collision of the scalar lattice, in place, with the velocity of the momentum
+    /// collision.
+    fn collide_thermal(&mut self) {
+        let n = self.n;
+        let s = self.stride;
+        let fluid = &self.fluid;
+        let cell_u = &self.cell_u;
+        let Some(t) = &mut self.thermal else { return };
+        let omega = t.omega;
+        let mut blocks = cell_blocks(&mut t.g, s, n);
+        parallel::for_each_mut(&mut blocks, |b, g| {
+            let len = g.first().map_or(0, |d| d.len());
+            for i in 0..len {
+                let cell = b * CELLS + i;
+                if !fluid.get(cell).copied().unwrap_or(false) {
+                    continue;
+                }
+                let mut temp = 0.0;
+                for q in 0..QT {
+                    temp += g.get(q).and_then(|d| d.get(i)).copied().unwrap_or(0.0);
+                }
+                let u = cell_u.get(cell).copied().unwrap_or([0.0; 3]);
+                for q in 0..QT {
+                    if let Some(x) = g.get_mut(q).and_then(|d| d.get_mut(i)) {
+                        *x -= omega * (*x - equilibrium_t(q, temp, u));
+                    }
+                }
+            }
+        });
+    }
+
+    /// Pull streaming of the scalar lattice into `g2` with the wall rules of the links (the
+    /// first seven directions), then the heat received per group.
+    fn stream_thermal(&mut self) {
+        let n = self.n;
+        let s = self.stride;
+        let (links, offset) = (&self.links, &self.offset);
+        let Some(t) = &mut self.thermal else { return };
+        let (g, groups) = (&t.g, &t.groups);
+        let mut blocks = cell_blocks(&mut t.g2, s, n);
+        parallel::for_each_mut(&mut blocks, |b, out| {
+            let start = b * CELLS;
+            for (q, dst) in out.iter_mut().enumerate().take(QT) {
+                let off = offset.get(q).copied().unwrap_or(0);
+                let src = g.get(q * s..q * s + n).unwrap_or_default();
+                for (i, x) in dst.iter_mut().enumerate() {
+                    if let Some(from) = (start + i).checked_add_signed(-off)
+                        && let Some(v) = src.get(from)
+                    {
+                        *x = *v;
+                    }
+                }
+            }
+            let first = links.partition_point(|l| (l.cell as usize) < start);
+            for link in links.get(first..).unwrap_or_default().iter().take_while(|l| (l.cell as usize) < start + CELLS) {
+                let (cell, q) = (link.cell as usize, link.q as usize);
+                if q >= QT {
+                    continue;
+                }
+                let v = thermal_rule(g, s, groups, cell, q, link.rule);
+                if let (Some(v), Some(x)) = (v, out.get_mut(q).and_then(|d| d.get_mut(cell - start))) {
+                    *x = v;
+                }
+            }
+        });
+        t.heat.fill(0.0);
+        for link in links {
+            let (cell, q) = (link.cell as usize, link.q as usize);
+            if q >= QT {
+                continue;
+            }
+            if let (Rule::Bounce { group, .. } | Rule::Reflect { group, .. }, Some(back)) =
+                (link.rule, thermal_rule(g, s, groups, cell, q, link.rule))
+            {
+                let out = g.get(opposite(q) * s + cell).copied().unwrap_or(0.0);
+                if let Some(h) = t.heat.get_mut(group as usize) {
+                    // what left the fluid toward the wall minus what came back
+                    *h += out - back;
+                }
+            }
+        }
+    }
+
+    /// Inlets hold their temperature; outlets take their neighbour's populations.
+    fn open_boundaries_thermal(&mut self) {
+        let s = self.stride;
+        let (open, offset, cell_u) = (&self.open, &self.offset, &self.cell_u);
+        let Some(t) = &mut self.thermal else { return };
+        for (oc, held) in open.iter().zip(&t.open) {
+            let cell = oc.cell as usize;
+            match held {
+                Some(value) => {
+                    let u = cell_u.get(cell).copied().unwrap_or([0.0; 3]);
+                    for q in 0..QT {
+                        if let Some(x) = t.g2.get_mut(q * s + cell) {
+                            *x = equilibrium_t(q, *value, u);
+                        }
+                    }
+                }
+                None => {
+                    // the neighbour one cell inward along the face's axis
+                    let axis_dir = 1 + 2 * oc.axis + usize::from(oc.inward < 0.0);
+                    let off = offset.get(axis_dir).copied().unwrap_or(0);
+                    if let Some(from) = cell.checked_add_signed(off) {
+                        for q in 0..QT {
+                            let v = t.g2.get(q * s + from).copied();
+                            if let (Some(v), Some(x)) = (v, t.g2.get_mut(q * s + cell)) {
+                                *x = v;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Every fluid cell's temperature from its populations.
+    /// The temperature of every fluid cell from its populations; false when one is not finite.
+    fn update_temperature(&mut self) -> bool {
+        let n = self.n;
+        let s = self.stride;
+        let fluid = &self.fluid;
+        let Some(t) = &mut self.thermal else { return true };
+        let mut finite = true;
+        for cell in 0..n {
+            if !fluid.get(cell).copied().unwrap_or(false) {
+                continue;
+            }
+            let mut temp = 0.0;
+            for q in 0..QT {
+                temp += t.g.get(q * s + cell).copied().unwrap_or(0.0);
+            }
+            finite &= temp.is_finite();
+            if let Some(slot) = t.temperature.get_mut(cell) {
+                *slot = temp;
+            }
+        }
+        finite
     }
 
     /// Two-relaxation-time collision with Guo forcing, in place, by blocks of [`CELLS`] cells
@@ -483,19 +808,27 @@ impl Flow {
         let n = self.n;
         let (wp, wm) = (self.omega_plus, self.omega_minus);
         let (sp, sm) = (1.0 - 0.5 * wp, 1.0 - 0.5 * wm);
-        let a = self.acceleration;
-        let forced = a != [0.0; 3];
+        let constant = self.acceleration;
+        let cell_force = &self.cell_force;
+        let forced = constant != [0.0; 3] || !cell_force.is_empty();
         let fluid = &self.fluid;
         let mut blocks = cell_blocks(&mut self.f, self.stride, n);
         let mut maxima = vec![0.0f64; blocks.len()];
-        let mut work: Vec<(&mut Vec<&mut [f64]>, &mut f64)> = blocks.iter_mut().zip(maxima.iter_mut()).collect();
-        parallel::for_each_mut(&mut work, |b, (f, max_u2)| {
+        // with heat, each block's velocities go to its slice of cell_u (empty otherwise)
+        let mut u_blocks: Vec<&mut [[f64; 3]]> = self.cell_u.chunks_mut(CELLS).collect();
+        let mut work: Vec<(&mut Vec<&mut [f64]>, &mut f64, Option<&mut [[f64; 3]]>)> = Vec::with_capacity(blocks.len());
+        let mut u_iter = u_blocks.drain(..);
+        for (f, m) in blocks.iter_mut().zip(maxima.iter_mut()) {
+            work.push((f, m, u_iter.next()));
+        }
+        parallel::for_each_mut(&mut work, |b, (f, max_u2, u_out)| {
             let mut fq = [0.0; Q];
             let len = f.first().map_or(0, |d| d.len());
             for i in 0..len {
                 if !fluid.get(b * CELLS + i).copied().unwrap_or(false) {
                     continue;
                 }
+                let a = cell_force.get(b * CELLS + i).copied().unwrap_or(constant);
                 let (mut rho, mut j) = (0.0, [0.0; 3]);
                 for q in 0..Q {
                     let v = f.get(q).and_then(|d| d.get(i)).copied().unwrap_or(0.0);
@@ -514,6 +847,9 @@ impl Flow {
                 let u = [(j[0] + 0.5 * force[0]) / rho, (j[1] + 0.5 * force[1]) / rho, (j[2] + 0.5 * force[2]) / rho];
                 let uu = u[0] * u[0] + u[1] * u[1] + u[2] * u[2];
                 **max_u2 = max_u2.max(uu);
+                if let Some(slot) = u_out.as_mut().and_then(|u| u.get_mut(i)) {
+                    *slot = u;
+                }
                 let uf = u[0] * force[0] + u[1] * force[1] + u[2] * force[2];
                 let mut put = |q: usize, v: f64| {
                     if let Some(x) = f.get_mut(q).and_then(|d| d.get_mut(i)) {
@@ -624,9 +960,9 @@ impl Flow {
     /// Zou–He velocity and pressure boundaries on the streamed populations.
     fn open_boundaries(&mut self) {
         let s = self.stride;
-        let a_half = self.acceleration.map(|v| 0.5 * v);
         for oc in &self.open {
             let cell = oc.cell as usize;
+            let a_half = self.force_at(cell).map(|v| 0.5 * v);
             let axis = oc.axis;
             let sign = oc.inward;
             let ci = |q: usize| f64::from(C[q][axis]);
@@ -675,6 +1011,22 @@ impl Flow {
     }
 }
 
+/// What a scalar population of a cell next to a wall or open face becomes (`None`: streamed as
+/// usual): a periodic image pulls, an adiabatic wall (or a slip face) bounces back, a held
+/// temperature anti-bounces back, a flux adds its heat, an open face is set afterwards.
+fn thermal_rule(g: &[f64], s: usize, groups: &[ThermalCondition], cell: usize, q: usize, rule: Rule) -> Option<f64> {
+    let back = g.get(opposite(q) * s + cell).copied()?;
+    match rule {
+        Rule::Pull { from } => g.get(q * s + from as usize).copied(),
+        Rule::Bounce { group, .. } | Rule::Reflect { group, .. } => Some(match groups.get(group as usize).copied().unwrap_or_default() {
+            ThermalCondition::Adiabatic {} => back,
+            ThermalCondition::Temperature { value } => -back + 2.0 * WT.get(q).copied().unwrap_or(0.0) * value,
+            ThermalCondition::Flux { value } => back + value,
+        }),
+        Rule::Open => Some(back),
+    }
+}
+
 impl crate::backend::Backend for Flow {
     fn name(&self) -> String {
         "cpu".into()
@@ -701,7 +1053,12 @@ impl crate::backend::Backend for Flow {
                 *v = u;
             }
         }
-        Ok(crate::backend::Fields { density, velocity })
+        let temperature = self.thermal.as_ref().map(|t| t.temperature.clone()).unwrap_or_default();
+        Ok(crate::backend::Fields { density, velocity, temperature })
+    }
+
+    fn heat(&mut self) -> Result<Vec<f64>> {
+        Ok(Flow::heat(self).to_vec())
     }
 
     fn mass(&mut self) -> Result<f64> {

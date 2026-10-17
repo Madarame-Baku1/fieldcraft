@@ -26,7 +26,7 @@
 //! density stops the run with [`crate::Error::Unstable`].
 
 use fieldcraft_mesh::surface::BoundarySurface;
-use fieldcraft_model::{BoxFace, FaceCondition, FluidDomain, Model, Procedure, SurfaceCondition};
+use fieldcraft_model::{BoxFace, Directional, FaceCondition, FluidDomain, Model, Procedure, SurfaceCondition, ThermalCondition};
 
 use crate::voxel::Grid;
 use crate::{Error, Limits, Result};
@@ -66,6 +66,25 @@ pub struct ObstacleFaces {
     pub names: Vec<String>,
     /// Every face tag's wall velocity in lattice units (zero for walls at rest).
     pub velocities: Vec<[f64; 3]>,
+    /// Every face tag's thermal condition (fluxes in lattice units); adiabatic without heat.
+    pub thermal: Vec<ThermalCondition>,
+}
+
+/// Heat in the fluid, in lattice units: a D3Q7 scalar lattice for the temperature
+/// (`flow::ThermalState`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThermalSetup {
+    /// The scalar lattice's relaxation time: its diffusivity is `(τ_T − ½) / 4`.
+    pub tau: f64,
+    /// The fluid's thermal diffusivity k / (ρ c), model units.
+    pub diffusivity: f64,
+    pub initial_temperature: f64,
+    /// `−β g` in lattice units: the buoyant acceleration per temperature above the initial one.
+    pub buoyancy: [f64; 3],
+    /// The box faces' conditions (fluxes in lattice units: temperature per step through a face).
+    pub faces: [ThermalCondition; 6],
+    /// Power per lattice heat flow (a temperature per step through one cell face): ρ c Δx³ / Δt.
+    pub heat_scale: f64,
 }
 
 /// A fluid step in lattice units.
@@ -93,6 +112,8 @@ pub struct Setup {
     pub initial_velocity: [f64; 3],
     /// The domain's obstacles, in its order.
     pub obstacles: Vec<ObstacleFaces>,
+    /// Heat in the fluid, when the domain has thermal settings.
+    pub thermal: Option<ThermalSetup>,
     pub warnings: Vec<String>,
 }
 
@@ -106,6 +127,21 @@ pub fn fluid_step<'m>(model: &'m Model, step: Option<&str>) -> Result<(&'m field
     let name = s.procedure.fluid_domain().unwrap_or_default();
     let domain = model.fluid_domain(name).ok_or_else(|| Error::NotFound(format!("fluid domain `{name}`")))?;
     Ok((s, domain))
+}
+
+/// A thermal condition in lattice units: a flux (power per area) becomes the temperature it adds
+/// to the cell behind the face per step.
+fn lattice_thermal(c: &ThermalCondition, flux_scale: f64) -> Result<ThermalCondition> {
+    Ok(match *c {
+        ThermalCondition::Flux { value } => {
+            let lattice = value * flux_scale;
+            if !lattice.is_finite() {
+                return Err(Error::Invalid(format!("a heat flux of {value} is too large for this lattice")));
+            }
+            ThermalCondition::Flux { value: lattice }
+        }
+        other => other,
+    })
 }
 
 impl Setup {
@@ -243,9 +279,68 @@ impl Setup {
             )));
         }
 
+        // Heat: the scalar lattice's relaxation time from the diffusivity, the conditions in
+        // lattice units (a flux is a temperature per step through a cell face).
+        let mut warnings = Vec::new();
+        let thermal = match &domain.thermal {
+            None => None,
+            Some(t) => {
+                let props = material.and_then(|m| m.thermal.as_ref());
+                let (Some(Directional::Isotropic(k)), Some(c)) = (props.and_then(|p| p.conductivity), props.and_then(|p| p.specific_heat)) else {
+                    return Err(Error::Invalid(format!(
+                        "material `{}` needs an isotropic conductivity and a specific heat for heat in the fluid",
+                        domain.material
+                    )));
+                };
+                let rho_c = density * c;
+                let diffusivity = k / rho_c;
+                if !(diffusivity > 0.0 && diffusivity.is_finite()) {
+                    return Err(Error::Invalid(format!("the thermal diffusivity k / (ρ c) of material `{}` is {diffusivity}", domain.material)));
+                }
+                let alpha = diffusivity * dt / (h * h);
+                let tau = 4.0 * alpha + 0.5;
+                if !(tau >= MIN_TAU) {
+                    return Err(Error::Invalid(format!(
+                        "the thermal relaxation time τ_T = {tau:.5} is below {MIN_TAU}: the grid cannot resolve diffusivity {diffusivity} at this time step (cell Péclet number {:.1}); refine the spacing or raise the time step",
+                        if alpha > 0.0 { lattice_velocity / alpha } else { f64::INFINITY }
+                    )));
+                }
+                if tau > 2.0 {
+                    warnings.push(format!("the thermal relaxation time τ_T = {tau:.3} is large: heat diffuses fast on this grid and time step; a shorter time step is more accurate"));
+                }
+                let flux_scale = dt / (rho_c * h);
+                let mut faces = [ThermalCondition::Adiabatic {}; 6];
+                for face in BoxFace::ALL {
+                    let c = t.faces.get(face);
+                    if matches!(c, ThermalCondition::Flux { .. })
+                        && matches!(
+                            domain.faces.get(face),
+                            FaceCondition::Velocity { .. } | FaceCondition::Pressure { .. } | FaceCondition::Periodic {}
+                        )
+                    {
+                        return Err(Error::Invalid(format!(
+                            "box face {}: a heat flux goes on a wall, not on an inlet, outlet or periodic face",
+                            face.name()
+                        )));
+                    }
+                    if let Some(slot) = faces.get_mut(face.index()) {
+                        *slot = lattice_thermal(c, flux_scale)?;
+                    }
+                }
+                let beta = t.expansion.unwrap_or(0.0);
+                Some(ThermalSetup {
+                    tau,
+                    diffusivity,
+                    initial_temperature: t.initial_temperature,
+                    buoyancy: t.gravity.map(|g| -beta * g * dt * dt / h),
+                    faces,
+                    heat_scale: rho_c * h * h * h / dt,
+                })
+            }
+        };
+
         // Obstacles, their face names and their faces' wall velocities.
         let mut domain_obstacles = Vec::with_capacity(domain.obstacles.len());
-        let mut warnings = Vec::new();
         for body in &domain.obstacles {
             let (index, o) = obstacles
                 .iter()
@@ -255,6 +350,25 @@ impl Setup {
             let tags = o.surface.tri_face().iter().copied().max().map_or(1, |m| m as usize + 1).max(o.faces.len());
             let names: Vec<String> = (0..tags).map(|t| o.faces.get(t).cloned().unwrap_or_else(|| format!("face{t}"))).collect();
             let mut velocities = vec![[0.0; 3]; tags];
+            let mut thermal_faces = vec![ThermalCondition::Adiabatic {}; tags];
+            if let (Some(t), Some(ts)) = (&domain.thermal, &thermal) {
+                // power per area → temperature per step through a cell face, as for the box faces
+                let flux_scale = h * h / ts.heat_scale;
+                for sb in t.surfaces.iter().filter(|sb| &sb.face.body == body) {
+                    let mut hit = false;
+                    for (tag, name) in names.iter().enumerate() {
+                        if sb.face.selects(&fieldcraft_model::GeometryRef::face(body.as_str(), name.as_str())?) {
+                            hit = true;
+                            if let Some(slot) = thermal_faces.get_mut(tag) {
+                                *slot = lattice_thermal(&sb.condition, flux_scale)?;
+                            }
+                        }
+                    }
+                    if !hit {
+                        return Err(Error::NotFound(format!("the {} is not a face of the obstacle's surface", sb.face)));
+                    }
+                }
+            }
             for sb in domain.surfaces.iter().filter(|sb| &sb.face.body == body) {
                 let mut hit = false;
                 for (tag, name) in names.iter().enumerate() {
@@ -269,7 +383,7 @@ impl Setup {
                     return Err(Error::NotFound(format!("the {} is not a face of the obstacle's surface", sb.face)));
                 }
             }
-            domain_obstacles.push(ObstacleFaces { index, names, velocities });
+            domain_obstacles.push(ObstacleFaces { index, names, velocities, thermal: thermal_faces });
         }
         if mach > 0.1 + 1e-12 {
             warnings.push(format!(
@@ -298,6 +412,7 @@ impl Setup {
             acceleration,
             initial_velocity: domain.initial_velocity.map(|c| c * dt / h),
             obstacles: domain_obstacles,
+            thermal,
             warnings,
             domain,
         })

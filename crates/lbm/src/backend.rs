@@ -13,11 +13,13 @@ use crate::flow::{Flow, Group};
 use crate::setup::Setup;
 use crate::{Error, Result};
 
-/// The density and velocity of every cell (lattice units; zero in solid cells).
+/// The density and velocity of every cell (lattice units; zero in solid cells), and the
+/// temperature (model units) when the flow carries heat (empty otherwise).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Fields {
     pub density: Vec<f64>,
     pub velocity: Vec<[f64; 3]>,
+    pub temperature: Vec<f64>,
 }
 
 /// A stepper of one prepared flow.
@@ -35,6 +37,9 @@ pub trait Backend {
     fn mass(&mut self) -> Result<f64>;
     /// The momentum each force group received in the last step (lattice units: force per step).
     fn forces(&mut self) -> Result<Vec<[f64; 3]>>;
+    /// The heat each force group received in the last step (lattice units: temperature times
+    /// cell faces per step); empty without heat.
+    fn heat(&mut self) -> Result<Vec<f64>>;
     fn groups(&self) -> &[Group];
     fn fluid_cells(&self) -> usize;
     fn is_fluid(&self, cell: usize) -> bool;
