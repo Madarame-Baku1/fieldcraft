@@ -586,11 +586,11 @@ mod tests {
     use super::*;
     use crate::size::UniformSize;
 
-    /// A corner of exactly 135°, the threshold, is not a corner however the last bits of its
+    /// An angle of exactly 135°, the threshold, is not a corner however the last bits of its
     /// points round (Windows' `sin` against glibc's, or two tessellations): a trapezoid with one
     /// stays a triangle rather than flipping to mapped when that vertex moves by an ulp (#556).
     #[test]
-    fn a_corner_on_the_threshold_is_one_whichever_way_it_rounds() {
+    fn an_angle_on_the_threshold_is_not_a_corner_whichever_way_it_rounds() {
         // (0, 0) 90°, (3, 0) 45°, (2, 1) 135°, (0, 1) 90°: three corners and a 135° bend.
         let trapezoid = |p: Q| {
             let pts = [[0.0, 0.0], [3.0, 0.0], p, [0.0, 1.0]];
