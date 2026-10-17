@@ -1130,7 +1130,8 @@ impl ModelApp {
             let still = key.as_ref().map(|k| PlotKey { frame: None, ..k.clone() });
             if self.prepared.0 != still {
                 let pick = key.as_ref().map(|k| k.pick).unwrap_or_default();
-                self.prepared = (still, results::prepare(&self.session, &self.display.1, pick).unwrap_or_default());
+                let bodies: Vec<&str> = self.pick.names.iter().map(|n| n.name.as_str()).collect();
+                self.prepared = (still, results::prepare(&self.session, &self.display.1, pick, &bodies).unwrap_or_default());
             }
             let frame = key.as_ref().and_then(|k| k.frame);
             let p = key.as_ref().and_then(|_| results::plot(&self.session, &self.display.1, frame, &self.prepared.1));

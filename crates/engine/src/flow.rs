@@ -1,5 +1,5 @@
 //! The display of a fluid step's result: its fields per cell drawn as a coloured slice through the
-//! domain, on the obstacles' surfaces beside the fluid, and as streamlines coloured by speed
+//! domain, on the obstacles' surfaces beside the fluid, and as streamlines coloured by speed or temperature
 //! ([`fieldcraft_render::flow`]), as the results view's [`FlowView`] asks. The headless pictures
 //! ([`crate::view`]) and the desktop viewport draw the same [`FlowPlot`]; the part stays drawn
 //! (a fluid step does not deform it).
@@ -20,6 +20,8 @@ use serde_json::{Value, json};
 
 use crate::results::{Field, Kind, Pick, ResultsView, magnitude};
 use crate::{EngineError, Result, StepResult};
+
+pub mod wall;
 
 /// Streamlines traced when no count is given, and the steps (half a cell each) each may take.
 pub const DEFAULT_STREAMLINES: u32 = 64;
@@ -90,7 +92,7 @@ impl Default for StreamlineView {
 }
 
 /// What a fluid step's display shows besides the field's legend (the view's contour field:
-/// velocity or pressure, `None` draws no colours).
+/// velocity, pressure, temperature or wall heat flux; `None` draws no colours).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FlowView {
     /// The slice, `None` for none.
@@ -157,14 +159,29 @@ pub fn direction(r: &FluidResult, f: &Frame) -> (Axis, bool) {
     (axis, sum[axis.index()] >= 0.0)
 }
 
-/// A cell field's value in every cell of a frame: velocity magnitude or pressure, NaN in the
+/// A cell field's value in every cell of a frame: velocity magnitude, pressure or temperature, NaN in the
 /// solid cells.
 pub fn cell_values(r: &FluidResult, field: Field, f: &Frame) -> Result<Vec<f64>> {
     let solid = |k: usize| r.solid.get(k).copied().unwrap_or(false);
     let values: Vec<f64> = match field {
         Field::Velocity => f.velocity.iter().map(|v| magnitude(v.map(f64::from))).collect(),
         Field::Pressure => f.pressure.iter().map(|p| f64::from(*p)).collect(),
-        _ => return Err(EngineError::Params(format!("{} is not available for fluid step `{}` (velocity or pressure)", field.label(), r.step))),
+        Field::Temperature if f.temperature.len() == r.grid.len() && !f.temperature.is_empty() => {
+            f.temperature.iter().map(|t| f64::from(*t)).collect()
+        }
+        Field::Temperature => {
+            return Err(EngineError::Params(format!(
+                "temperature is not available for fluid step `{}`: this frame has no complete temperature field (isothermal flow)",
+                r.step
+            )));
+        }
+        _ => {
+            return Err(EngineError::Params(format!(
+                "{} is not available for fluid step `{}` (velocity, pressure or temperature)",
+                field.label(),
+                r.step
+            )));
+        }
     };
     Ok(values.into_iter().enumerate().map(|(k, v)| if solid(k) || !v.is_finite() { f64::NAN } else { v }).collect())
 }
@@ -286,6 +303,10 @@ pub struct FlowPlot {
     /// The bands streamlines are coloured by speed over: the legend's when it shows velocity;
     /// `None` draws them in one colour (the legend shows another field).
     pub speed: Option<Bands>,
+    /// Face-averaged heat values paired with the displayed geometry triangles.
+    pub wall_values: Vec<([Vec3; 3], Option<f64>)>,
+    /// A point on each recorded wall face for the legend's extreme markers.
+    pub wall_positions: Vec<Option<Vec3>>,
 }
 
 impl FlowPlot {
@@ -301,7 +322,7 @@ pub fn plot(view: &ResultsView, result: &Arc<StepResult>, traced: &TraceCache) -
     let k = frame_index(r, view.pick())?;
     let f = frame(r, view.pick())?;
     let fv = FlowView::of(view, r).into_owned();
-    let contour = match view.contour.filter(|c| matches!(c, Field::Velocity | Field::Pressure)) {
+    let contour = match view.contour.filter(|c| matches!(c, Field::Velocity | Field::Pressure | Field::Temperature)) {
         Some(field) => {
             let values = cell_values(r, field, f)?;
             cell_range(&values).map(|(min, max)| CellContour { field, bands: view.bands(min.1, max.1), min, max, values })
@@ -321,7 +342,34 @@ pub fn plot(view: &ResultsView, result: &Arc<StepResult>, traced: &TraceCache) -
         None => Arc::default(),
     };
     let speed = contour.as_ref().filter(|c| c.field == Field::Velocity).map(|c| c.bands);
-    Ok(FlowPlot { grid: g, contour, slice, surface: fv.surface, streamlines, speed, view: fv })
+    Ok(FlowPlot { grid: g, contour, slice, surface: fv.surface, streamlines, speed, view: fv, wall_values: Vec::new(), wall_positions: Vec::new() })
+}
+
+/// Add the obstacle face mapping shared by the desktop and headless views.
+pub fn plot_with_surfaces(
+    view: &ResultsView,
+    result: &Arc<StepResult>,
+    traced: &TraceCache,
+    session: &crate::Session,
+    base: &fieldcraft_render::DisplayMesh,
+    bodies: &[&str],
+) -> Result<FlowPlot> {
+    let mut out = plot(view, result, traced)?;
+    if view.contour == Some(Field::WallHeatFlux) {
+        let Kind::Fluid(r) = result.kind() else { return Ok(out) };
+        let faces = wall::faces(session, r, view.pick())?;
+        let positions: std::collections::BTreeMap<_, _> = base
+            .surface_tris
+            .iter()
+            .filter_map(|t| bodies.get(t.body as usize).map(|name| ((*name, t.face), (t.p[0] + t.p[1] + t.p[2]) * (1.0 / 3.0))))
+            .collect();
+        out.wall_positions = faces.iter().map(|f| positions.get(&(f.body.as_str(), f.index)).copied()).collect();
+        let values: Vec<f64> = faces.iter().map(|f| f.flux.unwrap_or(f64::NAN)).collect();
+        out.contour =
+            cell_range(&values).map(|(min, max)| CellContour { field: Field::WallHeatFlux, bands: view.bands(min.1, max.1), min, max, values });
+        out.wall_values = base.surface_tris.iter().zip(wall::triangle_values(&faces, base, bodies)).map(|(t, v)| (t.p, v)).collect();
+    }
+    Ok(out)
 }
 
 /// The colours a flow plot is drawn in.
@@ -330,7 +378,7 @@ pub struct FlowColors<'a> {
     /// The contour scale, low to high, and values above a clamped legend's maximum.
     pub stops: &'a [Rgb],
     pub over: Rgb,
-    /// Streamlines when the legend shows another field than velocity.
+    /// Streamlines when the legend shows neither velocity nor temperature.
     pub plain: Rgb,
 }
 
@@ -339,7 +387,19 @@ pub struct FlowColors<'a> {
 pub fn draw(plot: &FlowPlot, scene: &mut Scene, colors: &FlowColors) {
     if let Some(c) = &plot.contour {
         let color = |band: Option<u32>| band.map_or(colors.plain, |k| bands_color(colors.stops, colors.over, &c.bands, k));
-        if plot.surface {
+        if plot.surface && c.field == Field::WallHeatFlux {
+            // Only tagged geometry triangles can receive wall heat. A structural mesh or
+            // hidden geometry must not accidentally inherit a face's value by index.
+            if scene.tris.len() == plot.wall_values.len() {
+                for (tri, (points, value)) in scene.tris.iter_mut().zip(&plot.wall_values) {
+                    if tri.p == *points
+                        && let Some(v) = value
+                    {
+                        tri.color = color(c.bands.band(*v));
+                    }
+                }
+            }
+        } else if plot.surface {
             let model = std::mem::take(&mut scene.tris);
             for t in model {
                 let v = t.p.map(|p| flow::sample(&plot.grid, &c.values, p));
@@ -362,7 +422,14 @@ pub fn draw(plot: &FlowPlot, scene: &mut Scene, colors: &FlowColors) {
         for (k, w) in l.points.windows(2).enumerate() {
             let (Some(&a), Some(&b)) = (w.first(), w.get(1)) else { continue };
             let speed = 0.5 * (l.speed.get(k).copied().unwrap_or(0.0) + l.speed.get(k + 1).copied().unwrap_or(0.0));
-            let color = plot.speed.as_ref().and_then(|b| b.band(speed).map(|k| bands_color(colors.stops, colors.over, b, k))).unwrap_or(colors.plain);
+            let temperature = plot.contour.as_ref().filter(|c| c.field == Field::Temperature);
+            let color = if let Some(c) = temperature {
+                let value = flow::sample(&plot.grid, &c.values, (a + b) * 0.5);
+                c.bands.band(value).map(|k| bands_color(colors.stops, colors.over, &c.bands, k))
+            } else {
+                plot.speed.as_ref().and_then(|b| b.band(speed).map(|k| bands_color(colors.stops, colors.over, b, k)))
+            }
+            .unwrap_or(colors.plain);
             scene.lines.push(SceneLine { a, b, color, width: STREAMLINE_WIDTH });
         }
     }
@@ -386,7 +453,7 @@ pub fn report(view: &ResultsView, r: &FluidResult, units: fieldcraft_model::Unit
         }
     }
     let fv = FlowView::of(view, r);
-    out["slice"] = match &fv.slice {
+    out["slice"] = match fv.slice.as_ref().filter(|_| view.contour != Some(Field::WallHeatFlux)) {
         Some(s) => json!({"axis": s.axis, "position": slice_position(r, s)}),
         None => Value::Null,
     };
@@ -494,6 +561,30 @@ pub(crate) mod tests {
         assert_eq!(FlowView::for_result(&r).slice.unwrap().axis, Axis::X);
         let s = seeds(&r, &r.frames[1], &StreamlineView { count: 4, ..StreamlineView::default() });
         assert!(s.iter().all(|p| p.y == 3.5), "{s:?}");
+    }
+
+    #[test]
+    fn temperature_colours_cells_and_streamlines_and_masks_solids() {
+        let mut r = channel();
+        for f in &mut r.frames {
+            f.temperature = (0..r.grid.len()).map(|k| 20.0 + 2.0 * r.grid.coords(k)[0] as f32).collect();
+        }
+        let values = cell_values(&r, Field::Temperature, &r.frames[1]).unwrap();
+        assert_eq!(values.iter().filter(|v| v.is_nan()).count(), 8);
+        assert_eq!(cell_range(&values).map(|(a, b)| (a.1, b.1)), Some((20.0, 38.0)));
+        let result = Arc::new(crate::StepResult::Fluid(r));
+        let mut view = ResultsView::for_result(&result);
+        view.contour = Some(Field::Temperature);
+        let p = plot(&view, &result, &TraceCache::default()).unwrap();
+        let mut scene = Scene::default();
+        let colors = FlowColors { stops: &[Rgb(0, 0, 255), Rgb(255, 0, 0)], over: Rgb(255, 255, 255), plain: Rgb(7, 7, 7) };
+        draw(&p, &mut scene, &colors);
+        assert!(!scene.tris.is_empty());
+        assert!(!scene.lines.is_empty());
+        assert!(scene.lines.iter().all(|l| l.color != colors.plain));
+        assert!(scene.lines.windows(2).any(|l| l[0].color != l[1].color));
+        let cold = channel();
+        assert!(cell_values(&cold, Field::Temperature, &cold.frames[1]).unwrap_err().to_string().contains("isothermal"));
     }
 
     #[test]

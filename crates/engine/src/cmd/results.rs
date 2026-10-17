@@ -24,7 +24,7 @@ pub const DEFORMED: CommandSpec = CommandSpec {
 pub const CONTOUR: CommandSpec = CommandSpec {
     id: "results.contour",
     label: "Contours",
-    params: r#"{"step": "Load", "field": "von_mises", "bands": 12, "range"?: {"min"?: 0, "max"?: 80} | "auto"} — contours of a nodal field: displacement, displacement_x/y/z, velocity (explicit and fluid steps), pressure (fluid steps), von_mises, max/mid/min_principal, stress_xx/yy/zz/xy/xz/yz (stresses for static steps), contact_pressure, contact_gap, contact_status (0 open, 1 closed or stick, 2 slip), contact_shear, contact_slip (friction; nonlinear static steps with contact, at the contacts' secondary surfaces); "none" turns them off; 2 to 24 bands; `range` clamps the legend (a bound left out, null or "auto" follows the field; values above `max` are drawn in the over colour), kept until the field changes"#,
+    params: r#"{"step": "Load", "field": "von_mises", "bands": 12, "range"?: {"min"?: 0, "max"?: 80} | "auto"} — contours of a nodal field: displacement, displacement_x/y/z, velocity (explicit and fluid steps), pressure (fluid steps), temperature (thermal frames), wall_heat_flux (signed face average on thermal fluid obstacles), von_mises, max/mid/min_principal, stress_xx/yy/zz/xy/xz/yz (stresses for static steps), contact_pressure, contact_gap, contact_status (0 open, 1 closed or stick, 2 slip), contact_shear, contact_slip (friction; nonlinear static steps with contact, at the contacts' secondary surfaces); "none" turns them off; 2 to 24 bands; `range` clamps the legend (a bound left out, null or "auto" follows the field; values above `max` are drawn in the over colour), kept until the field changes"#,
     form: Some(super::forms::CONTOUR),
     kind: CommandKind::Session,
     requires: &[Requirement::Result],
@@ -94,7 +94,7 @@ pub const EXPORT_CSV: CommandSpec = CommandSpec {
 pub const SLICE: CommandSpec = CommandSpec {
     id: "results.slice",
     label: "Flow Slice",
-    params: r#"{"step": "Flow", "field": "velocity" | "pressure", "axis": "x" | "y" | "z" | "none", "position": 20 | "auto", "frame": 10} — shows a fluid step's field (velocity magnitude or gauge pressure, banded with the legend as results.contour sets it) on a slice through the domain normal to `axis`, at `position` along it (inside the domain; "auto" or left out with a new axis: the domain's middle); "none" hides the slice; `frame` from 0 (left out: the one shown, at first the last); what is left out stays as shown. A fluid step is first shown with velocity on a slice through the middle, normal to the horizontal axis across the flow"#,
+    params: r#"{"step": "Flow", "field": "velocity" | "pressure" | "temperature", "axis": "x" | "y" | "z" | "none", "position": 20 | "auto", "frame": 10} — shows a fluid step's field (velocity magnitude, gauge pressure or temperature when its frames carry heat, banded with the legend as results.contour sets it) on a slice through the domain normal to `axis`, at `position` along it (inside the domain; "auto" or left out with a new axis: the domain's middle); "none" hides the slice; `frame` from 0 (left out: the one shown, at first the last); what is left out stays as shown. A fluid step is first shown with velocity on a slice through the middle, normal to the horizontal axis across the flow"#,
     form: Some(super::forms::SLICE),
     kind: CommandKind::Session,
     requires: &[Requirement::Result],
@@ -104,7 +104,7 @@ pub const SLICE: CommandSpec = CommandSpec {
 pub const SURFACE: CommandSpec = CommandSpec {
     id: "results.surface",
     label: "Flow on Surfaces",
-    params: r#"{"step": "Flow", "show": true} — colours a fluid step's obstacles (the part drawn) by the field shown, read in the fluid cells beside them; `show: false` draws the part in its own colours"#,
+    params: r#"{"step": "Flow", "show": true, "field"?: "velocity" | "pressure" | "temperature" | "wall_heat_flux", "frame"?: 10} — colours a fluid step's obstacles (the part drawn) by the field shown, read in the fluid cells beside them; `wall_heat_flux` is signed power received by each obstacle face divided by its complete tessellated area, in model power/area units (positive into the wall); histories interpolate at the shown frame without extrapolation; recorded adiabatic faces are zero, missing histories remain uncoloured; no slice is drawn for this surface-only field. `show: false` draws the part in its own colours"#,
     form: Some(super::forms::FLOW_SURFACE),
     kind: CommandKind::Session,
     requires: &[Requirement::Result],
@@ -114,7 +114,7 @@ pub const SURFACE: CommandSpec = CommandSpec {
 pub const STREAMLINES: CommandSpec = CommandSpec {
     id: "results.streamlines",
     label: "Streamlines",
-    params: r#"{"step": "Flow", "show": true, "count": 64, "max_steps": 4000, "seeds": [[x, y, z], …], "line": {"from": [x, y, z], "to": [x, y, z]}, "frame": 10} — streamlines of a fluid step, traced downstream through its velocity field (trilinear between the cells, midpoint rule, half-cell steps) and coloured by speed when the legend shows velocity: from `seeds` (at most 2000 points), from `count` points evenly along `line`, or else from `count` seeds (1 to 2000, default 64) on the inlet face upstream of the obstacles; each at most `max_steps` steps (1 to 100000, default 4000), 2 000 000 points in all; `show: false` hides them; `frame` as for results.slice. Replies with the view and `traced`: the streamlines, their points, the seeds and how many started none (outside the fluid)"#,
+    params: r#"{"step": "Flow", "show": true, "field"?: "velocity" | "pressure" | "temperature", "count": 64, "max_steps": 4000, "seeds": [[x, y, z], …], "line": {"from": [x, y, z], "to": [x, y, z]}, "frame": 10} — streamlines of a fluid step, traced downstream through its velocity field (trilinear between the cells, midpoint rule, half-cell steps) and coloured by speed or temperature when that field is selected (plain for pressure): from `seeds` (at most 2000 points), from `count` points evenly along `line`, or else from `count` seeds (1 to 2000, default 64) on the inlet face upstream of the obstacles; each at most `max_steps` steps (1 to 100000, default 4000), 2 000 000 points in all; `show: false` hides them; `frame` as for results.slice. Replies with the view and `traced`: the streamlines, their points, the seeds and how many started none (outside the fluid)"#,
     form: Some(super::forms::STREAMLINES),
     kind: CommandKind::Session,
     requires: &[Requirement::Result],
@@ -249,12 +249,27 @@ fn contour(s: &mut Session, p: &Value) -> Result<Value> {
     if let (Some(f), Some((r, _))) = (field, s.latest_result(&step))
         && !Field::available(r).any(|a| a == f)
     {
+        if f == Field::Temperature && matches!(r.kind(), Kind::Fluid(_)) {
+            return Err(EngineError::Params(format!(
+                "temperature is not available for fluid step `{step}`: its frames have no complete temperature field (isothermal flow)"
+            )));
+        }
+        if f == Field::WallHeatFlux {
+            return Err(EngineError::Params(format!("wall heat flux is not available for step `{step}`: it requires thermal obstacle histories")));
+        }
         return Err(EngineError::Params(format!("{} is not available for step `{step}` (mode shapes have no stress scale)", f.label())));
     }
     let range = match p.get("range") {
         None => None,
         Some(r) => Some(legend_range(r)?),
     };
+    if field == Some(Field::WallHeatFlux)
+        && let Some((r, _)) = s.latest_result(&step)
+        && let Kind::Fluid(f) = r.kind()
+    {
+        let pick = s.results_view.as_ref().filter(|v| v.step == step).map(|v| v.pick()).unwrap_or_default();
+        crate::flow::wall::faces(s, f, pick)?;
+    }
     let v = view_of(s, &step)?;
     if v.contour != field {
         (v.range_min, v.range_max) = (None, None);
@@ -403,12 +418,7 @@ fn seed_point(v: &Value) -> Option<[f64; 3]> {
 fn slice(s: &mut Session, p: &Value) -> Result<Value> {
     let (step, r) = fluid_step(s, p)?;
     let Kind::Fluid(f) = r.kind() else { return Err(EngineError::Params(format!("step `{step}` is not a fluid step"))) };
-    let field = match opt::<String>(p, "field")?.as_deref() {
-        None => None,
-        Some("velocity") => Some(Field::Velocity),
-        Some("pressure") => Some(Field::Pressure),
-        Some(_) => return Err(EngineError::invalid("field", "must be \"velocity\" or \"pressure\"")),
-    };
+    let field = fluid_field(p, &r)?;
     // Some(None): hide the slice.
     let axis = match opt::<String>(p, "axis")?.as_deref() {
         None => None,
@@ -463,7 +473,27 @@ fn surface(s: &mut Session, p: &Value) -> Result<Value> {
     let (step, r) = fluid_step(s, p)?;
     let Kind::Fluid(f) = r.kind() else { return Err(EngineError::Params(format!("step `{step}` is not a fluid step"))) };
     let show = opt::<bool>(p, "show")?.unwrap_or(true);
+    let field = if opt::<String>(p, "field")?.as_deref() == Some("wall_heat_flux") {
+        if !Field::available(&r).any(|f| f == Field::WallHeatFlux) {
+            return Err(EngineError::invalid("field", "wall heat flux is unavailable: this step has no thermal obstacle histories"));
+        }
+        Some(Field::WallHeatFlux)
+    } else {
+        fluid_field(p, &r)?
+    };
+    let frame = fluid_frame(f, p)?;
+    if field == Some(Field::WallHeatFlux) {
+        let mut pick = s.results_view.as_ref().filter(|v| v.step == step).map(|v| v.pick()).unwrap_or_default();
+        if frame.is_some() {
+            pick.frame = frame;
+        }
+        crate::flow::wall::faces(s, f, pick)?;
+    }
     let v = view_of(s, &step)?;
+    set_fluid_field(v, field);
+    if frame.is_some() {
+        v.frame = frame;
+    }
     let mut flow = FlowView::of(v, f).into_owned();
     flow.surface = show;
     v.flow = Some(flow);
@@ -474,6 +504,7 @@ fn streamlines(s: &mut Session, p: &Value) -> Result<Value> {
     let (step, r) = fluid_step(s, p)?;
     let Kind::Fluid(f) = r.kind() else { return Err(EngineError::Params(format!("step `{step}` is not a fluid step"))) };
     let show = opt::<bool>(p, "show")?.unwrap_or(true);
+    let field = fluid_field(p, &r)?;
     let count = count_param(p, "count", MAX_STREAMLINES)?;
     let max_steps = count_param(p, "max_steps", MAX_STREAMLINE_STEPS)?;
     let max = MAX_STREAMLINES as usize;
@@ -502,6 +533,7 @@ fn streamlines(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let frame = fluid_frame(f, p)?;
     let v = view_of(s, &step)?;
+    set_fluid_field(v, field);
     let mut flow = FlowView::of(v, f).into_owned();
     flow.streamlines = if show {
         let mut sl = flow.streamlines.take().unwrap_or_default();
@@ -535,6 +567,32 @@ fn streamlines(s: &mut Session, p: &Value) -> Result<Value> {
         out["traced"] = json!({"streamlines": lines.len(), "points": points, "seeds": seeds, "no_start": seeds.saturating_sub(lines.len())});
     }
     Ok(out)
+}
+
+fn fluid_field(p: &Value, r: &crate::StepResult) -> Result<Option<Field>> {
+    let field = match opt::<String>(p, "field")?.as_deref() {
+        None => return Ok(None),
+        Some("velocity") => Field::Velocity,
+        Some("pressure") => Field::Pressure,
+        Some("temperature") => Field::Temperature,
+        Some(_) => return Err(EngineError::invalid("field", "must be velocity, pressure or temperature")),
+    };
+    if !Field::available(r).any(|f| f == field) {
+        return Err(EngineError::invalid(
+            "field",
+            "temperature is unavailable: this isothermal step has no complete temperature field in its frames",
+        ));
+    }
+    Ok(Some(field))
+}
+
+fn set_fluid_field(view: &mut ResultsView, field: Option<Field>) {
+    if let Some(field) = field {
+        if view.contour != Some(field) {
+            (view.range_min, view.range_max) = (None, None);
+        }
+        view.contour = Some(field);
+    }
 }
 
 fn clear(s: &mut Session, _: &Value) -> Result<Value> {
@@ -1434,6 +1492,43 @@ mod tests {
             assert!(t.execute(id, &json!({})).is_err(), "{id}");
             assert!(t.execute(id, &json!({"step": "Bend"})).is_err(), "{id}");
         }
+    }
+
+    #[test]
+    fn temperature_views_require_thermal_frames_and_follow_the_selected_frame() {
+        let mut r = crate::flow::tests::channel();
+        r.frames[0].temperature = vec![20.0; r.grid.len()];
+        r.frames[1].temperature = vec![70.0; r.grid.len()];
+        let mut s = Session::default();
+        s.store_result(crate::StepResult::Fluid(r));
+        for command in ["results.slice", "results.surface", "results.streamlines", "results.contour"] {
+            let report = s.execute(command, &json!({"field": "temperature"})).unwrap();
+            assert_eq!(report["contour"]["field"], "temperature", "{command}: {report}");
+            assert_eq!(report["contour"]["range"]["max"]["value"], 70.0);
+        }
+        let report = s.execute("results.frame", &json!({"frame": 0})).unwrap();
+        assert_eq!(report["contour"]["range"]["max"]["value"], 20.0);
+        assert!(Field::available(s.latest_result("Flow").unwrap().0).any(|f| f == Field::Temperature));
+        let before = s.results_view.clone();
+        for command in ["results.slice", "results.surface", "results.streamlines"] {
+            for params in [json!({"field": "temperature", "frame": u64::MAX}), json!({"field": ["temperature"]})] {
+                assert!(s.execute(command, &params).is_err());
+                assert_eq!(s.results_view, before);
+            }
+        }
+        let mut incomplete = crate::flow::tests::channel();
+        incomplete.frames[0].temperature = vec![20.0; incomplete.grid.len()];
+        incomplete.frames[1].temperature = vec![70.0; incomplete.grid.len().saturating_sub(1)];
+        let incomplete = crate::StepResult::Fluid(incomplete);
+        assert!(!Field::available(&incomplete).any(|f| f == Field::Temperature));
+        let mut cold = fluid();
+        let before = cold.results_view.clone();
+        for command in ["results.slice", "results.surface", "results.streamlines", "results.contour"] {
+            let error = cold.execute(command, &json!({"field": "temperature"})).unwrap_err().to_string();
+            assert!(error.contains("isothermal"), "{command}: {error}");
+            assert_eq!(cold.results_view, before);
+        }
+        assert!(!Field::available(cold.latest_result("Flow").unwrap().0).any(|f| f == Field::Temperature));
     }
 
     #[test]

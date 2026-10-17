@@ -511,7 +511,8 @@ fn picture(s: &Session, p: &Palette, section: Option<Section>, toward: Vec3) -> 
         // The part as it is, with the flow drawn through and around it.
         let mut scene = model_scene(&base, p);
         let mut bounds = base.bounds;
-        if let Ok(fp) = crate::flow::plot(view, result, &s.traced) {
+        let names: Vec<&str> = bodies.iter().map(String::as_str).collect();
+        if let Ok(fp) = crate::flow::plot_with_surfaces(view, result, &s.traced, s, &base, &names) {
             if let Some(c) = &fp.contour {
                 let cell = |(k, v): (usize, f64)| (u32::try_from(k).unwrap_or(u32::MAX), v);
                 shown.contour = Some((c.field.id().to_string(), cell(c.min), cell(c.max)));

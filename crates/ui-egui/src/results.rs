@@ -114,6 +114,9 @@ impl Plot {
 
     /// Where a contour extreme is: its node's position, or a fluid step's cell centre.
     pub fn extreme_position(&self, label: u32) -> Option<Vec3> {
+        if self.view.contour == Some(Field::WallHeatFlux) {
+            return self.flow.as_ref()?.wall_positions.get(label as usize).copied().flatten();
+        }
         match self.result.kind() {
             Kind::Fluid(f) => Some(Vec3::from(fieldcraft_engine::flow::cell_centre(f, usize::try_from(label).ok()?))),
             _ => self.node_position(label),
@@ -175,10 +178,12 @@ pub fn scale(view: &ResultsView, result: &StepResult, pick: Pick, base: &Display
 
 /// The part of the session's results plot that depends on what is drawn (`pick`), not on the
 /// animation's deformation multiplier: the deformation scale and the contour values.
-pub fn prepare(session: &Session, base: &DisplayMesh, pick: Pick) -> Option<Prepared> {
+pub fn prepare(session: &Session, base: &DisplayMesh, pick: Pick, bodies: &[&str]) -> Option<Prepared> {
     let (view, result, _) = shown(session)?;
     if matches!(result.kind(), Kind::Fluid(_)) {
-        let flow = fieldcraft_engine::flow::plot(view, result, &session.traced).ok();
+        let mut view = view.clone();
+        view.frame = pick.frame;
+        let flow = fieldcraft_engine::flow::plot_with_surfaces(&view, result, &session.traced, session, base, bodies).ok();
         let cell = |(k, v): (usize, f64)| (u32::try_from(k).unwrap_or(u32::MAX), v);
         let contour = flow
             .as_ref()
@@ -336,7 +341,8 @@ pub(crate) mod tests {
 
     fn plot_at(s: &Session, base: &DisplayMesh, frame: Option<u64>) -> Option<Plot> {
         let (view, result, _) = shown(s)?;
-        plot(s, base, frame, &prepare(s, base, pick(view, result, frame))?)
+        let bodies: Vec<&str> = s.design.iter().flat_map(|d| &d.bodies).map(|b| b.name.as_str()).collect();
+        plot(s, base, frame, &prepare(s, base, pick(view, result, frame), &bodies)?)
     }
 
     /// The sample cantilever, solved (static step `Load`, frequency step `Modes`).
@@ -412,22 +418,39 @@ pub(crate) mod tests {
     }
 
     /// A 40 × 30 × 10 mm plate in a tank of 5 mm cells, a liquid flowing past it along x, solved.
-    fn plate_in_a_tank() -> Session {
+    fn plate_in_a_tank(thermal: bool) -> Session {
         use fieldcraft_geometry::sample::{Plate, plate_design};
-        let dir = std::env::temp_dir().join(format!("fieldcraft-ui-flow-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("fieldcraft-ui-flow-{}-{thermal}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("plate.solidcraft");
         std::fs::write(&path, plate_design(&Plate::default()).unwrap()).unwrap();
         let mut s = Session::default();
         s.execute("geometry.open", &json!({"path": path.to_str().unwrap()})).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
-        s.run_script(&json!([
+        let mut script = json!([
             {"command": "model.material.create", "params": {"name": "Water", "density": 1e-9, "fluid": {"type": "newtonian", "viscosity": 1e-7}}},
             {"command": "model.fluid_domain.create", "params": {"name": "Tank", "material": "Water", "min": [-20, -20, -20], "max": [60, 50, 30], "spacing": 5, "obstacles": ["Body1"],
                 "faces": {"x_min": {"type": "velocity", "velocity": [10, 0, 0]}, "x_max": {"type": "pressure", "pressure": 0}}}},
             {"command": "model.step.create", "params": {"name": "Flow", "procedure": {"type": "fluid", "domain": "Tank", "steps": 60, "frames": 2}}},
-        ]))
-        .unwrap();
+        ]);
+        if thermal {
+            script[0]["params"]["thermal"] = json!({"conductivity": 1.0, "specific_heat": 1e8});
+            let faces: Vec<_> = s.design.as_ref().unwrap().bodies[0]
+                .faces()
+                .iter()
+                .map(|f| {
+                    json!({
+                        "face": {"body": "Body1", "face": f.name}, "condition": {"type": "temperature", "value": 60.0}
+                    })
+                })
+                .collect();
+            script[1]["params"]["thermal"] =
+                json!({"initial_temperature": 20.0, "surfaces": faces, "faces": {"x_min": {"type": "temperature", "value": 20.0}}});
+        }
+        s.run_script(&script).unwrap();
+        if thermal {
+            s.execute("model.units", &json!({"system": "mm-t-s-N-MPa"})).unwrap();
+        }
         s.execute("solve.fluid", &json!({})).unwrap();
         s
     }
@@ -436,7 +459,7 @@ pub(crate) mod tests {
     /// slice and on the part, with its legend, and streamlines (#193).
     #[test]
     fn a_fluid_step_keeps_the_part_and_draws_the_flow() {
-        let mut s = plate_in_a_tank();
+        let mut s = plate_in_a_tank(false);
         let (base, _) = fieldcraft_engine::view::display(&s);
         assert!(!base.surface_tris.is_empty());
         let p = plot_at(&s, &base, None).unwrap();
@@ -455,6 +478,37 @@ pub(crate) mod tests {
         s.execute("results.slice", &json!({"field": "pressure", "frame": 0})).unwrap();
         let p = plot_at(&s, &base, None).unwrap();
         assert_eq!((p.contour.as_ref().map(|c| c.field), p.pick.frame), (Some(Field::Pressure), Some(0)));
+    }
+
+    #[test]
+    fn heated_flow_fields_have_units_colours_and_face_markers() {
+        let mut s = plate_in_a_tank(true);
+        let (base, _) = fieldcraft_engine::view::display(&s);
+        s.execute("results.slice", &json!({"field": "temperature"})).unwrap();
+        let p = plot_at(&s, &base, None).unwrap();
+        assert_eq!(p.contour.as_ref().unwrap().field, Field::Temperature);
+        assert!(Field::Temperature.title(&p.result, p.units).contains("°C or K"));
+        assert!(Field::available(&p.result).any(|f| f == Field::Temperature));
+        assert!(p.contour.as_ref().unwrap().max.1 > 20.0);
+        let last = p.frame().unwrap().2 - 1;
+        s.execute("results.frame", &json!({"frame": 0})).unwrap();
+        assert_eq!(plot_at(&s, &base, None).unwrap().contour.as_ref().unwrap().max.1, 20.0, "the frame selector changes the temperature shown");
+        s.execute("results.frame", &json!({"frame": last})).unwrap();
+        s.execute("results.surface", &json!({"field": "wall_heat_flux"})).unwrap();
+        let p = plot_at(&s, &base, None).unwrap();
+        let c = p.contour.as_ref().unwrap();
+        assert_eq!(c.field, Field::WallHeatFlux);
+        assert_eq!(c.field.unit(&p.result, p.units).as_deref(), Some("mW/mm²"));
+        assert!(c.min.1 < 0.0, "hot wall gives heat to fluid");
+        assert!(p.extreme_position(c.min.0).is_some());
+        assert!(p.flow.as_ref().unwrap().slice.is_none());
+        for t in [Tokens::light(), Tokens::dark()] {
+            let scene = scene(&p, Style::ShadedEdges, crate::scene::Show::DEFAULT, &t);
+            assert_eq!(scene.tris.len(), base.surface_tris.len());
+            assert!(scene.tris.windows(2).any(|t| t[0].color != t[1].color));
+        }
+        s.execute("results.frame", &json!({"frame": 0})).unwrap();
+        assert!(plot_at(&s, &base, None).unwrap().contour.is_none());
     }
 
     #[test]

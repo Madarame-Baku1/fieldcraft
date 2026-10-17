@@ -2081,6 +2081,8 @@ pub const CONTOUR: &[Field] = &[
             ("displacement_z", "Displacement Z"),
             ("velocity", "Velocity magnitude"),
             ("pressure", "Pressure (fluid)"),
+            ("temperature", "Temperature"),
+            ("wall_heat_flux", "Wall heat flux (into wall)"),
             ("max_principal", "Max principal"),
             ("mid_principal", "Mid principal"),
             ("min_principal", "Min principal"),
@@ -2122,7 +2124,7 @@ pub const FRAME: &[Field] = &[
 const FLUID_FRAME: Field = int("frame", "Frame", 0, 1_000_000_000).help("The frame shown, from 0.").hint("the frame shown");
 pub const SLICE: &[Field] = &[
     SOLVED,
-    choice("field", "Field", &[("velocity", "Velocity magnitude"), ("pressure", "Pressure")])
+    choice("field", "Field", &[("velocity", "Velocity magnitude"), ("pressure", "Pressure"), ("temperature", "Temperature (heated flow)")])
         .help("The field coloured on the slice and the obstacles.")
         .hint("the field shown"),
     choice("axis", "Normal", &[("x", "X"), ("y", "Y"), ("z", "Z"), ("none", "None (hide)")])
@@ -2133,9 +2135,23 @@ pub const SLICE: &[Field] = &[
         .hint("the position shown"),
     FLUID_FRAME,
 ];
-pub const FLOW_SURFACE: &[Field] = &[SOLVED, flag("show", "Show").help("Colour the obstacles by the field in the fluid beside them.").def("true")];
+pub const FLOW_SURFACE: &[Field] = &[
+    SOLVED,
+    flag("show", "Show").help("Colour the obstacles by the selected field.").def("true"),
+    choice(
+        "field",
+        "Field",
+        &[("velocity", "Velocity"), ("pressure", "Pressure"), ("temperature", "Temperature"), ("wall_heat_flux", "Wall heat flux (into wall)")],
+    )
+    .help("Colour the obstacle faces by the adjacent fluid field, or signed wall heat received per area.")
+    .hint("the field shown"),
+    FLUID_FRAME,
+];
 pub const STREAMLINES: &[Field] = &[
     SOLVED,
+    choice("field", "Field", &[("velocity", "Velocity"), ("pressure", "Pressure (plain lines)"), ("temperature", "Temperature")])
+        .help("Colour streamlines by speed or temperature; pressure leaves the lines in one colour.")
+        .hint("the field shown"),
     flag("show", "Show").help("Draw the streamlines.").def("true"),
     int("count", "Count", 1, 2000).help("Seeds on the inlet face, or points along the seed line.").def("64"),
     int("max_steps", "Max steps", 1, 100_000).help("Most steps of half a cell each streamline takes.").def("4000"),

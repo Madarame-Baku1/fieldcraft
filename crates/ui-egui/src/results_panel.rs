@@ -41,7 +41,8 @@ pub fn show(app: &mut ModelApp, ui: &mut egui::Ui, rect: Rect, t: &Tokens) {
     probe(app, &plot, &painter, rect, t);
     let mut focus = None;
     for (i, (line, node)) in extremes.into_iter().enumerate() {
-        let r = ui.interact(line, ui.id().with(("fc_legend_extreme", i)), egui::Sense::click()).on_hover_text(format!("Show and probe node {node}"));
+        let tip = if plot.is_fluid() { "Centre this field extreme".into() } else { format!("Show and probe node {node}") };
+        let r = ui.interact(line, ui.id().with(("fc_legend_extreme", i)), egui::Sense::click()).on_hover_text(tip);
         if r.hovered() {
             ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
         }
@@ -86,6 +87,7 @@ fn title(plot: &Plot) -> String {
     match (&plot.contour, plot.mode()) {
         (Some(l), _) => l.field.title(&plot.result, plot.units),
         (None, Some(_)) => "Mode shape (normalised)".into(),
+        (None, None) if plot.is_fluid() => plot.view.contour.map_or_else(|| "Flow".into(), |f| f.title(&plot.result, plot.units)),
         (None, None) => "Deformed shape".into(),
     }
 }
@@ -474,9 +476,23 @@ fn deformation_rows(plot: &Plot, ui: &mut egui::Ui, run: &mut Vec<(&'static str,
 fn flow_rows(plot: &Plot, ui: &mut egui::Ui, run: &mut Vec<(&'static str, Value)>) {
     use fieldcraft_engine::flow::{Axis, slice_position};
     let (Kind::Fluid(f), Some(flow)) = (plot.result.kind(), plot.flow.as_ref()) else { return };
+    if plot.view.contour == Some(Field::WallHeatFlux) {
+        ui.label("Wall heat");
+        ui.label("Positive into wall; face average");
+        ui.end_row();
+        if plot.contour.is_none() {
+            ui.label("History");
+            ui.label("No wall heat recorded at this frame");
+            ui.end_row();
+        }
+    }
     let view = &flow.view;
     ui.label("Slice");
     ui.horizontal(|ui| {
+        if plot.view.contour == Some(Field::WallHeatFlux) {
+            ui.label("Hidden for wall heat");
+            return;
+        }
         let shown = view.slice.as_ref().map_or("None", |s| s.axis.id());
         egui::ComboBox::from_id_salt("fc_results_slice").selected_text(format!("Normal {}", shown.to_uppercase())).width(90.0).show_ui(ui, |ui| {
             if ui.selectable_label(view.slice.is_none(), "None").clicked() {
@@ -504,14 +520,14 @@ fn flow_rows(plot: &Plot, ui: &mut egui::Ui, run: &mut Vec<(&'static str, Value)
     ui.end_row();
     ui.label("Obstacles");
     let mut surface = view.surface;
-    if ui.checkbox(&mut surface, "Coloured").on_hover_text("Colour the part by the field in the fluid beside it").changed() {
+    if ui.checkbox(&mut surface, "Coloured").on_hover_text("Colour the part by the selected fluid field or wall heat").changed() {
         run.push(("results.surface", json!({"show": surface})));
     }
     ui.end_row();
     ui.label("Streamlines");
     ui.horizontal(|ui| {
         let mut on = view.streamlines.is_some();
-        if ui.checkbox(&mut on, "").on_hover_text("Streamlines from the inlet, coloured by speed when the legend shows velocity").changed() {
+        if ui.checkbox(&mut on, "").on_hover_text("Streamlines from the inlet, coloured by speed or temperature when selected").changed() {
             run.push(("results.streamlines", json!({"show": on})));
         }
         if let Some(sl) = &view.streamlines {

@@ -139,3 +139,28 @@ factorization's supernodes, the tet mesher's refinement and improvement passes, 
 attempts) and stops with `cancelled`, leaving the model unchanged. One job runs at a
 time; another long command meanwhile is refused, naming the job. The MCP server's `solve` and
 `mesh` tools wait for the reply.
+
+## Heated flow results
+
+A solved fluid step with temperature in every saved frame offers `temperature` in the
+Results field list and through `results.contour`, `results.slice`, `results.surface` and
+`results.streamlines` (`{"field":"temperature"}`). Slices and obstacle surfaces sample
+fluid-cell temperature; streamline colours sample temperature along the velocity traces.
+The legend and existing `solve.probe` use the model's temperature scale, without conversion.
+An isothermal step hides the field and rejects an explicit request with an explanation.
+The frame slider and `results.frame` select the field's time, including the initial frame.
+
+`results.surface {"field":"wall_heat_flux","frame":10}` shows the signed heat received
+by each obstacle face divided by that face's complete tessellated geometric area. Positive
+values heat the wall; a hot wall heating the fluid is negative. This is a face average,
+not a resolved local distribution. The legend uses the model's consistent power/area unit:
+for mm–tonne–second it is mW/mm² (not W/mm²); other systems follow their own units.
+
+Wall heat uses the recorded face-group histories, linearly interpolated at the shown frame
+only between recorded times. The initial frame precedes the history and remains uncoloured;
+no heat is invented or extrapolated. Recorded adiabatic faces are zero. Unrecorded/imported
+faces remain in their own colour. The command reply includes `wall_heat.faces` with body,
+face, area, power and flux (null when unavailable), plus the sign and sampling convention.
+This surface-only field suppresses the slice and leaves streamlines plain; selecting a cell
+field restores the saved slice settings. `results.contour` also selects the wall field and
+controls its bands/range. The desktop and headless picture use the same mapping and palette.

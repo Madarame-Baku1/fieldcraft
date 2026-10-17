@@ -696,7 +696,7 @@ pub static CATALOGUE: &[Capability] = &[
         "Streamlines",
         Results,
         "Plots",
-        "A fluid step's streamlines coloured by speed, its velocity or pressure on a slice, and the obstacles coloured by the flow",
+        "A fluid step's velocity, pressure or temperature on slices and obstacles, speed or temperature along streamlines, and signed wall heat per area",
         &["results.slice", "results.surface"],
     ),
     ready("results.export.vtu", "Export VTU", Results, "Files", "Write a solved step as VTK unstructured grids for ParaView"),

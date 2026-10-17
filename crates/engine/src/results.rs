@@ -91,6 +91,8 @@ pub enum Field {
     Temperature,
     /// Heat flux magnitude (heat transfer steps, at the end of the step).
     HeatFlux,
+    /// Signed fluid heat received by an obstacle face per geometric area.
+    WallHeatFlux,
     /// Contact pressure (nonlinear static steps with contact: 0 off the contacts' secondary
     /// surfaces).
     ContactPressure,
@@ -106,7 +108,7 @@ pub enum Field {
 }
 
 impl Field {
-    pub const ALL: [Field; 23] = [
+    pub const ALL: [Field; 24] = [
         Field::Displacement,
         Field::DisplacementX,
         Field::DisplacementY,
@@ -125,6 +127,7 @@ impl Field {
         Field::StressYz,
         Field::Temperature,
         Field::HeatFlux,
+        Field::WallHeatFlux,
         Field::ContactPressure,
         Field::ContactGap,
         Field::ContactStatus,
@@ -153,6 +156,7 @@ impl Field {
             Field::StressYz => "stress_yz",
             Field::Temperature => "temperature",
             Field::HeatFlux => "heat_flux",
+            Field::WallHeatFlux => "wall_heat_flux",
             Field::ContactPressure => "contact_pressure",
             Field::ContactGap => "contact_gap",
             Field::ContactStatus => "contact_status",
@@ -181,6 +185,7 @@ impl Field {
             Field::StressYz => "Stress YZ",
             Field::Temperature => "Temperature",
             Field::HeatFlux => "Heat flux magnitude",
+            Field::WallHeatFlux => "Wall heat flux (into wall)",
             Field::ContactPressure => "Contact pressure",
             Field::ContactGap => "Contact gap",
             Field::ContactStatus => "Contact status (0 open, 1 closed or stick, 2 slip)",
@@ -196,7 +201,7 @@ impl Field {
             Field::Velocity => Quantity::Velocity,
             Field::Pressure => Quantity::Stress,
             Field::Temperature => Quantity::Temperature,
-            Field::HeatFlux => Quantity::HeatFlux,
+            Field::HeatFlux | Field::WallHeatFlux => Quantity::HeatFlux,
             Field::ContactGap | Field::ContactStatus => Quantity::None,
             Field::ContactPressure
             | Field::ContactShear
@@ -249,6 +254,7 @@ impl Field {
                 | Field::Pressure
                 | Field::Temperature
                 | Field::HeatFlux
+                | Field::WallHeatFlux
         ) && !self.is_contact()
     }
 
@@ -273,7 +279,16 @@ impl Field {
                 e.frames.last().map_or((false, false, false, false), |f| (!f.stress.is_empty(), !f.velocity.is_empty(), false, false))
             }
             // Cell fields, drawn by `crate::flow`.
-            Kind::Fluid(_) => return vec![Field::Velocity, Field::Pressure].into_iter(),
+            Kind::Fluid(f) => {
+                let mut fields = vec![Field::Velocity, Field::Pressure];
+                if !f.frames.is_empty() && f.frames.iter().all(|frame| !frame.temperature.is_empty() && frame.temperature.len() == f.grid.len()) {
+                    fields.push(Field::Temperature);
+                    if f.heat.iter().any(|h| h.body.is_some()) {
+                        fields.push(Field::WallHeatFlux);
+                    }
+                }
+                return fields.into_iter();
+            }
             Kind::Heat(_) => return Field::ALL.into_iter().filter(|f| f.is_thermal()).collect::<Vec<_>>().into_iter(),
         };
         Field::ALL
@@ -281,6 +296,7 @@ impl Field {
             .filter(move |f| match f {
                 Field::Velocity => velocity,
                 Field::Pressure => false,
+                Field::WallHeatFlux => false,
                 Field::Temperature => temperature,
                 Field::HeatFlux => flux,
                 f if f.is_contact() => contact,
@@ -536,7 +552,7 @@ pub fn field_values(model: &Model, r: &StepResult, field: Field, pick: Pick) -> 
             Kind::Static(_) | Kind::Frequency(_) | Kind::Fluid(_) | Kind::Heat(_) => Err(unavailable()),
         },
         // Per cell (crate::flow::cell_values), not per node.
-        Field::Pressure => Err(unavailable()),
+        Field::Pressure | Field::WallHeatFlux => Err(unavailable()),
         Field::Temperature => match r.kind() {
             Kind::Heat(h) => Ok(heat_frame(h, pick)?.1.to_vec()),
             Kind::Static(StaticResult { temperature: Some(t), .. }) => Ok(t.clone()),
@@ -706,6 +722,18 @@ impl Session {
                         out[k.as_str()] = x;
                     }
                 }
+                if v.contour == Some(Field::WallHeatFlux)
+                    && let Ok(faces) = crate::flow::wall::faces(self, f, v.pick())
+                {
+                    let values: Vec<f64> = faces.iter().map(|f| f.flux.unwrap_or(f64::NAN)).collect();
+                    let end = |(k, value): (usize, f64)| json!({"body": faces.get(k).map(|f| &f.body), "face": faces.get(k).map(|f| &f.face), "value": value});
+                    let range = crate::flow::cell_range(&values).map(|(a, b)| json!({"min": end(a), "max": end(b)}));
+                    out["contour"] = json!({"field": Field::WallHeatFlux, "label": Field::WallHeatFlux.label(), "unit": Quantity::HeatFlux.unit(self.model.units()), "range": range});
+                    if v.range_min.is_some() || v.range_max.is_some() {
+                        out["contour"]["legend"] = json!({"min": v.range_min, "max": v.range_max});
+                    }
+                    out["wall_heat"] = json!({"faces": faces, "positive": "into wall", "history": "linear interpolation between recorded samples; no extrapolation", "unrecorded": "uncoloured"});
+                }
             }
             Kind::Heat(h) => {
                 out["heat_flows"] = heat_flows(h);
@@ -773,7 +801,7 @@ mod tests {
         }
         let (modes, _) = s.latest_result("Modes").unwrap();
         assert_eq!(Field::available(modes).count(), 4);
-        assert_eq!(Field::available(bend).count(), Field::ALL.len() - 9, "all but velocity, pressure, the thermal and the contact fields");
+        assert_eq!(Field::available(bend).count(), Field::ALL.len() - 10, "all but velocity, pressure, the thermal and the contact fields");
         assert!(field_values(&s.model, modes, Field::VonMises, Pick { mode: 1, frame: None }).is_err());
         assert!(field_values(&s.model, modes, Field::Displacement, Pick { mode: 9, frame: None }).is_err());
         assert_eq!(field_values(&s.model, modes, Field::Displacement, Pick { mode: 2, frame: None }).unwrap().len(), modes.nodes().len());

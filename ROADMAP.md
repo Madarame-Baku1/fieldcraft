@@ -123,3 +123,10 @@ What exists and what is missing, by area; each gap is in a milestone above.
 | Fluid dynamics | LBM D3Q19 TRT, walls, inlets/outlets, obstacle forces | Turbulence with wall models, thermal and conjugate heat transfer, non-Newtonian, porous media, multiphase, GPU (M12, M13) |
 | Wave propagation | One-dimensional elastic waves and impact in the explicit solver (bar cases in the oracle) | A 2D/3D finite-difference ultrasound solver (velocity–stress FDTD, EFIT, k-space pseudospectral) on voxelised geometry, time–frequency diagrams (spectrogram, wavelet, Wigner–Ville) with dispersion overlays, spectral elements, absorbing boundaries, tone-burst and transducer sources, attenuation, Lamb/Rayleigh/Love guided waves and SAFE dispersion curves, ultrasound in fluids and tissue, nonlinear acoustics, A/B-scans and frequency–wavenumber analysis (M23) |
 | Design | — | Parametric studies on SolidCraft parameters, optimisation, submodelling (M22) |
+
+### Heated flow results (#157)
+
+Temperature is available on fluid slices, obstacle surfaces and streamline colours when the
+saved frames carry it. Signed face-average wall heat follows recorded histories and the
+model's power/area units. Commands, the Results panel and headless pictures share the view;
+initial frames without recorded wall heat remain uncoloured.
