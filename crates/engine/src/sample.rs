@@ -18,6 +18,8 @@
 use fieldcraft_geometry::Shape;
 use serde_json::{Value, json};
 
+mod heated_flow;
+
 /// A sample the app offers (Help › Samples, the empty viewport, `file.sample`, `--sample NAME`).
 pub struct Sample {
     pub name: &'static str,
@@ -91,6 +93,14 @@ pub const SAMPLES: &[Sample] = &[
         design: Some(UPRIGHT_BRACKET),
         prepare: None,
         script: |_| flow_past(),
+    },
+    Sample {
+        name: "heated-flow",
+        label: "Heated Flow Past a Bracket",
+        about: "Cool air passing an 80 °C bracket: temperature slices and signed wall heat, a small transient demonstration",
+        design: Some(UPRIGHT_BRACKET),
+        prepare: None,
+        script: heated_flow::script,
     },
     Sample {
         name: "heated-bracket",

@@ -1971,6 +1971,7 @@ pub const SAMPLE: &[Field] = &[choice(
         ("drop-test", "Drop test"),
         ("rubber-seal", "Rubber seal"),
         ("flow-past", "Flow past a bracket"),
+        ("heated-flow", "Heated flow past a bracket"),
         ("heated-bracket", "Heated bracket"),
         ("bracket-hex", "Hex-meshed bracket"),
         ("crank-arm", "Bicycle crank arm"),

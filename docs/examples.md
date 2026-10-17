@@ -6,7 +6,7 @@ press **Solve** (`solve.run`). Each opens fully defined — geometry, mesh, mate
 conditions, loads and steps — in mm, t, s, N and MPa, and opens and solves within half a minute. The geometry is our
 own: SolidCraft scripts run when the sample opens (a recipe from [`tests/corpus`](../tests/corpus)
 or one written in `crates/engine/src/sample.rs`). Each sample has a test in
-`crates/engine/src/sample.rs` that opens it, checks it clean, solves it and holds its result to
+`crates/engine/src/sample.rs` or its modules that opens it, checks it clean, solves it and holds its result to
 the check given below.
 
 ## Drop test (`drop-test`)
@@ -200,3 +200,22 @@ SolidCraft geometry with persistent face names, swept all-hex (hex8 of 4 mm, inc
 clamped at `F2:start` and loaded with 1000 N down through a kinematic coupling to `F2:top`.
 **Look at:** the bending stress in the flanges, highest at the clamp; the tip moves 0.18 mm down
 (beam theory with shear: 0.184 mm).
+
+## Heated flow past a bracket (`heated-flow`)
+
+Air at 20 °C enters at 1 mm/s and passes the original upright bracket, whose faces are
+held at 80 °C. The 130 × 80 × 70 mm domain has 5 mm cells (5,824 cells), a pressure outlet,
+slip sides and top, and a no-slip floor. There are 180 steps and six saved output intervals,
+plus the initial frame. Open `file.sample {"name":"heated-flow"}` and solve on CPU or GPU.
+The slow prescribed flow keeps this coarse lattice away from its small-relaxation-time limit.
+
+**Look at:** Results → Temperature, or `results.slice {"field":"temperature"}`, for the
+warming air. `results.surface {"field":"wall_heat_flux"}` shows heat received by each
+bracket face per area: the hot wall heating the air is negative. In this model's mm–tonne–second
+units the wall flux is mW/mm². The initial frame has no recorded wall heat and stays uncoloured.
+
+**Check:** the fluid warms above its inlet temperature while staying below the held wall
+temperature (with a small numerical tolerance); recorded hot walls give heat to the fluid.
+This coarse, short transient is a quick display demonstration, not a converged convection
+benchmark. It has neither buoyancy nor solid heat conduction. The sample is isolated in
+`crates/engine/src/sample/heated_flow.rs` and its gallery registration.
