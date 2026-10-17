@@ -151,7 +151,7 @@ pub(super) fn optional_count(p: &Value, key: &str, default: u64, range: std::ops
 }
 
 /// A whole number in `range`, as a problem's kind.
-fn whole_in(range: &std::ops::RangeInclusive<u64>) -> ProblemKind {
+pub(super) fn whole_in(range: &std::ops::RangeInclusive<u64>) -> ProblemKind {
     let int = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
     ProblemKind::NotAWholeNumber { min: int(*range.start()), max: int(*range.end()) }
 }

@@ -6,7 +6,7 @@ Every entry is a toolbar button. **Ready** entries run their command; **coming s
 shown greyed with the roadmap milestone that brings them (ROADMAP.md). Scripts, the command line,
 the control channel and AI agents over MCP (docs/mcp.md) run the same commands.
 
-84 ready, 37 coming soon.
+85 ready, 36 coming soon.
 
 ## Geometry
 
@@ -159,7 +159,7 @@ the control channel and AI agents over MCP (docs/mcp.md) run the same commands.
 | Plots | Path Plot — Plot a quantity along a path | coming soon (M9) |  |
 | Plots | Cut — Section cuts through the model | coming soon (M9) |  |
 | Plots | Display Group — Show and hide parts of the model | coming soon (M9) |  |
-| Plots | Streamlines — Streamlines and flow fields | coming soon (M12) |  |
+| Plots | Streamlines — A fluid step's streamlines coloured by speed, its velocity or pressure on a slice, and the obstacles coloured by the flow | ready | `results.streamlines`, `results.slice`, `results.surface` |
 | Files | Export VTU — Write a solved step as VTK unstructured grids for ParaView | ready | `results.export.vtu` |
 | Files | Read Results — Read results in public formats | coming soon (M9) |  |
 | Files | Convergence — Mesh convergence studies | coming soon (M9) |  |

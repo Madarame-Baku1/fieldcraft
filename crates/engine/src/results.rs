@@ -1,6 +1,7 @@
 //! What the results display shows ([`ResultsView`], set by the `results.*` commands) and the
 //! nodal values it draws: displacements, mode shapes, explicit field frames and stress fields,
-//! read from a solved step's [`StepResult`]. An explicit frame's one-point element stresses are
+//! read from a solved step's [`StepResult`]; a fluid step's cell fields are drawn by
+//! [`crate::flow`]. An explicit frame's one-point element stresses are
 //! averaged to the nodes (unweighted, like the implicit solver's nodal stresses).
 //!
 //! The view is session state, like the camera: changing it is not an edit, so it is neither
@@ -21,7 +22,7 @@ pub enum Kind<'a> {
     Static(&'a StaticResult),
     Frequency(&'a FrequencyResult),
     Explicit(&'a ExplicitResult),
-    /// Per cell, not per node: no nodal fields to display yet.
+    /// Per cell, not per node: drawn by [`crate::flow`].
     Fluid(&'a fieldcraft_lbm::FluidResult),
     Heat(&'a HeatResult),
 }
@@ -72,8 +73,10 @@ pub enum Field {
     DisplacementX,
     DisplacementY,
     DisplacementZ,
-    /// Velocity magnitude (explicit steps).
+    /// Velocity magnitude (explicit steps; per cell in fluid steps).
     Velocity,
+    /// Gauge pressure (per cell, fluid steps).
+    Pressure,
     VonMises,
     MaxPrincipal,
     MidPrincipal,
@@ -103,12 +106,13 @@ pub enum Field {
 }
 
 impl Field {
-    pub const ALL: [Field; 22] = [
+    pub const ALL: [Field; 23] = [
         Field::Displacement,
         Field::DisplacementX,
         Field::DisplacementY,
         Field::DisplacementZ,
         Field::Velocity,
+        Field::Pressure,
         Field::VonMises,
         Field::MaxPrincipal,
         Field::MidPrincipal,
@@ -136,6 +140,7 @@ impl Field {
             Field::DisplacementY => "displacement_y",
             Field::DisplacementZ => "displacement_z",
             Field::Velocity => "velocity",
+            Field::Pressure => "pressure",
             Field::VonMises => "von_mises",
             Field::MaxPrincipal => "max_principal",
             Field::MidPrincipal => "mid_principal",
@@ -163,6 +168,7 @@ impl Field {
             Field::DisplacementY => "Displacement Y",
             Field::DisplacementZ => "Displacement Z",
             Field::Velocity => "Velocity magnitude",
+            Field::Pressure => "Pressure (gauge)",
             Field::VonMises => "Von Mises stress",
             Field::MaxPrincipal => "Max. principal stress",
             Field::MidPrincipal => "Mid. principal stress",
@@ -188,6 +194,7 @@ impl Field {
         match self {
             Field::Displacement | Field::DisplacementX | Field::DisplacementY | Field::DisplacementZ | Field::ContactSlip => Quantity::Length,
             Field::Velocity => Quantity::Velocity,
+            Field::Pressure => Quantity::Stress,
             Field::Temperature => Quantity::Temperature,
             Field::HeatFlux => Quantity::HeatFlux,
             Field::ContactGap | Field::ContactStatus => Quantity::None,
@@ -239,6 +246,7 @@ impl Field {
                 | Field::DisplacementY
                 | Field::DisplacementZ
                 | Field::Velocity
+                | Field::Pressure
                 | Field::Temperature
                 | Field::HeatFlux
         ) && !self.is_contact()
@@ -264,14 +272,15 @@ impl Field {
             Kind::Explicit(e) => {
                 e.frames.last().map_or((false, false, false, false), |f| (!f.stress.is_empty(), !f.velocity.is_empty(), false, false))
             }
-            // Cell fields have their own display (M12 streamlines); no nodal field.
-            Kind::Fluid(_) => return Vec::new().into_iter(),
+            // Cell fields, drawn by `crate::flow`.
+            Kind::Fluid(_) => return vec![Field::Velocity, Field::Pressure].into_iter(),
             Kind::Heat(_) => return Field::ALL.into_iter().filter(|f| f.is_thermal()).collect::<Vec<_>>().into_iter(),
         };
         Field::ALL
             .into_iter()
             .filter(move |f| match f {
                 Field::Velocity => velocity,
+                Field::Pressure => false,
                 Field::Temperature => temperature,
                 Field::HeatFlux => flux,
                 f if f.is_contact() => contact,
@@ -385,6 +394,9 @@ pub struct ResultsView {
     pub frame: Option<usize>,
     /// Animate the deformation (a mode swings through ±, a static step grows from 0).
     pub animate: bool,
+    /// A fluid step's slice, surface colours and streamlines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow: Option<crate::flow::FlowView>,
 }
 
 impl ResultsView {
@@ -393,11 +405,18 @@ impl ResultsView {
     /// shape, at the automatic scale); a frequency step's first mode deformed with displacement
     /// contours (a mode shape is a deformation); an explicit step at its last frame and a
     /// nonlinear static step at its last increment, deformed to true scale ([`true_scale`];
-    /// with von Mises contours when they kept stresses); a heat step undeformed.
+    /// with von Mises contours when they kept stresses); a heat step undeformed; a fluid step's
+    /// velocity magnitude on a slice, the obstacles and streamlines ([`crate::flow::FlowView`]).
     pub fn for_result(r: &StepResult) -> ResultsView {
         let heat = matches!(r.kind(), Kind::Heat(_));
+        let flow = match r.kind() {
+            Kind::Fluid(f) => Some(crate::flow::FlowView::for_result(f)),
+            _ => None,
+        };
         let contour = if heat {
             Field::Temperature
+        } else if flow.is_some() {
+            Field::Velocity
         } else if Field::available(r).any(|f| f == Field::VonMises) {
             Field::VonMises
         } else {
@@ -415,6 +434,7 @@ impl ResultsView {
             mode: 1,
             frame: None,
             animate: false,
+            flow,
         }
     }
 
@@ -515,6 +535,8 @@ pub fn field_values(model: &Model, r: &StepResult, field: Field, pick: Pick) -> 
             }
             Kind::Static(_) | Kind::Frequency(_) | Kind::Fluid(_) | Kind::Heat(_) => Err(unavailable()),
         },
+        // Per cell (crate::flow::cell_values), not per node.
+        Field::Pressure => Err(unavailable()),
         Field::Temperature => match r.kind() {
             Kind::Heat(h) => Ok(heat_frame(h, pick)?.1.to_vec()),
             Kind::Static(StaticResult { temperature: Some(t), .. }) => Ok(t.clone()),
@@ -679,6 +701,11 @@ impl Session {
             }
             Kind::Fluid(f) => {
                 out["frames"] = f.frames.iter().map(|f| f.time).collect();
+                if let Value::Object(flow) = crate::flow::report(v, f, self.model.units()) {
+                    for (k, x) in flow {
+                        out[k.as_str()] = x;
+                    }
+                }
             }
             Kind::Heat(h) => {
                 out["heat_flows"] = heat_flows(h);
@@ -746,7 +773,7 @@ mod tests {
         }
         let (modes, _) = s.latest_result("Modes").unwrap();
         assert_eq!(Field::available(modes).count(), 4);
-        assert_eq!(Field::available(bend).count(), Field::ALL.len() - 8, "all but velocity, the thermal and the contact fields");
+        assert_eq!(Field::available(bend).count(), Field::ALL.len() - 9, "all but velocity, pressure, the thermal and the contact fields");
         assert!(field_values(&s.model, modes, Field::VonMises, Pick { mode: 1, frame: None }).is_err());
         assert!(field_values(&s.model, modes, Field::Displacement, Pick { mode: 9, frame: None }).is_err());
         assert_eq!(field_values(&s.model, modes, Field::Displacement, Pick { mode: 2, frame: None }).unwrap().len(), modes.nodes().len());

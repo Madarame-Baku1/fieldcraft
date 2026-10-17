@@ -62,6 +62,9 @@ pub struct Tokens {
     pub line_element: Color32,
     /// Element edges (the mesh wireframe).
     pub mesh_edge: Color32,
+    /// Streamlines when the legend shows another field than velocity: stands out from the
+    /// viewport background.
+    pub streamline: Color32,
     pub node: Color32,
     // ---- geometry ----
     /// Faces of the open design and imported surfaces (SolidCraft's body colour).
@@ -149,6 +152,7 @@ impl Tokens {
             shell: Color32::from_rgb(0xc0, 0x8c, 0x78),
             line_element: Color32::from_rgb(0xc8, 0x8c, 0x1e),
             mesh_edge: Color32::from_rgb(0x1e, 0x23, 0x2a),
+            streamline: Color32::from_rgb(0x28, 0x2e, 0x38),
             node: Color32::from_rgb(0xb4, 0x3c, 0x8c),
             geometry: Color32::from_rgb(176, 186, 198),
             geometry_edge: Color32::from_rgb(40, 44, 52),
@@ -216,6 +220,7 @@ impl Tokens {
         t.shell = Color32::from_rgb(0xc8, 0x96, 0x82);
         t.line_element = Color32::from_rgb(0xf0, 0xc0, 0x50);
         t.mesh_edge = Color32::from_rgb(0x14, 0x18, 0x1e);
+        t.streamline = Color32::from_rgb(0xd8, 0xde, 0xe8);
         t.node = Color32::from_rgb(0xf2, 0xe6, 0x6e);
         t.geometry = Color32::from_rgb(152, 156, 162);
         t.geometry_edge = Color32::from_rgb(16, 16, 18);
@@ -272,6 +277,7 @@ impl Tokens {
             shell: rgb(self.shell),
             line_element: rgb(self.line_element),
             mesh_edge: rgb(self.mesh_edge),
+            streamline: rgb(self.streamline),
             node: rgb(self.node),
             geometry: rgb(self.geometry),
             geometry_edge: rgb(self.geometry_edge),
@@ -442,6 +448,20 @@ mod tests {
                     assert!(far(*s, *o) > 90, "{s:?} vs {o:?} dark={dark}");
                 }
             }
+        }
+    }
+
+    /// Streamlines in one colour (the legend showing pressure) stand out from the viewport
+    /// background in both themes (#193 review: they were near-black on the dark one).
+    #[test]
+    fn streamlines_stand_out_from_the_background() {
+        let luma = |c: Color32| i32::from(c.r()) * 3 + i32::from(c.g()) * 6 + i32::from(c.b());
+        for dark in [true, false] {
+            let t = Tokens::get(dark);
+            for bg in [t.viewport_top, t.viewport_bottom] {
+                assert!((luma(t.streamline) - luma(bg)).abs() > 1200, "dark={dark}");
+            }
+            assert_eq!(t.palette().streamline, rgb(t.streamline));
         }
     }
 

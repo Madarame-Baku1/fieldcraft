@@ -1,11 +1,12 @@
 //! `results.*`: what the results display shows (deformed shape, contours, mode shapes,
-//! animation) and reaction sums. The display is session state ([`ResultsView`]): these
+//! animation; a fluid step's slice, coloured obstacles and streamlines) and reaction sums. The display is session state ([`ResultsView`]): these
 //! commands are not edits, so they are not journalled or undone.
 
 use crate::schema::ProblemKind;
 use serde_json::{Value, json};
 
 use super::{opt, xyz};
+use crate::flow::{Axis, FlowView, MAX_STREAMLINE_STEPS, MAX_STREAMLINES, SliceView};
 use crate::requirement::Requirement;
 use crate::results::{Field, Kind, MAX_BANDS, MIN_BANDS, ResultsView};
 use crate::{CommandKind, CommandSpec, EngineError, Result, Session};
@@ -23,7 +24,7 @@ pub const DEFORMED: CommandSpec = CommandSpec {
 pub const CONTOUR: CommandSpec = CommandSpec {
     id: "results.contour",
     label: "Contours",
-    params: r#"{"step": "Load", "field": "von_mises", "bands": 12, "range"?: {"min"?: 0, "max"?: 80} | "auto"} — contours of a nodal field: displacement, displacement_x/y/z, von_mises, max/mid/min_principal, stress_xx/yy/zz/xy/xz/yz (stresses for static steps), contact_pressure, contact_gap, contact_status (0 open, 1 closed or stick, 2 slip), contact_shear, contact_slip (friction; nonlinear static steps with contact, at the contacts' secondary surfaces); "none" turns them off; 2 to 24 bands; `range` clamps the legend (a bound left out, null or "auto" follows the field; values above `max` are drawn in the over colour), kept until the field changes"#,
+    params: r#"{"step": "Load", "field": "von_mises", "bands": 12, "range"?: {"min"?: 0, "max"?: 80} | "auto"} — contours of a nodal field: displacement, displacement_x/y/z, velocity (explicit and fluid steps), pressure (fluid steps), von_mises, max/mid/min_principal, stress_xx/yy/zz/xy/xz/yz (stresses for static steps), contact_pressure, contact_gap, contact_status (0 open, 1 closed or stick, 2 slip), contact_shear, contact_slip (friction; nonlinear static steps with contact, at the contacts' secondary surfaces); "none" turns them off; 2 to 24 bands; `range` clamps the legend (a bound left out, null or "auto" follows the field; values above `max` are drawn in the over colour), kept until the field changes"#,
     form: Some(super::forms::CONTOUR),
     kind: CommandKind::Session,
     requires: &[Requirement::Result],
@@ -53,7 +54,7 @@ pub const ANIMATE: CommandSpec = CommandSpec {
 pub const FRAME: CommandSpec = CommandSpec {
     id: "results.frame",
     label: "Field Frame",
-    params: r#"{"step": "Impact", "frame": 3, "time": 0.002} — shows a field frame of a solved explicit step, by index from 0 or the frame nearest a time (neither: the last), or of a nonlinear static step (one per converged increment, `time` its load factor; the deformed shape follows it, its contours show the final state); the deformed shape and contours follow it"#,
+    params: r#"{"step": "Impact", "frame": 3, "time": 0.002} — shows a field frame of a solved explicit or fluid step, by index from 0 or the frame nearest a time (neither: the last), or of a nonlinear static step (one per converged increment, `time` its load factor; the deformed shape follows it, its contours show the final state); the deformed shape and contours follow it"#,
     form: Some(super::forms::FRAME),
     kind: CommandKind::Session,
     requires: &[Requirement::Result],
@@ -90,6 +91,36 @@ pub const EXPORT_CSV: CommandSpec = CommandSpec {
     run: export_csv,
 };
 
+pub const SLICE: CommandSpec = CommandSpec {
+    id: "results.slice",
+    label: "Flow Slice",
+    params: r#"{"step": "Flow", "field": "velocity" | "pressure", "axis": "x" | "y" | "z" | "none", "position": 20 | "auto", "frame": 10} — shows a fluid step's field (velocity magnitude or gauge pressure, banded with the legend as results.contour sets it) on a slice through the domain normal to `axis`, at `position` along it (inside the domain; "auto" or left out with a new axis: the domain's middle); "none" hides the slice; `frame` from 0 (left out: the one shown, at first the last); what is left out stays as shown. A fluid step is first shown with velocity on a slice through the middle, normal to the horizontal axis across the flow"#,
+    form: Some(super::forms::SLICE),
+    kind: CommandKind::Session,
+    requires: &[Requirement::Result],
+    run: slice,
+};
+
+pub const SURFACE: CommandSpec = CommandSpec {
+    id: "results.surface",
+    label: "Flow on Surfaces",
+    params: r#"{"step": "Flow", "show": true} — colours a fluid step's obstacles (the part drawn) by the field shown, read in the fluid cells beside them; `show: false` draws the part in its own colours"#,
+    form: Some(super::forms::FLOW_SURFACE),
+    kind: CommandKind::Session,
+    requires: &[Requirement::Result],
+    run: surface,
+};
+
+pub const STREAMLINES: CommandSpec = CommandSpec {
+    id: "results.streamlines",
+    label: "Streamlines",
+    params: r#"{"step": "Flow", "show": true, "count": 64, "max_steps": 4000, "seeds": [[x, y, z], …], "line": {"from": [x, y, z], "to": [x, y, z]}, "frame": 10} — streamlines of a fluid step, traced downstream through its velocity field (trilinear between the cells, midpoint rule, half-cell steps) and coloured by speed when the legend shows velocity: from `seeds` (at most 2000 points), from `count` points evenly along `line`, or else from `count` seeds (1 to 2000, default 64) on the inlet face upstream of the obstacles; each at most `max_steps` steps (1 to 100000, default 4000), 2 000 000 points in all; `show: false` hides them; `frame` as for results.slice. Replies with the view and `traced`: the streamlines, their points, the seeds and how many started none (outside the fluid)"#,
+    form: Some(super::forms::STREAMLINES),
+    kind: CommandKind::Session,
+    requires: &[Requirement::Result],
+    run: streamlines,
+};
+
 pub const CLEAR: CommandSpec = CommandSpec {
     id: "results.clear",
     label: "Hide Results",
@@ -115,23 +146,27 @@ fn solved_list(s: &Session) -> String {
 pub(super) enum Want {
     Any,
     Frequency,
-    /// Steps with frames: explicit dynamics and nonlinear static (one per converged increment).
+    /// Steps with frames: explicit dynamics, fluid and nonlinear static (one per converged
+    /// increment).
     Frames,
+    Fluid,
 }
 
 impl Want {
     fn fits(self, s: &Session, step: &str) -> bool {
         s.latest_result(step).is_some_and(|(r, _)| match (self, r.kind()) {
-            (Want::Any, _) | (Want::Frequency, Kind::Frequency(_)) | (Want::Frames, Kind::Explicit(_)) => true,
+            (Want::Any, _) | (Want::Frequency, Kind::Frequency(_)) | (Want::Frames | Want::Fluid, Kind::Fluid(_)) => true,
+            (Want::Frames, Kind::Explicit(_)) => true,
             (Want::Frames, Kind::Static(r)) => r.nonlinear.is_some(),
-            (Want::Frequency | Want::Frames, _) => false,
+            (Want::Frequency | Want::Frames | Want::Fluid, _) => false,
         })
     }
     fn name(self) -> &'static str {
         match self {
             Want::Any => "solved",
             Want::Frequency => "frequency",
-            Want::Frames => "explicit or nonlinear static",
+            Want::Frames => "explicit, fluid or nonlinear static",
+            Want::Fluid => "fluid",
         }
     }
 }
@@ -291,6 +326,9 @@ fn animate(s: &mut Session, p: &Value) -> Result<Value> {
         return Ok(s.results_report());
     }
     let step = step_for(s, &json!({}), Want::Any)?;
+    if s.latest_result(&step).is_some_and(|(r, _)| matches!(r.kind(), Kind::Fluid(_))) {
+        return Err(EngineError::Params(format!("step `{step}` is a fluid step: nothing deforms; show its frames with results.frame")));
+    }
     let v = view_of(s, &step)?;
     v.animate = true;
     v.deformed = true;
@@ -302,6 +340,7 @@ fn frame(s: &mut Session, p: &Value) -> Result<Value> {
     let times: Vec<f64> = match s.latest_result(&step).map(|(r, _)| r.kind()) {
         Some(Kind::Explicit(e)) => e.frames.iter().map(|f| f.time).collect(),
         Some(Kind::Static(r)) => r.nonlinear.as_ref().map(|h| h.load_factors()).unwrap_or_default(),
+        Some(Kind::Fluid(f)) => f.frames.iter().map(|f| f.time).collect(),
         _ => Vec::new(),
     };
     let last = times.len().checked_sub(1).ok_or_else(|| EngineError::Params(format!("step `{step}` has no field frames")))?;
@@ -320,6 +359,182 @@ fn frame(s: &mut Session, p: &Value) -> Result<Value> {
     let v = view_of(s, &step)?;
     v.frame = Some(k);
     Ok(s.results_report())
+}
+
+/// The fluid step a fluid display command works on (`step`, or the one shown) and its result.
+fn fluid_step(s: &Session, p: &Value) -> Result<(String, std::sync::Arc<crate::StepResult>)> {
+    let step = step_for(s, p, Want::Fluid)?;
+    let r = s.latest_result(&step).map(|(r, _)| r.clone()).ok_or_else(|| EngineError::Params(solved_list(s)))?;
+    Ok((step, r))
+}
+
+/// A whole number in `range`, when given.
+fn whole(p: &Value, key: &str, range: std::ops::RangeInclusive<u64>) -> Result<Option<u64>> {
+    match p.get(key).filter(|v| !v.is_null()) {
+        None => Ok(None),
+        Some(v) => v.as_u64().filter(|n| range.contains(n)).map(Some).ok_or_else(|| EngineError::param(key, super::mesh::whole_in(&range))),
+    }
+}
+
+/// A fluid command's `frame`: from 0 to the last; `None` when left out.
+fn fluid_frame(f: &fieldcraft_lbm::FluidResult, p: &Value) -> Result<Option<usize>> {
+    let last = f.frames.len().saturating_sub(1) as u64;
+    Ok(whole(p, "frame", 0..=last)?.and_then(|k| usize::try_from(k).ok()))
+}
+
+/// A whole number from 1 to `max`, when given.
+fn count_param(p: &Value, key: &str, max: u32) -> Result<Option<u32>> {
+    Ok(whole(p, key, 1..=u64::from(max))?.and_then(|n| u32::try_from(n).ok()))
+}
+
+/// Largest coordinate a seed may have.
+const MAX_COORDINATE: f64 = 1e12;
+
+/// A point `[x, y, z]` of finite coordinates no larger than [`MAX_COORDINATE`].
+fn seed_point(v: &Value) -> Option<[f64; 3]> {
+    let a = v.as_array().filter(|a| a.len() == 3)?;
+    let c: Vec<f64> = a.iter().filter_map(Value::as_f64).filter(|x| x.is_finite() && x.abs() <= MAX_COORDINATE).collect();
+    match c[..] {
+        [x, y, z] => Some([x, y, z]),
+        _ => None,
+    }
+}
+
+fn slice(s: &mut Session, p: &Value) -> Result<Value> {
+    let (step, r) = fluid_step(s, p)?;
+    let Kind::Fluid(f) = r.kind() else { return Err(EngineError::Params(format!("step `{step}` is not a fluid step"))) };
+    let field = match opt::<String>(p, "field")?.as_deref() {
+        None => None,
+        Some("velocity") => Some(Field::Velocity),
+        Some("pressure") => Some(Field::Pressure),
+        Some(_) => return Err(EngineError::invalid("field", "must be \"velocity\" or \"pressure\"")),
+    };
+    // Some(None): hide the slice.
+    let axis = match opt::<String>(p, "axis")?.as_deref() {
+        None => None,
+        Some("none") => Some(None),
+        Some(a) => Some(Some(Axis::parse(a).ok_or_else(|| EngineError::invalid("axis", "must be x, y, z or none"))?)),
+    };
+    // Some(None): the domain's middle.
+    let position = match p.get("position").filter(|v| !v.is_null()) {
+        None => None,
+        Some(Value::String(a)) if a == "auto" => Some(None),
+        Some(v) => Some(Some(v.as_f64().filter(|x| x.is_finite()).ok_or_else(|| EngineError::param("position", ProblemKind::NotANumber))?)),
+    };
+    let frame = fluid_frame(f, p)?;
+    let first = FlowView::for_result(f);
+    let shown = s.results_view.as_ref().filter(|v| v.step == step).and_then(|v| v.flow.clone()).unwrap_or_else(|| first.clone());
+    let slice = match axis {
+        Some(None) => None,
+        Some(Some(a)) => {
+            // A new axis starts at the middle; the same one keeps its position.
+            let kept = shown.slice.as_ref().filter(|s| s.axis == a).and_then(|s| s.position);
+            Some(SliceView { axis: a, position: position.unwrap_or(kept) })
+        }
+        None => {
+            let current = shown.slice.clone().or(first.slice);
+            current.map(|s| SliceView { position: position.unwrap_or(s.position), ..s })
+        }
+    };
+    if let Some(sv) = &slice
+        && let Some(at) = sv.position
+    {
+        let g = crate::flow::grid(f);
+        let (lo, hi) = (g.start(sv.axis.index()), g.end(sv.axis.index()));
+        if !(at >= lo && at <= hi) {
+            return Err(EngineError::invalid("position", format!("must be inside the domain: {lo} to {hi} along {}", sv.axis.id())));
+        }
+    }
+    let v = view_of(s, &step)?;
+    if let Some(field) = field {
+        if v.contour != Some(field) {
+            (v.range_min, v.range_max) = (None, None);
+        }
+        v.contour = Some(field);
+    }
+    if frame.is_some() {
+        v.frame = frame;
+    }
+    v.flow = Some(FlowView { slice, ..shown });
+    Ok(s.results_report())
+}
+
+fn surface(s: &mut Session, p: &Value) -> Result<Value> {
+    let (step, r) = fluid_step(s, p)?;
+    let Kind::Fluid(f) = r.kind() else { return Err(EngineError::Params(format!("step `{step}` is not a fluid step"))) };
+    let show = opt::<bool>(p, "show")?.unwrap_or(true);
+    let v = view_of(s, &step)?;
+    let mut flow = FlowView::of(v, f).into_owned();
+    flow.surface = show;
+    v.flow = Some(flow);
+    Ok(s.results_report())
+}
+
+fn streamlines(s: &mut Session, p: &Value) -> Result<Value> {
+    let (step, r) = fluid_step(s, p)?;
+    let Kind::Fluid(f) = r.kind() else { return Err(EngineError::Params(format!("step `{step}` is not a fluid step"))) };
+    let show = opt::<bool>(p, "show")?.unwrap_or(true);
+    let count = count_param(p, "count", MAX_STREAMLINES)?;
+    let max_steps = count_param(p, "max_steps", MAX_STREAMLINE_STEPS)?;
+    let max = MAX_STREAMLINES as usize;
+    let seeds = match p.get("seeds").filter(|v| !v.is_null()) {
+        None => None,
+        Some(_) => {
+            let list = super::points(p, "seeds", max)?;
+            if list.is_empty() || list.iter().flatten().any(|c| !(c.is_finite() && c.abs() <= MAX_COORDINATE)) {
+                return Err(EngineError::invalid("seeds", format!("must be 1 to {max} points [x, y, z] of finite coordinates")));
+            }
+            Some(list)
+        }
+    };
+    let line = match p.get("line").filter(|v| !v.is_null()) {
+        None => None,
+        Some(v) => {
+            let end = |k: &str| v.get(k).and_then(seed_point);
+            match (end("from"), end("to")) {
+                (Some(a), Some(b)) => Some((a, b)),
+                _ => return Err(EngineError::invalid("line", "must be {\"from\": [x, y, z], \"to\": [x, y, z]} of finite coordinates")),
+            }
+        }
+    };
+    if seeds.is_some() && line.is_some() {
+        return Err(EngineError::invalid("line", "give `seeds` or `line`, not both"));
+    }
+    let frame = fluid_frame(f, p)?;
+    let v = view_of(s, &step)?;
+    let mut flow = FlowView::of(v, f).into_owned();
+    flow.streamlines = if show {
+        let mut sl = flow.streamlines.take().unwrap_or_default();
+        sl.count = count.unwrap_or(sl.count);
+        sl.max_steps = max_steps.unwrap_or(sl.max_steps);
+        sl.seeds = match (seeds, line) {
+            (Some(points), _) => Some(points),
+            (None, Some((a, b))) => {
+                let n = sl.count.max(1);
+                let at = |i: u32| if n == 1 { 0.5 } else { f64::from(i) / f64::from(n - 1) };
+                Some((0..n).map(|i| std::array::from_fn(|k| a[k] + (b[k] - a[k]) * at(i))).collect())
+            }
+            (None, None) => None,
+        };
+        Some(sl)
+    } else {
+        None
+    };
+    if frame.is_some() {
+        v.frame = frame;
+    }
+    let pick = v.pick();
+    let traced = flow.streamlines.clone();
+    v.flow = Some(flow);
+    let mut out = s.results_report();
+    if let Some(sl) = traced {
+        // Traced once: the plot drawn after this reply takes the same lines from the session.
+        let k = crate::flow::frame_index(f, pick)?;
+        let (seeds, lines) = s.traced.trace(&r, k, &sl)?;
+        let points: usize = lines.iter().map(|l| l.points.len()).sum();
+        out["traced"] = json!({"streamlines": lines.len(), "points": points, "seeds": seeds, "no_start": seeds.saturating_sub(lines.len())});
+    }
+    Ok(out)
 }
 
 fn clear(s: &mut Session, _: &Value) -> Result<Value> {
@@ -1159,6 +1374,124 @@ mod tests {
         assert!(s.execute("results.frame", &json!({"frame": 11})).is_err());
         assert!(s.execute("results.modes", &json!({})).is_err());
         assert!(s.execute("results.reactions", &json!({})).is_err());
+    }
+
+    /// A session showing a synthetic fluid result ([`crate::flow::tests::channel`]).
+    fn fluid() -> Session {
+        let mut s = Session::default();
+        s.store_result(crate::StepResult::Fluid(crate::flow::tests::channel()));
+        s
+    }
+
+    /// A fluid step is shown with velocity on a slice across the flow, its obstacles coloured
+    /// and streamlines from the inlet (#193); the commands change what is shown, not the model.
+    #[test]
+    fn fluid_steps_show_a_slice_the_obstacles_and_streamlines() {
+        let mut s = fluid();
+        let (journal, revision) = (s.journal.len(), s.revision());
+        let r = s.results_report();
+        assert_eq!(r["view"]["contour"], "velocity", "{r}");
+        assert_eq!(r["contour"]["range"]["max"]["value"], 10.0, "{r}");
+        assert_eq!(r["contour"]["range"]["max"]["at"], json!([9.5, 0.5, 0.5]), "{r}");
+        assert_eq!(r["slice"], json!({"axis": "y", "position": 2.0}));
+        assert_eq!((r["surface"].as_bool(), r["streamlines"]["inlet"].as_str()), (Some(true), Some("x_min")), "{r}");
+        // A slice normal to z at 1.5 coloured by pressure; "auto" goes back to the middle, a new
+        // axis starts there; positions outside the domain are refused; "none" hides it.
+        let r = s.execute("results.slice", &json!({"axis": "z", "position": 1.5, "field": "pressure"})).unwrap();
+        assert_eq!((r["slice"].clone(), r["contour"]["field"].as_str()), (json!({"axis": "z", "position": 1.5}), Some("pressure")), "{r}");
+        assert_eq!(s.execute("results.slice", &json!({"position": "auto"})).unwrap()["slice"]["position"], 2.0);
+        assert_eq!(s.execute("results.slice", &json!({"axis": "x"})).unwrap()["slice"], json!({"axis": "x", "position": 5.0}));
+        let e = s.execute("results.slice", &json!({"position": 11})).unwrap_err().to_string();
+        assert!(e.contains("0 to 10"), "{e}");
+        assert!(s.execute("results.slice", &json!({"axis": "none"})).unwrap()["slice"].is_null());
+        // results.contour reaches the same fields; nodal ones are refused.
+        s.execute("results.contour", &json!({"field": "velocity", "bands": 6})).unwrap();
+        assert!(s.execute("results.contour", &json!({"field": "von_mises"})).is_err());
+        // Frames, by results.frame or with the slice.
+        assert_eq!(s.execute("results.frame", &json!({"frame": 0})).unwrap()["time"], 0.0);
+        assert_eq!(s.execute("results.slice", &json!({"frame": 1, "axis": "y"})).unwrap()["time"], 1.0);
+        // Streamlines from the inlet, from seeds, along a line; hidden.
+        let r = s.execute("results.streamlines", &json!({"count": 4})).unwrap();
+        assert_eq!((r["traced"]["seeds"].as_u64(), r["traced"]["streamlines"].as_u64()), (Some(4), Some(4)), "{r}");
+        // The reply's trace is the one the plot draws.
+        let (view, result) = (s.results_view.as_ref().unwrap(), s.latest_result("Flow").unwrap().0);
+        let p = crate::flow::plot(view, result, &s.traced).unwrap();
+        let sl = view.flow.as_ref().and_then(|f| f.streamlines.as_ref()).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&p.streamlines, &s.traced.trace(result, 1, sl).unwrap().1));
+        let r = s.execute("results.streamlines", &json!({"seeds": [[0.5, 0.5, 0.5], [5.5, 1.5, 1.5], [50, 0, 0]]})).unwrap();
+        assert_eq!((r["traced"]["streamlines"].as_u64(), r["traced"]["no_start"].as_u64()), (Some(1), Some(2)), "{r}");
+        assert_eq!(r["streamlines"]["seeds"], 3);
+        let r =
+            s.execute("results.streamlines", &json!({"line": {"from": [0.5, 0.5, 0.5], "to": [0.5, 3.5, 3.5]}, "count": 5, "max_steps": 3})).unwrap();
+        assert_eq!((r["traced"]["seeds"].as_u64(), r["traced"]["points"].as_u64()), (Some(5), Some(20)), "{r}");
+        assert!(s.execute("results.streamlines", &json!({"show": false})).unwrap()["streamlines"].is_null());
+        assert_eq!(s.execute("results.surface", &json!({"show": false})).unwrap()["surface"], false);
+        assert!(s.execute("results.animate", &json!({})).is_err(), "nothing deforms");
+        assert_eq!((s.journal.len(), s.revision()), (journal, revision), "display commands are not edits");
+        // Structural steps have none of it.
+        let mut t = solved();
+        for id in ["results.slice", "results.surface", "results.streamlines"] {
+            assert!(t.execute(id, &json!({})).is_err(), "{id}");
+            assert!(t.execute(id, &json!({"step": "Bend"})).is_err(), "{id}");
+        }
+    }
+
+    #[test]
+    fn fluid_display_hostile_params_never_panic() {
+        let s = fluid();
+        let point = json!([0.5, 0.5, 0.5]);
+        let hostile = [
+            json!(null),
+            json!([]),
+            json!({"step": 7}),
+            json!({"step": "Nope"}),
+            json!({"field": "nope"}),
+            json!({"field": 3}),
+            json!({"axis": "w"}),
+            json!({"axis": 1}),
+            json!({"axis": ""}),
+            json!({"position": 1e308}),
+            json!({"position": -1e308}),
+            json!({"position": "middle"}),
+            json!({"position": [1]}),
+            json!({"axis": "z", "position": -0.001}),
+            json!({"frame": -1}),
+            json!({"frame": 2}),
+            json!({"frame": 1e300}),
+            json!({"frame": "last"}),
+            json!({"show": "yes"}),
+            json!({"count": 0}),
+            json!({"count": 2001}),
+            json!({"count": -5}),
+            json!({"count": 1e300}),
+            json!({"count": "many"}),
+            json!({"max_steps": 0}),
+            json!({"max_steps": 100_001}),
+            json!({"max_steps": u64::MAX}),
+            json!({"seeds": []}),
+            json!({"seeds": [[1, 2]]}),
+            json!({"seeds": [[1e300, 0, 0]]}),
+            json!({"seeds": [[1, "x", 0]]}),
+            json!({"seeds": "here"}),
+            json!({"seeds": vec![point.clone(); 2001]}),
+            json!({"seeds": [point], "line": {"from": [0, 0, 0], "to": [1, 1, 1]}}),
+            json!({"line": {"from": [0, 0, 0]}}),
+            json!({"line": 5}),
+            json!({"line": {"from": [0, 0, 0], "to": [1e13, 0, 0]}}),
+            json!({"count": 2000, "max_steps": 100_000}),
+            json!({"seeds": vec![point; 2000], "max_steps": 100_000}),
+        ];
+        for id in
+            ["results.slice", "results.surface", "results.streamlines", "results.frame", "results.contour", "results.deformed", "results.animate"]
+        {
+            for p in &hostile {
+                let mut t = s.clone();
+                let _ = t.execute(id, p);
+                assert_eq!(t.model, s.model);
+                // Whatever was accepted still draws.
+                let _ = crate::view::scene(&t, &crate::view::Palette::LIGHT);
+            }
+        }
     }
 
     #[test]

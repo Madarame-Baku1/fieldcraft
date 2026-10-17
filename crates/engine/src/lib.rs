@@ -17,6 +17,7 @@ pub mod bug_report;
 pub mod catalogue;
 pub mod cmd;
 pub mod crash;
+pub mod flow;
 pub mod logfile;
 
 pub use cmd::analytic_surfaces;
@@ -298,6 +299,9 @@ pub struct Session {
     /// What the last `geometry.check` found, drawn as markers while the design it checked is
     /// open ([`view::geometry_marks`]). Not an edit: neither journalled, saved nor undone.
     pub geometry_marks: Option<Arc<view::GeometryMarks>>,
+    /// The streamlines last traced for a fluid step's display ([`flow::TraceCache`]): the
+    /// `results.streamlines` reply and the plot share them. Not an edit either.
+    pub traced: flow::TraceCache,
 }
 
 impl Session {

@@ -1992,6 +1992,8 @@ pub const CONTOUR: &[Field] = &[
             ("displacement_x", "Displacement X"),
             ("displacement_y", "Displacement Y"),
             ("displacement_z", "Displacement Z"),
+            ("velocity", "Velocity magnitude"),
+            ("pressure", "Pressure (fluid)"),
             ("max_principal", "Max principal"),
             ("mid_principal", "Mid principal"),
             ("min_principal", "Min principal"),
@@ -2029,6 +2031,35 @@ pub const FRAME: &[Field] = &[
     SOLVED,
     int("frame", "Frame", 0, 1_000_000_000).help("The frame shown."),
     positive("time", "Time", D::Time).help("Show the frame nearest this time; the last when empty.").hint("the last frame"),
+];
+const FLUID_FRAME: Field = int("frame", "Frame", 0, 1_000_000_000).help("The frame shown, from 0.").hint("the frame shown");
+pub const SLICE: &[Field] = &[
+    SOLVED,
+    choice("field", "Field", &[("velocity", "Velocity magnitude"), ("pressure", "Pressure")])
+        .help("The field coloured on the slice and the obstacles.")
+        .hint("the field shown"),
+    choice("axis", "Normal", &[("x", "X"), ("y", "Y"), ("z", "Z"), ("none", "None (hide)")])
+        .help("The axis the slice is normal to.")
+        .hint("the slice shown"),
+    number_or_auto("position", "Position", D::Length, None)
+        .help("Where the slice crosses its axis; auto: the domain's middle.")
+        .hint("the position shown"),
+    FLUID_FRAME,
+];
+pub const FLOW_SURFACE: &[Field] = &[SOLVED, flag("show", "Show").help("Colour the obstacles by the field in the fluid beside them.").def("true")];
+pub const STREAMLINES: &[Field] = &[
+    SOLVED,
+    flag("show", "Show").help("Draw the streamlines.").def("true"),
+    int("count", "Count", 1, 2000).help("Seeds on the inlet face, or points along the seed line.").def("64"),
+    int("max_steps", "Max steps", 1, 100_000).help("Most steps of half a cell each streamline takes.").def("4000"),
+    points("seeds", "Seeds", D::Length, 2000).help("The points streamlines start from; the inlet face when empty."),
+    group(
+        "line",
+        "Seed line",
+        &[xyz("from", "From", D::Length).help("The seed line's first end."), xyz("to", "To", D::Length).help("The seed line's last end.")],
+    )
+    .help("Start `count` streamlines evenly along a line instead of the inlet face."),
+    FLUID_FRAME,
 ];
 pub const EXPORT_CSV: &[Field] = &[
     choice("what", "Export", &[("reactions", "Reaction sums"), ("probe", "Probed nodes")]).help("What to write.").req().def("\"reactions\""),

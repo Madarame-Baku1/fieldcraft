@@ -5,19 +5,20 @@
 //! The picture follows the desktop viewport's conventions: geometry draws as faces with their
 //! boundaries while the model has no element faces, then as boundaries only; elements in their
 //! kind's colour with their edges; a results view ([`crate::results::ResultsView`]) draws the
-//! deformed shape (automatic or chosen scale) with its contour bands. Animation is not drawn: a
+//! deformed shape (automatic or chosen scale) with its contour bands, or a fluid step's slice,
+//! coloured obstacles and streamlines over the undeformed part ([`crate::flow`]). Animation is not drawn: a
 //! picture shows the full deformation (a mode at its positive shape). The analysis setup's
 //! symbols ([`fieldcraft_render::glyphs`]) are drawn over the model as the viewport draws them,
 //! muted over a results plot (and only those its step used), at their default size on screen
 //! once the camera is known.
 
 use fieldcraft_model::ElementKind;
-use fieldcraft_render::contour::{bands_color, split_triangle};
+use fieldcraft_render::contour::{banded, bands_color};
 use fieldcraft_render::glyphs::{self, GlyphColors, GlyphShow, GlyphView, Glyphs};
 use fieldcraft_render::{Aabb3, Camera, DisplayMesh, Orientation, Rgb, Scene, SceneLine, ScenePoint, SceneTri, Vec3};
 use serde_json::Value;
 
-use crate::results::{auto_scale, displacements, field_values, range};
+use crate::results::{Kind, auto_scale, displacements, field_values, range};
 use crate::{EngineError, Result, Session};
 
 /// The colours of a picture.
@@ -32,6 +33,9 @@ pub struct Palette {
     pub shell: Rgb,
     pub line_element: Rgb,
     pub mesh_edge: Rgb,
+    /// Streamlines when the legend shows another field than velocity: stands out from the
+    /// background.
+    pub streamline: Rgb,
     /// Nodes, when they are shown.
     pub node: Rgb,
     pub geometry: Rgb,
@@ -66,6 +70,7 @@ impl Palette {
         shell: Rgb(0xc0, 0x8c, 0x78),
         line_element: Rgb(0xc8, 0x8c, 0x1e),
         mesh_edge: Rgb(0x1e, 0x23, 0x2a),
+        streamline: Rgb(0x28, 0x2e, 0x38),
         node: Rgb(0xb4, 0x3c, 0x8c),
         geometry: Rgb(176, 186, 198),
         geometry_edge: Rgb(40, 44, 52),
@@ -303,7 +308,8 @@ pub struct Shown {
     pub step: Option<String>,
     /// The deformation scale factor drawn (0: undeformed).
     pub scale: f64,
-    /// The contour field drawn, with its smallest and largest value and their nodes.
+    /// The contour field drawn, with its smallest and largest value and their nodes (a fluid
+    /// step's: their cells).
     pub contour: Option<(String, (u32, f64), (u32, f64))>,
     /// Bodies that could not be tessellated for display.
     pub failed: Vec<String>,
@@ -500,6 +506,21 @@ fn picture(s: &Session, p: &Palette, section: Option<Section>, toward: Vec3) -> 
         return Picture { scene, drawn: base, bounds, shown, glyphs, colors: p.glyphs, datums, bodies };
     };
     shown.step = Some(view.step.clone());
+    let colors = p.glyphs.over_results(p.background.1);
+    if matches!(result.kind(), Kind::Fluid(_)) {
+        // The part as it is, with the flow drawn through and around it.
+        let mut scene = model_scene(&base, p);
+        let mut bounds = base.bounds;
+        if let Ok(fp) = crate::flow::plot(view, result, &s.traced) {
+            if let Some(c) = &fp.contour {
+                let cell = |(k, v): (usize, f64)| (u32::try_from(k).unwrap_or(u32::MAX), v);
+                shown.contour = Some((c.field.id().to_string(), cell(c.min), cell(c.max)));
+            }
+            crate::flow::draw(&fp, &mut scene, &crate::flow::FlowColors { stops: &p.contour, over: p.contour_over, plain: p.streamline });
+            bounds.union(fp.bounds());
+        }
+        return Picture { scene, drawn: base, bounds, shown, glyphs, colors, datums: Aabb3::EMPTY, bodies };
+    }
     let pick = view.pick();
     let nodes = result.nodes();
     let u = displacements(result, pick).unwrap_or(&[]);
@@ -519,21 +540,15 @@ fn picture(s: &Session, p: &Palette, section: Option<Section>, toward: Vec3) -> 
         shown.contour = Some((field.id().to_string(), min, max));
         let bands = view.bands(min.1, max.1);
         let at = |label: u32| nodes.binary_search(&label).ok().and_then(|i| values.get(i).copied()).unwrap_or(f64::NAN);
+        let color = |band: Option<u32>| band.map_or(p.no_result, |k| bands_color(&p.contour, p.contour_over, &bands, k));
         scene.tris.clear();
         for tri in &drawn.tris {
-            split_triangle(tri.p, tri.nodes.map(at), &bands, &mut |piece, band| {
-                let color = band.map_or(p.no_result, |k| bands_color(&p.contour, p.contour_over, &bands, k));
-                for k in 1..piece.len().saturating_sub(1) {
-                    if let (Some(&a), Some(&b), Some(&c)) = (piece.first(), piece.get(k), piece.get(k + 1)) {
-                        scene.tris.push(SceneTri { p: [a, b, c], normal: tri.normal, color });
-                    }
-                }
-            });
+            banded(tri.p, tri.nodes.map(at), tri.normal, &bands, &color, &mut scene.tris);
         }
     }
     let mut bounds = base.bounds;
     bounds.union(drawn.bounds);
-    Picture { scene, drawn, bounds, shown, glyphs, colors: p.glyphs.over_results(p.background.1), datums: Aabb3::EMPTY, bodies }
+    Picture { scene, drawn, bounds, shown, glyphs, colors, datums: Aabb3::EMPTY, bodies }
 }
 
 /// The scene of the session (the model, or the results view's plot) with the setup's symbols
@@ -1068,6 +1083,34 @@ mod tests {
         ] {
             assert!(camera(&bad).is_err(), "{bad}");
         }
+    }
+
+    /// A fluid step draws the part with its faces coloured by the flow beside them, a coloured
+    /// slice through the domain and streamlines (#193: the part vanished and nothing was drawn).
+    #[test]
+    fn a_fluid_step_draws_its_flow_around_the_part() {
+        let mut s = crate::flow::tests::plate_in_a_tank();
+        let p = Palette::LIGHT;
+        let (base, ..) = display(&s);
+        assert!(!base.surface_tris.is_empty());
+        let part: Vec<Rgb> = model_scene(&base, &p).tris.iter().map(|t| t.color).collect();
+        let (scene, bounds, shown) = super::scene(&s, &p);
+        let (field, min, max) = shown.contour.clone().unwrap();
+        assert!(field == "velocity" && max.1 > min.1, "{shown:?}");
+        assert!(scene.tris.len() > base.surface_tris.len(), "the slice is drawn");
+        assert!(!scene.lines.is_empty(), "streamlines are drawn");
+        let tank = Aabb3 { min: Vec3::new(-20.0, -20.0, -20.0), max: Vec3::new(60.0, 50.0, 30.0) };
+        assert_eq!(bounds, tank, "the picture frames the tank");
+        // The part is coloured by the flow; in its own colours without the surface colours.
+        let in_part_colour = |scene: &Scene| scene.tris.iter().filter(|t| part.contains(&t.color)).count();
+        assert!(in_part_colour(&scene) < base.surface_tris.len());
+        s.execute("results.surface", &json!({"show": false})).unwrap();
+        s.execute("results.slice", &json!({"axis": "none"})).unwrap();
+        s.execute("results.streamlines", &json!({"show": false})).unwrap();
+        let (scene, ..) = super::scene(&s, &p);
+        assert_eq!((in_part_colour(&scene), scene.tris.len()), (base.surface_tris.len(), base.surface_tris.len()), "the part alone");
+        let (png, _) = render_png(&s, &Orientation::of(StandardView::Iso), 160, 120, &p).unwrap();
+        assert!(count_color(&png, p.background.0) < 160 * 120, "the part is in the picture");
     }
 
     /// Pixels of colour `c` (within a few levels) in a PNG.
