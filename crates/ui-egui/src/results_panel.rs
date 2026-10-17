@@ -1,7 +1,8 @@
 //! What the viewport shows over a results plot: the legend (field and unit, bands, range,
 //! deformation scale, a stale-result warning), markers at the contour's largest and smallest
 //! value, and the probed node; and the results controls of the context panel (right), which run
-//! the `results.*` commands. Numbers go through one formatter ([`crate::results::number`]) with
+//! the `results.*` commands (a fluid step's: its slice, coloured obstacles, streamlines and
+//! frames). Numbers go through one formatter ([`crate::results::number`]) with
 //! the units of the model's unit system ([`Quantity`]).
 
 use egui::{Align2, Color32, FontId, Pos2, Rect, RichText, Stroke, pos2, vec2};
@@ -53,10 +54,14 @@ pub fn show(app: &mut ModelApp, ui: &mut egui::Ui, rect: Rect, t: &Tokens) {
     }
 }
 
-/// Turn the view about node `node` of the plot (keeping the zoom) and probe it.
+/// Turn the view about node `node` of the plot (keeping the zoom) and probe it; a fluid step's
+/// extreme is a cell, turned about only.
 fn focus_node(app: &mut ModelApp, plot: &Plot, node: u32) {
-    if let Some(at) = plot.node_position(node).filter(|p| p.is_finite()) {
+    if let Some(at) = plot.extreme_position(node).filter(|p| p.is_finite()) {
         app.cam.target = at;
+    }
+    if plot.is_fluid() {
+        return;
     }
     // A failure (a stale result) shows in the status bar.
     let _ = app.probe_node(node);
@@ -103,7 +108,11 @@ fn extreme_lines(plot: &Plot) -> Option<[(String, u32); 2]> {
     let l = plot.contour.as_ref()?;
     let unit = l.field.unit(&plot.result, plot.units);
     let scale = l.max.1.abs().max(l.min.1.abs());
-    let line = |what: &str, (node, v): (u32, f64)| (format!("{what} {} at node {node}", with_unit(number_in(v, scale), unit.as_deref())), node);
+    let at = |node: u32| match plot.extreme_position(node).filter(|_| plot.is_fluid()) {
+        Some(p) => format!("at {}", components(&[p.x, p.y, p.z], 0.0)),
+        None => format!("at node {node}"),
+    };
+    let line = |what: &str, (node, v): (u32, f64)| (format!("{what} {} {}", with_unit(number_in(v, scale), unit.as_deref()), at(node)), node);
     Some([line("Max", l.max), line("Min", l.min)])
 }
 
@@ -125,7 +134,9 @@ fn legend_layout(plot: &Plot, painter: &egui::Painter, rect: Rect, t: &Tokens) -
         }
     }
     lines.push((step, t.overlay_text));
-    lines.push((deformation(plot), t.text_dim));
+    if !plot.is_fluid() {
+        lines.push((deformation(plot), t.text_dim));
+    }
     if let Some(l) = plot.contour.as_ref().filter(|_| plot.view.range_min.is_some() || plot.view.range_max.is_some()) {
         let scale = l.max.1.abs().max(l.min.1.abs());
         lines.push((format!("Legend clamped to {} … {}", number_in(l.bands.min, scale), number_in(l.bands.max, scale)), t.warm));
@@ -206,17 +217,32 @@ fn legend(plot: &Plot, painter: &egui::Painter, rect: Rect, t: &Tokens) -> Vec<(
     out
 }
 
-/// A box of `text` beside the screen point `at`, kept inside `bounds`: right of the point, or left
-/// of it when it would run off the right edge; held inside top and bottom.
-fn label_beside(painter: &egui::Painter, at: Pos2, text: String, bounds: Rect, t: &Tokens) {
-    let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), t.overlay_text);
-    let size = galley.size() + 2.0 * LABEL_PAD;
+/// Where a label box of `size` goes beside the screen point `at`, kept inside `bounds`: right of
+/// the point, or left of it when it would run off the right edge; held inside top and bottom.
+/// When it would cover `avoid` (a label already placed), it goes under that box, or over it
+/// when under runs off the bottom.
+fn label_box(at: Pos2, size: egui::Vec2, bounds: Rect, avoid: Option<Rect>) -> Rect {
     let right = at + vec2(LABEL_GAP, -size.y / 2.0);
-    let x = if right.x + size.x > bounds.right() { at.x - LABEL_GAP - size.x } else { right.x };
-    let y = right.y.clamp(bounds.top(), (bounds.bottom() - size.y).max(bounds.top()));
-    let box_rect = Rect::from_min_size(pos2(x.max(bounds.left()), y), size);
+    let x = if right.x + size.x > bounds.right() { at.x - LABEL_GAP - size.x } else { right.x }.max(bounds.left());
+    let inside = |y: f32| y.clamp(bounds.top(), (bounds.bottom() - size.y).max(bounds.top()));
+    let at_y = |y: f32| Rect::from_min_size(pos2(x, inside(y)), size);
+    let beside = at_y(right.y);
+    match avoid.filter(|a| a.intersects(beside)) {
+        None => beside,
+        Some(a) => {
+            let under = at_y(a.bottom() + LABEL_PAD.y);
+            if under.intersects(a) { at_y(a.top() - LABEL_PAD.y - size.y) } else { under }
+        }
+    }
+}
+
+/// A box of `text` beside the screen point `at` ([`label_box`]); returns where it went.
+fn label_beside(painter: &egui::Painter, at: Pos2, text: String, bounds: Rect, avoid: Option<Rect>, t: &Tokens) -> Rect {
+    let galley = painter.layout_no_wrap(text, FontId::proportional(12.0), t.overlay_text);
+    let box_rect = label_box(at, galley.size() + 2.0 * LABEL_PAD, bounds, avoid);
     painter.rect_filled(box_rect, 4.0, t.overlay);
     painter.galley(box_rect.left_top() + LABEL_PAD, galley, t.overlay_text);
+    box_rect
 }
 
 /// Markers with their values at the contour's largest and smallest value.
@@ -225,13 +251,15 @@ fn markers(app: &ModelApp, plot: &Plot, painter: &egui::Painter, rect: Rect, t: 
     let unit = l.field.unit(&plot.result, plot.units);
     let scale = l.max.1.abs().max(l.min.1.abs());
     let (high, low) = (t.contour[4], t.contour[0]);
+    // The Min label keeps off the Max label when the two cells are close on screen.
+    let mut placed = None;
     for (what, (node, v), color) in [("Max", l.max, high), ("Min", l.min, low)] {
-        let Some(at) = plot.node_position(node).and_then(|w| crate::viewport::to_screen(app, w)) else { continue };
+        let Some(at) = plot.extreme_position(node).and_then(|w| crate::viewport::to_screen(app, w)) else { continue };
         if !rect.contains(at) {
             continue;
         }
         painter.circle(at, 5.0, color, Stroke::new(2.0, t.overlay_text));
-        label_beside(painter, at, format!("{what} {}", with_unit(number_in(v, scale), unit.as_deref())), rect, t);
+        placed = Some(label_beside(painter, at, format!("{what} {}", with_unit(number_in(v, scale), unit.as_deref())), rect, placed, t));
     }
 }
 
@@ -249,7 +277,7 @@ fn probe(app: &ModelApp, plot: &Plot, painter: &egui::Painter, rect: Rect, t: &T
     let Some(p) = app.probe.as_ref().filter(|p| p.step == plot.view.step && p.mode == plot.pick.mode && p.frame == plot.pick.frame) else { return };
     let Some(at) = plot.node_position(p.node).and_then(|w| crate::viewport::to_screen(app, w)) else { return };
     painter.circle(at, 5.0, t.accent, Stroke::new(2.0, t.overlay_text));
-    label_beside(painter, at, p.lines.join("\n"), rect, t);
+    label_beside(painter, at, p.lines.join("\n"), rect, None, t);
 }
 
 /// The results controls (the context panel's Results section): step, contour field,
@@ -308,40 +336,11 @@ pub fn controls(app: &mut ModelApp, plot: &Plot, ui: &mut egui::Ui, t: &Tokens) 
                 ui.end_row();
             }
         }
-        ui.label("Deformed");
-        ui.horizontal(|ui| {
-            let mut deformed = plot.view.deformed;
-            if ui.checkbox(&mut deformed, "").changed() {
-                run.push(("results.deformed", json!({"show": deformed})));
-            }
-            let mut auto = plot.view.scale.is_none();
-            let tip = if true_scale(&plot.result) {
-                "Draw the displacements at true scale (they are large already)"
-            } else {
-                "Scale the largest displacement to a tenth of the model"
-            };
-            if ui.checkbox(&mut auto, "Auto").on_hover_text(tip).changed() {
-                run.push(("results.deformed", json!({"scale": if auto { json!("auto") } else { json!(plot.scale) }})));
-            }
-            // The scale ticking Deformed draws with, also while it is off.
-            let mut scale = plot.scale;
-            let drag = egui::DragValue::new(&mut scale)
-                .speed(plot.scale.abs().max(1e-6) * 0.01)
-                .range(0.0..=1e12)
-                .prefix("× ")
-                .custom_formatter(|v, _| number(v))
-                .custom_parser(|s| s.replace(',', "").trim().parse::<f64>().ok());
-            if ui.add_enabled(plot.view.deformed, drag).changed() {
-                run.push(("results.deformed", json!({"scale": scale})));
-            }
-        });
-        ui.end_row();
-        ui.label("Animate");
-        let mut animate = plot.view.animate;
-        if ui.checkbox(&mut animate, "").changed() {
-            run.push(("results.animate", json!({"on": animate})));
+        if plot.is_fluid() {
+            flow_rows(plot, ui, &mut run);
+        } else {
+            deformation_rows(plot, ui, &mut run);
         }
-        ui.end_row();
         ui.label("Show");
         ui.horizontal(|ui| {
             if plot.contour.is_some() {
@@ -354,6 +353,17 @@ pub fn controls(app: &mut ModelApp, plot: &Plot, ui: &mut egui::Ui, t: &Tokens) 
     if let Kind::Explicit(e) = plot.result.kind() {
         ui.separator();
         explicit(ui, e, plot, t, &mut run);
+    } else if let Some((k, at, n)) = plot.frame().filter(|_| plot.is_fluid()) {
+        // A fluid step: its frames, the slice, the obstacles and the streamlines following.
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.label("Frame");
+            let mut frame = k;
+            if ui.add(egui::Slider::new(&mut frame, 0..=n.saturating_sub(1))).changed() {
+                run.push(("results.frame", json!({"frame": frame})));
+            }
+        });
+        ui.label(RichText::new(format!("t = {}", with_unit(number(at), Quantity::Time.unit(plot.units).as_deref()))).color(t.text_dim));
     } else if let Some((k, factor, n)) = plot.frame().filter(|_| matches!(plot.result.kind(), Kind::Static(_))) {
         // A nonlinear static step: its increments, the deformed shape following the slider.
         ui.separator();
@@ -419,6 +429,100 @@ pub fn controls(app: &mut ModelApp, plot: &Plot, ui: &mut egui::Ui, t: &Tokens) 
         // The reaction sums land in `app.reactions` (ModelApp::run_form).
         let _ = app.run(id, params);
     }
+}
+
+/// The deformation rows of the results grid: Deformed (with its scale) and Animate.
+fn deformation_rows(plot: &Plot, ui: &mut egui::Ui, run: &mut Vec<(&'static str, Value)>) {
+    ui.label("Deformed");
+    ui.horizontal(|ui| {
+        let mut deformed = plot.view.deformed;
+        if ui.checkbox(&mut deformed, "").changed() {
+            run.push(("results.deformed", json!({"show": deformed})));
+        }
+        let mut auto = plot.view.scale.is_none();
+        let tip = if true_scale(&plot.result) {
+            "Draw the displacements at true scale (they are large already)"
+        } else {
+            "Scale the largest displacement to a tenth of the model"
+        };
+        if ui.checkbox(&mut auto, "Auto").on_hover_text(tip).changed() {
+            run.push(("results.deformed", json!({"scale": if auto { json!("auto") } else { json!(plot.scale) }})));
+        }
+        // The scale ticking Deformed draws with, also while it is off.
+        let mut scale = plot.scale;
+        let drag = egui::DragValue::new(&mut scale)
+            .speed(plot.scale.abs().max(1e-6) * 0.01)
+            .range(0.0..=1e12)
+            .prefix("× ")
+            .custom_formatter(|v, _| number(v))
+            .custom_parser(|s| s.replace(',', "").trim().parse::<f64>().ok());
+        if ui.add_enabled(plot.view.deformed, drag).changed() {
+            run.push(("results.deformed", json!({"scale": scale})));
+        }
+    });
+    ui.end_row();
+    ui.label("Animate");
+    let mut animate = plot.view.animate;
+    if ui.checkbox(&mut animate, "").changed() {
+        run.push(("results.animate", json!({"on": animate})));
+    }
+    ui.end_row();
+}
+
+/// A fluid step's rows of the results grid: the slice (its normal, position), the obstacles'
+/// colours and the streamlines (their count from the inlet).
+fn flow_rows(plot: &Plot, ui: &mut egui::Ui, run: &mut Vec<(&'static str, Value)>) {
+    use fieldcraft_engine::flow::{Axis, slice_position};
+    let (Kind::Fluid(f), Some(flow)) = (plot.result.kind(), plot.flow.as_ref()) else { return };
+    let view = &flow.view;
+    ui.label("Slice");
+    ui.horizontal(|ui| {
+        let shown = view.slice.as_ref().map_or("None", |s| s.axis.id());
+        egui::ComboBox::from_id_salt("fc_results_slice").selected_text(format!("Normal {}", shown.to_uppercase())).width(90.0).show_ui(ui, |ui| {
+            if ui.selectable_label(view.slice.is_none(), "None").clicked() {
+                run.push(("results.slice", json!({"axis": "none"})));
+            }
+            for a in Axis::ALL {
+                if ui.selectable_label(view.slice.as_ref().is_some_and(|s| s.axis == a), format!("Normal {}", a.id().to_uppercase())).clicked() {
+                    run.push(("results.slice", json!({"axis": a.id()})));
+                }
+            }
+        });
+        if let Some(s) = &view.slice {
+            let (lo, hi) = (flow.grid.start(s.axis.index()), flow.grid.end(s.axis.index()));
+            let mut at = slice_position(f, s);
+            let drag = egui::DragValue::new(&mut at)
+                .speed((hi - lo).abs().max(1e-9) * 0.002)
+                .range(lo..=hi)
+                .custom_formatter(|v, _| number(v))
+                .custom_parser(|s| s.replace(',', "").trim().parse::<f64>().ok());
+            if ui.add(drag).on_hover_text("Where the slice crosses its axis").changed() {
+                run.push(("results.slice", json!({"position": at})));
+            }
+        }
+    });
+    ui.end_row();
+    ui.label("Obstacles");
+    let mut surface = view.surface;
+    if ui.checkbox(&mut surface, "Coloured").on_hover_text("Colour the part by the field in the fluid beside it").changed() {
+        run.push(("results.surface", json!({"show": surface})));
+    }
+    ui.end_row();
+    ui.label("Streamlines");
+    ui.horizontal(|ui| {
+        let mut on = view.streamlines.is_some();
+        if ui.checkbox(&mut on, "").on_hover_text("Streamlines from the inlet, coloured by speed when the legend shows velocity").changed() {
+            run.push(("results.streamlines", json!({"show": on})));
+        }
+        if let Some(sl) = &view.streamlines {
+            let mut count = sl.count;
+            let drag = egui::DragValue::new(&mut count).range(1..=fieldcraft_engine::flow::MAX_STREAMLINES).speed(1.0).suffix(" seeds");
+            if ui.add(drag).on_hover_text("Seeds on the inlet face, upstream of the obstacles").changed() {
+                run.push(("results.streamlines", json!({"count": count})));
+            }
+        }
+    });
+    ui.end_row();
 }
 
 /// The probed node's values, one row each, or how to probe one; the export's parameters when
@@ -817,5 +921,33 @@ fn reactions_table(ui: &mut egui::Ui, r: &Value, plot: &Plot, t: &Tokens) {
             (format!("Reactions and applied loads differ by {}", with_unit(number(residual), force.as_deref())), t.warm)
         };
         ui.label(RichText::new(text).small().color(color));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A label goes right of its point, left when right runs off, inside the top and bottom;
+    /// one that would cover a placed label goes under it, or over it at the bottom edge.
+    #[test]
+    fn labels_keep_inside_the_view_and_off_each_other() {
+        let bounds = Rect::from_min_max(pos2(0.0, 0.0), pos2(400.0, 300.0));
+        let size = vec2(80.0, 20.0);
+        let a = label_box(pos2(100.0, 150.0), size, bounds, None);
+        assert_eq!(a, Rect::from_min_size(pos2(100.0 + LABEL_GAP, 140.0), size));
+        assert_eq!(label_box(pos2(380.0, 150.0), size, bounds, None).min, pos2(380.0 - LABEL_GAP - 80.0, 140.0));
+        assert_eq!(label_box(pos2(100.0, 2.0), size, bounds, None).min.y, 0.0);
+        assert_eq!(label_box(pos2(100.0, 299.0), size, bounds, None).max.y, 300.0);
+        // Far apart: unmoved. Overlapping: under the placed one, apart by the label padding.
+        assert_eq!(label_box(pos2(100.0, 250.0), size, bounds, Some(a)), Rect::from_min_size(pos2(100.0 + LABEL_GAP, 240.0), size));
+        let b = label_box(pos2(104.0, 156.0), size, bounds, Some(a));
+        assert_eq!(b.min, pos2(104.0 + LABEL_GAP, a.max.y + LABEL_PAD.y));
+        assert!(!b.intersects(a));
+        // Placed at the bottom edge: the second goes over it.
+        let low = label_box(pos2(100.0, 299.0), size, bounds, None);
+        let over = label_box(pos2(100.0, 295.0), size, bounds, Some(low));
+        assert_eq!(over.max.y, low.min.y - LABEL_PAD.y);
+        assert!(!over.intersects(low));
     }
 }

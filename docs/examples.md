@@ -67,8 +67,10 @@ Reynolds number and rises as it falls); the lattice's mass changes by less than 
 
 ![The L-bracket the air flows past, as the sample opens](media/examples/flow-past.png)
 
-The picture shows the bracket only: the viewport does not draw flow results yet (velocity
-slices and streamlines are planned in M12), so the results are numbers for now.
+The picture shows the bracket as the sample opens. After Solve the viewport draws the flow:
+velocity magnitude on a slice through the middle of the box (`results.slice`; pressure with
+`field: "pressure"`), the bracket coloured by the flow beside it (`results.surface`) and
+streamlines seeded upstream of it, coloured by speed (`results.streamlines`).
 
 ## Heated bracket (`heated-bracket`)
 

@@ -4,14 +4,16 @@
 //! ([`fieldcraft_render::contour`]); animation steps the deformation through a fixed number of
 //! frames per cycle (an explicit step's animation runs through its field frames, contours
 //! following). A plot of a stale result (the model changed since the solve) is drawn the
-//! same way and marked.
+//! same way and marked. A fluid step draws the part as it is, with the engine's flow display
+//! ([`fieldcraft_engine::flow`]: a slice, the obstacles coloured and streamlines) through it.
 
 use std::sync::Arc;
 
+use fieldcraft_engine::flow::FlowPlot;
 use fieldcraft_engine::results::{Field, Kind, Pick, ResultsView, auto_scale, displacements, field_values, range};
 use fieldcraft_engine::{Session, StepResult};
-use fieldcraft_render::contour::{Bands, bands_color, split_triangle};
-use fieldcraft_render::{DisplayMesh, Scene, SceneTri, Vec3};
+use fieldcraft_render::contour::{Bands, banded, bands_color};
+use fieldcraft_render::{DisplayMesh, Scene, Vec3};
 
 use crate::Style;
 use crate::theme::{Tokens, rgb};
@@ -29,10 +31,10 @@ const ROUND_OFF: f64 = 1e-9;
 pub struct Contour {
     pub field: Field,
     pub bands: Bands,
-    /// The smallest and largest value and their nodes.
+    /// The smallest and largest value and their nodes (a fluid step's: their cells).
     pub min: (u32, f64),
     pub max: (u32, f64),
-    /// The value at every node, in the result's node order.
+    /// The value at every node, in the result's node order (empty for a fluid step's cells).
     pub values: Vec<f64>,
 }
 
@@ -56,6 +58,8 @@ pub struct Plot {
     /// The elements as drawn (deformed at the current animation frame).
     pub display: DisplayMesh,
     pub contour: Option<Arc<Contour>>,
+    /// A fluid step's slice, coloured obstacles and streamlines.
+    pub flow: Option<Arc<FlowPlot>>,
     /// The mode and field frame drawn.
     pub pick: Pick,
     /// The model's unit system, which the numbers shown with the plot are in.
@@ -67,6 +71,7 @@ pub struct Plot {
 pub struct Prepared {
     pub scale: f64,
     pub contour: Option<Arc<Contour>>,
+    pub flow: Option<Arc<FlowPlot>>,
 }
 
 /// A mode's value as the results show it: its frequency, or a buckling mode's load factor.
@@ -95,6 +100,7 @@ impl Plot {
                 (frames.len(), &|k| frames.get(k).map(|f| f.load_factor))
             }
             Kind::Heat(h) if h.times.len() > 1 => (h.times.len(), &|k| h.times.get(k).copied()),
+            Kind::Fluid(f) => (f.frames.len(), &|k| f.frames.get(k).map(|f| f.time)),
             _ => return None,
         };
         let k = self.pick.frame.unwrap_or(n.checked_sub(1)?);
@@ -104,6 +110,19 @@ impl Plot {
     /// The node's position in the plot, if it is drawn.
     pub fn node_position(&self, label: u32) -> Option<Vec3> {
         self.display.node_position(label)
+    }
+
+    /// Where a contour extreme is: its node's position, or a fluid step's cell centre.
+    pub fn extreme_position(&self, label: u32) -> Option<Vec3> {
+        match self.result.kind() {
+            Kind::Fluid(f) => Some(Vec3::from(fieldcraft_engine::flow::cell_centre(f, usize::try_from(label).ok()?))),
+            _ => self.node_position(label),
+        }
+    }
+
+    /// Whether it shows a fluid step (fields per cell, no deformation).
+    pub fn is_fluid(&self) -> bool {
+        matches!(self.result.kind(), Kind::Fluid(_))
     }
 }
 
@@ -158,6 +177,15 @@ pub fn scale(view: &ResultsView, result: &StepResult, pick: Pick, base: &Display
 /// animation's deformation multiplier: the deformation scale and the contour values.
 pub fn prepare(session: &Session, base: &DisplayMesh, pick: Pick) -> Option<Prepared> {
     let (view, result, _) = shown(session)?;
+    if matches!(result.kind(), Kind::Fluid(_)) {
+        let flow = fieldcraft_engine::flow::plot(view, result, &session.traced).ok();
+        let cell = |(k, v): (usize, f64)| (u32::try_from(k).unwrap_or(u32::MAX), v);
+        let contour = flow
+            .as_ref()
+            .and_then(|p| p.contour.as_ref())
+            .map(|c| Arc::new(Contour { field: c.field, bands: c.bands, min: cell(c.min), max: cell(c.max), values: Vec::new() }));
+        return Some(Prepared { scale: 0.0, contour, flow: flow.map(Arc::new) });
+    }
     let contour = view.contour.and_then(|field| {
         let mut values = field_values(&session.model, result, field, pick).ok()?;
         // The range (and the bands) follow what is drawn: a hidden body's nodes have no value.
@@ -169,7 +197,7 @@ pub fn prepare(session: &Session, base: &DisplayMesh, pick: Pick) -> Option<Prep
         let (min, max) = range(result.nodes(), &values)?;
         Some(Arc::new(Contour { field, bands: view.bands(min.1, max.1), min, max, values }))
     });
-    Some(Prepared { scale: scale(view, result, pick, base), contour })
+    Some(Prepared { scale: scale(view, result, pick, base), contour, flow: None })
 }
 
 /// The plot of the session's results view on the model's display data at animation `frame`,
@@ -180,10 +208,15 @@ pub fn plot(session: &Session, base: &DisplayMesh, frame: Option<u64>, prepared:
     let pick = pick(view, result, frame);
     let factor = if view.deformed { prepared.scale * swing(result, frame) } else { 0.0 };
     let u = displacements(result, pick).unwrap_or(&[]);
-    let display = base.displaced(|label| {
-        let i = nodes.binary_search(&label).ok()?;
-        u.get(i).map(|d| Vec3::from(*d) * factor)
-    });
+    // A fluid step does not move the part: it stays drawn as it is, geometry included.
+    let display = if matches!(result.kind(), Kind::Fluid(_)) {
+        base.clone()
+    } else {
+        base.displaced(|label| {
+            let i = nodes.binary_search(&label).ok()?;
+            u.get(i).map(|d| Vec3::from(*d) * factor)
+        })
+    };
     Some(Plot {
         view: view.clone(),
         result: result.clone(),
@@ -191,30 +224,32 @@ pub fn plot(session: &Session, base: &DisplayMesh, frame: Option<u64>, prepared:
         scale: prepared.scale,
         display,
         contour: prepared.contour.clone(),
+        flow: prepared.flow.clone(),
         pick,
         units: session.model.units(),
     })
 }
 
 /// The scene of a plot: the deformed elements drawn as the model is ([`scene::build`]), with
-/// their faces split into contour bands when a field is shown. Over a plot, hiding the mesh hides
-/// the element edges: the result itself never vanishes with them.
+/// their faces split into contour bands when a field is shown; a fluid step's part as it is with
+/// the flow drawn through it ([`fieldcraft_engine::flow::draw`]). Over a plot, hiding the mesh
+/// hides the element edges: the result itself never vanishes with them.
 pub fn scene(plot: &Plot, style: Style, show: crate::scene::Show, t: &Tokens) -> Scene {
     let (style, show) = if show.mesh { (style, show) } else { (Style::Shaded, crate::scene::Show { mesh: true, ..show }) };
     let mut s = crate::scene::build(&plot.display, style, show, t);
+    if let Some(flow) = &plot.flow {
+        let stops = t.contour_stops();
+        let colors = fieldcraft_engine::flow::FlowColors { stops: &stops, over: rgb(t.contour_over), plain: rgb(t.streamline) };
+        fieldcraft_engine::flow::draw(flow, &mut s, &colors);
+        return s;
+    }
     let Some(c) = plot.contour.as_ref().filter(|_| style != Style::Wireframe && show.mesh) else { return s };
     let nodes = plot.result.nodes();
     let stops = t.contour_stops();
+    let color = |band: Option<u32>| band.map_or(rgb(t.no_result), |k| bands_color(&stops, rgb(t.contour_over), &c.bands, k));
     s.tris.clear();
     for tri in &plot.display.tris {
-        split_triangle(tri.p, tri.nodes.map(|l| c.at(nodes, l)), &c.bands, &mut |piece, band| {
-            let color = band.map_or(rgb(t.no_result), |k| bands_color(&stops, rgb(t.contour_over), &c.bands, k));
-            for k in 1..piece.len().saturating_sub(1) {
-                if let (Some(&a), Some(&b), Some(&cc)) = (piece.first(), piece.get(k), piece.get(k + 1)) {
-                    s.tris.push(SceneTri { p: [a, b, cc], normal: tri.normal, color });
-                }
-            }
-        });
+        banded(tri.p, tri.nodes.map(|l| c.at(nodes, l)), tri.normal, &c.bands, &color, &mut s.tris);
     }
     s
 }
@@ -374,6 +409,52 @@ pub(crate) mod tests {
         let hidden = super::scene(&p, Style::ShadedEdges, crate::scene::Show { mesh: false, ..crate::scene::Show::DEFAULT }, &t);
         assert_eq!(hidden.tris, scene.tris);
         assert!(hidden.lines.iter().all(|l| l.color != rgb(t.mesh_edge)), "no element edges");
+    }
+
+    /// A 40 × 30 × 10 mm plate in a tank of 5 mm cells, a liquid flowing past it along x, solved.
+    fn plate_in_a_tank() -> Session {
+        use fieldcraft_geometry::sample::{Plate, plate_design};
+        let dir = std::env::temp_dir().join(format!("fieldcraft-ui-flow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plate.solidcraft");
+        std::fs::write(&path, plate_design(&Plate::default()).unwrap()).unwrap();
+        let mut s = Session::default();
+        s.execute("geometry.open", &json!({"path": path.to_str().unwrap()})).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        s.run_script(&json!([
+            {"command": "model.material.create", "params": {"name": "Water", "density": 1e-9, "fluid": {"type": "newtonian", "viscosity": 1e-7}}},
+            {"command": "model.fluid_domain.create", "params": {"name": "Tank", "material": "Water", "min": [-20, -20, -20], "max": [60, 50, 30], "spacing": 5, "obstacles": ["Body1"],
+                "faces": {"x_min": {"type": "velocity", "velocity": [10, 0, 0]}, "x_max": {"type": "pressure", "pressure": 0}}}},
+            {"command": "model.step.create", "params": {"name": "Flow", "procedure": {"type": "fluid", "domain": "Tank", "steps": 60, "frames": 2}}},
+        ]))
+        .unwrap();
+        s.execute("solve.fluid", &json!({})).unwrap();
+        s
+    }
+
+    /// After a fluid solve the part stays drawn and the flow is drawn through it: velocity on a
+    /// slice and on the part, with its legend, and streamlines (#193).
+    #[test]
+    fn a_fluid_step_keeps_the_part_and_draws_the_flow() {
+        let mut s = plate_in_a_tank();
+        let (base, _) = fieldcraft_engine::view::display(&s);
+        assert!(!base.surface_tris.is_empty());
+        let p = plot_at(&s, &base, None).unwrap();
+        assert!(p.is_fluid() && p.flow.is_some());
+        assert_eq!(p.display.surface_tris, base.surface_tris, "the part stays");
+        let legend = p.contour.clone().unwrap();
+        assert!(legend.field == Field::Velocity && legend.max.1 > legend.min.1, "{legend:?}");
+        let at = p.extreme_position(legend.max.0).unwrap();
+        assert!(at.x > -20.0 && at.x < 60.0, "{at:?}");
+        assert_eq!(p.frame().map(|(k, _, n)| (k, n)), Some((2, 3)));
+        let t = Tokens::light();
+        let scene = scene(&p, Style::ShadedEdges, crate::scene::Show::DEFAULT, &t);
+        assert!(scene.tris.len() > base.surface_tris.len(), "the slice is drawn");
+        assert!(!scene.lines.is_empty(), "streamlines and the part's edges are drawn");
+        // Pressure on the slice; the first frame (at rest at the inlet speed everywhere).
+        s.execute("results.slice", &json!({"field": "pressure", "frame": 0})).unwrap();
+        let p = plot_at(&s, &base, None).unwrap();
+        assert_eq!((p.contour.as_ref().map(|c| c.field), p.pick.frame), (Some(Field::Pressure), Some(0)));
     }
 
     #[test]

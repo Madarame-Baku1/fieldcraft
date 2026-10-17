@@ -1387,6 +1387,10 @@ impl ModelApp {
         let mut bounds = self.display.1.bounds;
         if let Some(p) = &self.plot.1 {
             bounds.union(p.display.bounds);
+            // A fluid step's slice and streamlines fill its domain.
+            if let Some(f) = &p.flow {
+                bounds.union(f.bounds());
+            }
         }
         // Reference points are places in the model, framed with it (their symbols are not).
         for p in self.session.model.reference_points().values() {

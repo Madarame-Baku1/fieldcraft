@@ -133,6 +133,18 @@ pub fn done(command: &str, label: &str, params: &Value, v: &Value) -> String {
             Some(f) => format!("Showing {step} frame {f}"),
             None => format!("Showing {step}, last frame"),
         }),
+        "results.slice" => Some(match (v["slice"]["axis"].as_str(), v["slice"]["position"].as_f64()) {
+            (Some(axis), Some(at)) => {
+                let field = v.pointer("/contour/label").and_then(Value::as_str).unwrap_or("The flow");
+                format!("{field} on a slice at {axis} = {}", crate::describe::quantity(at))
+            }
+            _ => format!("Slice off on {step}"),
+        }),
+        "results.surface" => Some(if v["surface"] == true { "Obstacles coloured by the flow" } else { "Obstacles in their own colours" }.to_string()),
+        "results.streamlines" => Some(match v.pointer("/traced/streamlines").and_then(Value::as_u64) {
+            Some(n) => format!("Traced {}", plural(n, "streamline")),
+            None => "Streamlines off".to_string(),
+        }),
         "results.clear" => Some("Back to the model".to_string()),
         "results.xy" => {
             let points = v.get("points").and_then(Value::as_u64).unwrap_or(0);
