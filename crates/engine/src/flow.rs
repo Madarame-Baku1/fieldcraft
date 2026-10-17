@@ -422,8 +422,8 @@ pub(crate) mod tests {
         let solid: Vec<bool> = (0..n).map(|c| matches!(grid.coords(c), [5 | 6, 1 | 2, 1 | 2])).collect();
         let velocity: Vec<[f32; 3]> = (0..n).map(|c| if solid[c] { [0.0; 3] } else { [grid.coords(c)[0] as f32 + 1.0, 0.0, 0.0] }).collect();
         let pressure: Vec<f32> = (0..n).map(|c| if solid[c] { 0.0 } else { 10.0 - grid.coords(c)[0] as f32 }).collect();
-        let at_rest = Frame { time: 0.0, step: 0, velocity: vec![[0.0; 3]; n], pressure: vec![0.0; n], mass: 1.0 };
-        let last = Frame { time: 1.0, step: 10, velocity, pressure, mass: 1.0 };
+        let at_rest = Frame { time: 0.0, step: 0, velocity: vec![[0.0; 3]; n], pressure: vec![0.0; n], temperature: Vec::new(), mass: 1.0 };
+        let last = Frame { time: 1.0, step: 10, velocity, pressure, temperature: Vec::new(), mass: 1.0 };
         let stats = FluidStats {
             cells: n,
             fluid_cells: n - 8,
@@ -438,6 +438,7 @@ pub(crate) mod tests {
             mach: 0.1,
             cell_updates: 0,
             backend: "cpu".into(),
+            tau_thermal: None,
         };
         FluidResult {
             step: "Flow".into(),
@@ -446,6 +447,7 @@ pub(crate) mod tests {
             frames: vec![at_rest, last],
             history_times: Vec::new(),
             forces: Vec::new(),
+            heat: Vec::new(),
             stats,
             warnings: Vec::new(),
         }

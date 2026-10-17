@@ -100,7 +100,7 @@ pub const HISTORY: CommandSpec = CommandSpec {
 pub const FLUID: CommandSpec = CommandSpec {
     id: "solve.fluid",
     label: "Solve Fluid Step",
-    params: r#"{"step": "Flow", "backend": "cpu", "max_cells": 16000000, "max_steps": 10000000, "max_cell_updates": 1e12, "max_frame_bytes": 2e9, "threads": 8} — runs a fluid step with the lattice Boltzmann solver (the only fluid step when `step` is left out): obstacles are triangulated from the open design or taken from imported surfaces; returns the time step, relaxation time, Mach number, mass and the final force on every wall; `backend` is `cpu` (the default: double precision, the same result on every machine) or `gpu` (the step on the GPU `FIELDCRAFT_GPU` picks, single precision, within the backend's stated tolerance of the CPU; an error when the build has none); the caps may only be lowered; `threads` as for solve.static"#,
+    params: r#"{"step": "Flow", "backend": "cpu", "max_cells": 16000000, "max_steps": 10000000, "max_cell_updates": 1e12, "max_frame_bytes": 2e9, "threads": 8} — runs a fluid step with the lattice Boltzmann solver (the only fluid step when `step` is left out): obstacles are triangulated from the open design or taken from imported surfaces; returns the time step, relaxation time, Mach number, mass, the final force on every wall and, with heat, the thermal relaxation time, the temperature range and the heat into every wall; `backend` is `cpu` (the default: double precision, the same result on every machine) or `gpu` (the step on the GPU `FIELDCRAFT_GPU` picks, single precision, within the backend's stated tolerance of the CPU; an error when the build has none); the caps may only be lowered; `threads` as for solve.static"#,
     form: Some(super::forms::SOLVE_FLUID),
     kind: CommandKind::Model,
     requires: &[Requirement::FluidDomain, Requirement::Step],
@@ -110,7 +110,7 @@ pub const FLUID: CommandSpec = CommandSpec {
 pub const PROBE: CommandSpec = CommandSpec {
     id: "solve.probe",
     label: "Probe Results",
-    params: r#"{"step": "Load", "nodes": [1, 2] (or "set": "fillet", a set's nodes), "mode": 1, "frame": 0} — the stored result at nodes (with `max_von_mises`, the largest among them, for static steps): displacement, rotation, reaction, reaction moment, stress and von Mises (static, with `elements` each element's results: solid, 2D and truss nodal stresses (and, in a nonlinear step, the equivalent plastic strain at the integration points of a plastic element), shell section forces (N, M, Q per length in the element's axes) and bottom, middle and top stresses, beam end forces (N, V_y, V_z, T, M_y, M_z in its axes)), the shape of mode `mode` with its rotations (frequency, from 1), or displacement and velocity in field frame `frame` (explicit, from 0; the last by default) at `nodes` (or at the nodes nearest to points: "at": [[x, y, z], ...], lowest label on a tie, each entry then giving its `xyz` and `distance`) and, with `elements` (explicit), each element's stress, von Mises stress, strain, equivalent plastic strain, damage, temperature and whether it has eroded; a coupled reference point's label gives its six displacements (translations, rotations) and reactions (forces, moments). Fluid steps: {"step": "Flow", "points": [[x, y, z]], "frame": 10 (default the last)} gives velocity and pressure in the cells at the points; {"step": "Flow", "forces": ["x_min", "F2:top", "Body1/F2:top"]} gives those walls' force histories"#,
+    params: r#"{"step": "Load", "nodes": [1, 2] (or "set": "fillet", a set's nodes), "mode": 1, "frame": 0} — the stored result at nodes (with `max_von_mises`, the largest among them, for static steps): displacement, rotation, reaction, reaction moment, stress and von Mises (static, with `elements` each element's results: solid, 2D and truss nodal stresses (and, in a nonlinear step, the equivalent plastic strain at the integration points of a plastic element), shell section forces (N, M, Q per length in the element's axes) and bottom, middle and top stresses, beam end forces (N, V_y, V_z, T, M_y, M_z in its axes)), the shape of mode `mode` with its rotations (frequency, from 1), or displacement and velocity in field frame `frame` (explicit, from 0; the last by default) at `nodes` (or at the nodes nearest to points: "at": [[x, y, z], ...], lowest label on a tie, each entry then giving its `xyz` and `distance`) and, with `elements` (explicit), each element's stress, von Mises stress, strain, equivalent plastic strain, damage, temperature and whether it has eroded; a coupled reference point's label gives its six displacements (translations, rotations) and reactions (forces, moments). Fluid steps: {"step": "Flow", "points": [[x, y, z]], "frame": 10 (default the last)} gives velocity, pressure and (with heat) temperature in the cells at the points; {"step": "Flow", "forces": ["x_min", "F2:top", "Body1/F2:top"]} gives those walls' force histories and {"step": "Flow", "heat": ["y_min"]} the heat into them over time (power, positive into the wall)"#,
     form: Some(super::forms::SOLVE_PROBE),
     kind: CommandKind::Model,
     requires: &[Requirement::Result],
@@ -520,6 +520,21 @@ fn fluid_summary(r: &FluidResult) -> Value {
         })
         .collect();
     let (m0, m1) = (r.frames.first().map_or(0.0, |f| f.mass), last.map_or(0.0, |f| f.mass));
+    let heat: Vec<Value> = r
+        .heat
+        .iter()
+        .filter(|h| h.power.iter().any(|v| *v != 0.0))
+        .map(|h| {
+            let recent = h.power.get(h.power.len().saturating_sub(tail)..).unwrap_or_default();
+            let mean = recent.iter().sum::<f64>() / recent.len().max(1) as f64;
+            json!({"name": h.name, "body": h.body, "final": h.power.last(), "mean": mean})
+        })
+        .collect();
+    let temperature = last.filter(|f| !f.temperature.is_empty()).map(|f| {
+        let fluid = f.temperature.iter().zip(&r.solid).filter(|(_, solid)| !**solid).map(|(t, _)| f64::from(*t));
+        let (lo, hi) = fluid.fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), t| (lo.min(t), hi.max(t)));
+        json!({"min": lo, "max": hi})
+    });
     json!({
         "step": r.step,
         "backend": r.stats.backend,
@@ -538,6 +553,9 @@ fn fluid_summary(r: &FluidResult) -> Value {
         "max_speed": max_speed,
         "mass": {"first": m0, "last": m1, "relative_change": if m0 != 0.0 { (m1 - m0) / m0 } else { 0.0 }},
         "forces": forces,
+        "tau_thermal": r.stats.tau_thermal,
+        "temperature": temperature,
+        "heat": heat,
         "warnings": r.warnings,
     })
 }
@@ -559,6 +577,25 @@ fn probe_fluid(r: &FluidResult, p: &Value) -> Result<Value> {
             .collect::<Result<_>>()?;
         return Ok(json!({"step": r.step, "times": r.history_times, "forces": out}));
     }
+    if let Some(names) = opt::<Vec<String>>(p, "heat")? {
+        if names.len() > MAX_PROBE_FORCES {
+            return Err(EngineError::Params(format!("`heat` lists at most {MAX_PROBE_FORCES} walls")));
+        }
+        if r.heat.is_empty() {
+            return Err(EngineError::Params(format!("step `{}` carries no heat: give its domain `thermal` settings", r.step)));
+        }
+        let out: Vec<Value> = names
+            .iter()
+            .map(|n| {
+                let h =
+                    r.heat.iter().find(|h| &h.name == n || h.body.as_ref().is_some_and(|b| format!("{b}/{}", h.name) == *n)).ok_or_else(|| {
+                        EngineError::Params(format!("no wall `{n}` (box faces x_min … z_max, or obstacle faces by name or body/name)"))
+                    })?;
+                Ok(json!({"name": h.name, "body": h.body, "power": h.power}))
+            })
+            .collect::<Result<_>>()?;
+        return Ok(json!({"step": r.step, "times": r.history_times, "heat": out}));
+    }
     let pts = points(p, "points", MAX_PROBE)?;
     let frame = match opt::<usize>(p, "frame")? {
         Some(k) if k < r.frames.len() => k,
@@ -569,8 +606,12 @@ fn probe_fluid(r: &FluidResult, p: &Value) -> Result<Value> {
     let out: Vec<Value> = pts
         .iter()
         .map(|&pt| match r.probe(frame, pt) {
-            Some((cell, velocity, pressure)) => {
-                json!({"point": pt, "cell": cell, "solid": r.solid.get(cell), "velocity": velocity, "pressure": pressure})
+            Some((cell, velocity, pressure, temperature)) => {
+                let mut v = json!({"point": pt, "cell": cell, "solid": r.solid.get(cell), "velocity": velocity, "pressure": pressure});
+                if let (Some(t), Some(obj)) = (temperature, v.as_object_mut()) {
+                    obj.insert("temperature".into(), json!(t));
+                }
+                v
             }
             None => json!({"point": pt, "cell": null}),
         })
@@ -845,6 +886,7 @@ pub(crate) mod tests {
     }
 
     use super::*;
+    use fieldcraft_model::{BoxFace, FluidBoundary, ThermalCondition};
 
     /// A cantilever 10 × 1 × 1 of ten hex8 elements with incompatible modes, clamped at x = 0,
     /// a total force of 1 down on the free end; a static and a frequency step.
@@ -1110,6 +1152,95 @@ pub(crate) mod tests {
         }
     }
 
+    /// The Couette gap with heat: the sliding top wall held at 1, the bottom at 0, the fluid's
+    /// diffusivity k / (ρ c) = 0.1.
+    fn heated_couette(s: &mut Session) {
+        couette(s);
+        heat_the_couette(s);
+    }
+
+    fn heat_the_couette(s: &mut Session) {
+        s.execute(
+            "model.material.edit",
+            &json!({"name": "Oil", "density": 1.0, "fluid": {"type": "newtonian", "viscosity": 0.1},
+            "thermal": {"conductivity": 0.1, "specific_heat": 1.0}}),
+        )
+        .unwrap();
+        s.execute(
+            "model.fluid_domain.edit",
+            &json!({"name": "Gap", "material": "Oil", "min": [0, 0, 0], "max": [0.125, 1, 0.125], "spacing": 0.125,
+            "faces": {"x_min": {"type": "periodic"}, "x_max": {"type": "periodic"}, "z_min": {"type": "periodic"}, "z_max": {"type": "periodic"},
+                "y_max": {"type": "moving_wall", "velocity": [0.1, 0, 0]}},
+            "thermal": {"initial_temperature": 0.5, "faces": {"y_min": {"type": "temperature", "value": 0}}}}),
+        )
+        .unwrap();
+        s.execute("model.fluid_domain.thermal_boundary", &json!({"domain": "Gap", "at": "y_max", "condition": {"type": "temperature", "value": 1}}))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_fluid_step_carries_heat_between_its_walls() {
+        let mut s = Session::default();
+        heated_couette(&mut s);
+        let r = s.execute("solve.fluid", &json!({})).unwrap();
+        assert!(r["tau_thermal"].as_f64().unwrap() > 0.5, "{r}");
+        assert!((r["temperature"]["min"].as_f64().unwrap() - 0.0625).abs() < 1e-6, "{r}");
+        assert!((r["temperature"]["max"].as_f64().unwrap() - 0.9375).abs() < 1e-6, "{r}");
+        // Conduction across the gap: k ΔT / H over the wall's area, out of the hot wall and
+        // into the cold one.
+        let expected = 0.1 * 1.0 / 1.0 * 0.125 * 0.125;
+        let heat = r["heat"].as_array().unwrap();
+        let cold = heat.iter().find(|h| h["name"] == "y_min").unwrap();
+        let hot = heat.iter().find(|h| h["name"] == "y_max").unwrap();
+        assert!((cold["mean"].as_f64().unwrap() / expected - 1.0).abs() < 1e-6, "{cold}");
+        assert!((hot["mean"].as_f64().unwrap() / expected + 1.0).abs() < 1e-6, "{hot}");
+
+        let probe = s.execute("solve.probe", &json!({"step": "Shear", "points": [[0.06, 0.5625, 0.06]]})).unwrap();
+        assert!((probe["points"][0]["temperature"].as_f64().unwrap() - 0.5625).abs() < 1e-6, "{probe}");
+        let h = s.execute("solve.probe", &json!({"step": "Shear", "heat": ["y_min", "y_max"]})).unwrap();
+        assert_eq!(h["heat"].as_array().unwrap().len(), 2);
+        assert_eq!(h["times"].as_array().unwrap().len(), h["heat"][0]["power"].as_array().unwrap().len());
+        assert!(s.execute("solve.probe", &json!({"step": "Shear", "heat": ["nope"]})).is_err());
+
+        // The thermal boundary needs the domain's heat settings; the material must keep its
+        // heat properties while a domain carries heat.
+        let isothermal = json!({"name": "Gap", "material": "Oil", "min": [0, 0, 0], "max": [0.125, 1, 0.125], "spacing": 0.125});
+        s.execute("model.fluid_domain.edit", &isothermal).unwrap();
+        assert!(
+            s.execute("model.fluid_domain.thermal_boundary", &json!({"domain": "Gap", "at": "y_max", "condition": {"type": "adiabatic"}})).is_err()
+        );
+        let r = s.execute("solve.fluid", &json!({})).unwrap();
+        assert!(r["temperature"].is_null() && r["heat"].as_array().unwrap().is_empty(), "{r}");
+        assert!(s.execute("solve.probe", &json!({"step": "Shear", "heat": ["y_min"]})).is_err());
+        heat_the_couette(&mut s);
+        assert!(s.execute("model.material.edit", &json!({"name": "Oil", "density": 1.0, "fluid": {"type": "newtonian", "viscosity": 0.1}})).is_err());
+        // JSON has no NaN (`json!(f64::NAN)` is `null`): the model refuses one directly.
+        let nan = ThermalCondition::Temperature { value: f64::NAN };
+        assert!(s.model.set_fluid_thermal_boundary("Gap", FluidBoundary::Box(BoxFace::YMax), nan).is_err());
+        let hostile = [
+            json!({"domain": "Gap", "at": "y_max", "condition": {"type": "temperature", "value": "nan"}}),
+            json!({"domain": "Gap", "at": "top", "condition": {"type": "temperature", "value": 1}}),
+            json!({"domain": "Gap", "at": {"body": "Nope", "face": "F1"}, "condition": {"type": "temperature", "value": 1}}),
+            json!({"domain": "Nope", "at": "y_max", "condition": {"type": "temperature", "value": 1}}),
+            json!({"domain": "Gap", "at": "y_max", "condition": {"type": "oven"}}),
+            json!({"domain": "Gap", "at": "y_max"}),
+            json!(null),
+        ];
+        for p in &hostile {
+            let before = s.model.clone();
+            assert!(s.execute("model.fluid_domain.thermal_boundary", p).is_err(), "{p}");
+            assert_eq!(s.model, before, "{p}");
+        }
+        // A finite flux the lattice cannot hold, or one on a periodic face, is refused by the
+        // solve, not by the model.
+        for (at, value) in [("y_max", 1e308), ("x_min", 1.0)] {
+            let mut t = s.clone();
+            t.execute("model.fluid_domain.thermal_boundary", &json!({"domain": "Gap", "at": at, "condition": {"type": "flux", "value": value}}))
+                .unwrap();
+            assert!(t.execute("solve.fluid", &json!({})).is_err(), "{at}");
+        }
+    }
+
     #[test]
     fn a_fluid_domain_takes_its_obstacles_from_the_open_design() {
         use fieldcraft_geometry::sample::{Plate, plate_design};
@@ -1177,6 +1308,9 @@ pub(crate) mod tests {
             json!({"step": "Shear", "forces": ["nope"]}),
             json!({"step": "Shear", "forces": vec!["y_min"; 1000]}),
             json!({"step": "Shear", "forces": "y_min"}),
+            json!({"step": "Shear", "heat": ["y_min"]}),
+            json!({"step": "Shear", "heat": vec!["y_min"; 1000]}),
+            json!({"step": "Shear", "heat": 3}),
             json!({"step": "Shear", "nodes": [1]}),
             json!({"step": "Shear", "threads": 0}),
             json!({"step": "Shear", "threads": 100000}),

@@ -543,12 +543,13 @@ pub static CATALOGUE: &[Capability] = &[
         "The box of fluid cells, its fluid, and the obstacle bodies voxelised from their face-tagged surfaces",
         &["model.fluid_domain.edit", "model.fluid_domain.delete"],
     ),
-    ready(
+    ready_more(
         "model.fluid_domain.boundary",
         "Inlet & Outlet",
         Loads,
         "Flow",
-        "Velocity inlets, pressure outlets, walls, moving and slip walls, periodic faces",
+        "Velocity inlets, pressure outlets, walls, moving and slip walls, periodic faces; held temperatures, heat fluxes and adiabatic faces",
+        &["model.fluid_domain.thermal_boundary"],
     ),
     // ---- Interactions ----
     ready_more(
@@ -649,7 +650,13 @@ pub static CATALOGUE: &[Capability] = &[
         "Transient dynamics of an explicit step by central differences (contact and erosion coming in M10)",
     ),
     soon("solve.blast", "Blast & Impact", Solve, "Explicit", "M14", "EOS-driven fluids with fluid–structure contact (ALE or SPH)"),
-    ready("solve.fluid", "Lattice Boltzmann", Solve, "Fluids", "Lattice Boltzmann flow of a fluid step on the CPU, with wall forces"),
+    ready(
+        "solve.fluid",
+        "Lattice Boltzmann",
+        Solve,
+        "Fluids",
+        "Lattice Boltzmann flow of a fluid step on the CPU or a GPU, with wall forces, and the heat it carries",
+    ),
     soon("solve.fsi", "Fluid–Structure", Solve, "Fluids", "M13", "Coupled fluid and structure solve"),
     // ---- Results ----
     ready_more("results.deformed", "Deformed", Results, "Display", "The deformed shape of a solved step, to scale", &["results.clear"]),

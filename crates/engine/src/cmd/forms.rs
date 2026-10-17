@@ -608,9 +608,58 @@ const SURFACE_CONDITION: &[Variant] = &[
     ),
 ];
 
+const THERMAL_CONDITION: &[Variant] = &[
+    variant("adiabatic", "Adiabatic", &[]),
+    variant("temperature", "Temperature", &[num("value", "Temperature", D::Temperature).help("The temperature held at the boundary.").req()]),
+    variant("flux", "Heat flux", &[num("value", "Heat flux", D::HeatFlux).help("Heat per area into the fluid (negative out of it).").req()]),
+];
+
 const fn face(key: &'static str, label: &'static str) -> Field {
     variants(key, label, FACE_CONDITION).hint("wall")
 }
+
+const fn thermal_face(key: &'static str, label: &'static str) -> Field {
+    variants(key, label, THERMAL_CONDITION).hint("adiabatic")
+}
+
+const FLUID_THERMAL: Field = group(
+    "thermal",
+    "Heat",
+    &[
+        num("initial_temperature", "Initial temperature", D::Temperature)
+            .help("The temperature everywhere at the start, and the reference of the buoyancy.")
+            .def("0"),
+        xyz("gravity", "Gravity", D::Acceleration).help("Gravity for the buoyancy; zero for none. Needs the expansion coefficient."),
+        positive("expansion", "Expansion β", D::Expansion).help("Volumetric thermal expansion coefficient of the fluid, for the buoyancy."),
+        group(
+            "faces",
+            "Box faces",
+            &[
+                thermal_face("x_min", "X min").help("Thermal condition on the box face at the smallest X."),
+                thermal_face("x_max", "X max").help("Thermal condition on the box face at the largest X."),
+                thermal_face("y_min", "Y min").help("Thermal condition on the box face at the smallest Y."),
+                thermal_face("y_max", "Y max").help("Thermal condition on the box face at the largest Y."),
+                thermal_face("z_min", "Z min").help("Thermal condition on the box face at the smallest Z."),
+                thermal_face("z_max", "Z max").help("Thermal condition on the box face at the largest Z."),
+            ],
+        )
+        .help("The thermal condition on each face of the box; a velocity inlet carries its held temperature in."),
+        rows(
+            "surfaces",
+            "Obstacle faces",
+            &[
+                OBSTACLE_FACE,
+                variants("condition", "Condition", THERMAL_CONDITION)
+                    .help("The thermal condition on that face.")
+                    .req()
+                    .def(r#"{"type": "adiabatic"}"#),
+            ],
+        )
+        .help("Thermal conditions on single obstacle faces; every other obstacle face is adiabatic."),
+    ],
+)
+.help("Heat carried by the flow: needs the material's conductivity and specific heat. Off for an isothermal flow.")
+.hint("isothermal when off");
 
 pub const FLUID_DOMAIN: &[Field] = &[
     NAME,
@@ -649,6 +698,7 @@ pub const FLUID_DOMAIN: &[Field] = &[
     positive("tolerance", "Obstacle tolerance", D::Length)
         .help("How close a cell must be to an obstacle surface to count as on it.")
         .hint("a tenth of the cell size"),
+    FLUID_THERMAL,
 ];
 
 pub const FLUID_BOUNDARY: &[Field] = &[
@@ -658,6 +708,15 @@ pub const FLUID_BOUNDARY: &[Field] = &[
         .req()
         .def("\"x_min\""),
     variants("condition", "Condition", FACE_CONDITION).help("The flow condition on that boundary.").req().def(r#"{"type": "velocity"}"#),
+];
+
+pub const FLUID_THERMAL_BOUNDARY: &[Field] = &[
+    reference("domain", "Domain", C::FluidDomain).help("The fluid domain to change; it needs heat settings.").req(),
+    name_or("at", "Boundary", &BOX_FACE, "Obstacle face", OBSTACLE_FACE_FIELDS)
+        .help("A face of the domain's box, or a named face of an obstacle body.")
+        .req()
+        .def("\"x_min\""),
+    variants("condition", "Condition", THERMAL_CONDITION).help("The thermal condition on that boundary.").req().def(r#"{"type": "temperature"}"#),
 ];
 
 const PROCEDURE: Field = variants(
@@ -1972,6 +2031,7 @@ pub const SOLVE_PROBE: &[Field] = &[
     flag("elements", "Element results").help("Also read element results (stresses) around the nodes."),
     points("points", "Fluid points", D::Length, 10_000).help("Points in the fluid to read."),
     json("forces", "Fluid walls").help("Walls whose fluid forces to sum, as JSON.").hint("[\"x_min\", \"F2:top\"]"),
+    json("heat", "Fluid walls (heat)").help("Walls whose heat histories to read, as JSON.").hint("[\"y_min\", \"F2:top\"]"),
 ];
 
 // ---- Results ----

@@ -27,7 +27,7 @@ crates in strictly lower layers.
 | L1 | `fieldcraft-render` | Display data without a GPU dependency: the visible faces, element edges and nodes of a model, the orbit camera, a CPU rasterizer for headless snapshots, geometry surfaces with their face boundaries, deformed shapes and banded contour plots of nodal results, slices, surface values and streamlines of flow fields on grids of cells, picking. | started |
 | L2 | `fieldcraft-solver` | Implicit solver: assembly from the resolved model, boundary conditions, sparse direct solution, linear static and modal analysis, stresses and reactions. | started |
 | L2 | `fieldcraft-explicit` | Explicit dynamics: central-difference time integration with lumped mass, one-point hex8 with hourglass control, nodal-pressure tet4, bulk viscosity, rigid walls, large deformation with objective rates, plasticity, damage and erosion, energy account, histories and field frames. | started |
-| L2 | `fieldcraft-lbm` | Lattice Boltzmann flow solver on the CPU: D3Q19 two-relaxation-time scheme, bounce-back and slip walls, Zou–He inlets and outlets, obstacles voxelised from the face-tagged surface with exact predicates, momentum-exchange forces per face. Uses `mesh` for the predicates and the boundary surface. | started |
+| L2 | `fieldcraft-lbm` | Lattice Boltzmann flow solver on the CPU: D3Q19 two-relaxation-time scheme, bounce-back and slip walls, Zou–He inlets and outlets, obstacles voxelised from the face-tagged surface with exact predicates, momentum-exchange forces per face; a D3Q7 temperature lattice carried by the flow (held temperatures, heat fluxes, adiabatic faces, Boussinesq buoyancy, the heat into every face). Uses `mesh` for the predicates and the boundary surface. | started |
 | L3 | `fieldcraft-fsi` | Fluid–structure coupling between the L2 solvers (later). | planned |
 | L4 | `fieldcraft-doc` | The document: geometry, mesh, model, results, history. | planned |
 | L5 | `fieldcraft-io` | `.fieldcraft` files (docs/formats/fieldcraft.md): text model definition, binary mesh, geometry references with content hashes, the journal; atomic saves; autosave storage for crash recovery; read and write roots that confine an automation client's file access (`roots`). Bytes in, bytes out; the file system only in `fs`, `recovery` and `roots` (in the browser, files kept in memory: `memory`). Result files later. | started |
@@ -309,21 +309,26 @@ cantilever's free-vibration period against `solve.frequency`.
 
 ## Lattice Boltzmann solver
 
-`fieldcraft-lbm` solves a model's fluid steps (`solve.fluid`; `solve.probe` reads velocity and
-pressure at points and wall force histories). Papers are cited in the module docs and in
-`docs/solvers/literature.md` (Part I).
+`fieldcraft-lbm` solves a model's fluid steps (`solve.fluid`; `solve.probe` reads velocity,
+pressure and temperature at points and wall force and heat histories). Papers are cited in the
+module docs and in `docs/solvers/literature.md` (Part I).
 
-1. **Model.** A fluid material (density, Newtonian viscosity), a fluid domain (box, cubic cell
-   spacing, a condition on each box face: wall, moving wall, slip, velocity inlet with a uniform
-   or parabolic profile, pressure outlet, periodic pair; obstacle bodies and moving-wall
-   conditions on their named faces; initial velocity; body acceleration) and a fluid step (end
+1. **Model.** A fluid material (density, Newtonian viscosity; conductivity and specific heat
+   for heat), a fluid domain (box, cubic cell spacing, a condition on each box face: wall,
+   moving wall, slip, velocity inlet with a uniform or parabolic profile, pressure outlet,
+   periodic pair; obstacle bodies and moving-wall conditions on their named faces; initial
+   velocity; body acceleration; optional `thermal` settings: the initial temperature, a thermal
+   condition per box face and per named obstacle face — held temperature, heat flux or
+   adiabatic — and gravity with the expansion coefficient for buoyancy) and a fluid step (end
    time or steps, optional time step, frames, the TRT parameter Λ). Deck writers refuse fluid
    steps.
 2. **Setup.** Lattice units from the spacing, the time step and the density. Without a given
    time step the solver keeps the characteristic lattice velocity at 0.05 and τ ≤ 1. A lattice
    Mach number above 0.3, τ below 0.505 or a lattice acceleration above 0.01 is refused with the
    numbers and what to change; caps on cells, steps, cell updates and frame memory are checked
-   before anything is allocated.
+   before anything is allocated. With heat, the scalar relaxation time follows from the
+   diffusivity k / (ρ c) in lattice units (refused below 0.505, warned above 2) and a flux on an
+   inlet, outlet or periodic face is refused.
 3. **Grid.** The engine triangulates each obstacle body (or takes an imported surface) and
    prepares its `BoundarySurface`; cells whose centres have a positive winding number are solid,
    decided with exact `orient2d`/`orient3d` and one symbolic perturbation, so faces through cell
@@ -332,17 +337,27 @@ pressure at points and wall force histories). Papers are cited in the module doc
    direction with per-link rules for the cells next to walls and box faces; Zou–He on inlet and
    outlet layers. Wall links give the momentum exchanged with every box face and B-rep face
    (the face of the triangle nearest the link). A non-positive density or a lattice speed above
-   0.5 stops the run with an error.
-5. **Results.** Frames of velocity and gauge pressure per cell (single precision), force
-   histories per wall and the fluid mass, in model units, stored per step like the implicit
-   results.
+   0.5 stops the run with an error. With heat, a D3Q7 BGK scalar lattice (weights ¼ and ⅛,
+   c_s² = ¼) steps after the flow on the same links: it is advected by the cell velocity and
+   diffuses with the scalar relaxation time; held temperatures are anti-bounce-back, adiabatic
+   faces bounce-back, a flux is added to the bounced population; velocity inlets carry the
+   held temperature in at the cell's velocity, pressure outlets copy their neighbour. The heat
+   crossing every wall link is summed per face as the flow's force is. The temperature feeds
+   back through a per-cell Boussinesq force −β (T − T₀) g.
+5. **Results.** Frames of velocity, gauge pressure and (with heat) temperature per cell (single
+   precision), force and heat histories per wall and the fluid mass, in model units, stored
+   per step like the implicit results.
 
 Verification (`crates/lbm/tests/verification.rs`, analytic): plane Poiseuille exact to round-off
 with Λ = 3/16 and second order with Λ = 1/4; Couette exact with the wall shear μU/H; Taylor–Green
 decay second order; Poiseuille in a staircase pipe; Stokes drag of a simple cubic sphere array
 against Hasimoto (1959); a parabolic-inlet, pressure-outlet channel against Poiseuille; mass
-conserved to round-off; bit-for-bit reproducibility. `crates/lbm/tests/benchmark.rs` (ignored,
-published reference values): Schäfer–Turek 2D-1.
+conserved to round-off; bit-for-bit reproducibility. `crates/lbm/tests/thermal.rs` (heat):
+linear conduction between held plates to round-off; a flux wall against q H / k and the wall's
+heat balance; an inlet temperature carried through a plug flow; a periodic blob that keeps its
+total and returns after one lap; (ignored, minutes) the de Vahl Davis cavity at Ra 10³ and 10⁴
+against the published Nusselt numbers (both within 0.1 %). `crates/lbm/tests/benchmark.rs` (ignored, published
+reference values): Schäfer–Turek 2D-1.
 
 ## Commands
 

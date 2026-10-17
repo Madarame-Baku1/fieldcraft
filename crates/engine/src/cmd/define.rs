@@ -8,7 +8,7 @@
 
 use fieldcraft_model::{
     BoundaryCondition, Coupling, FaceCondition, FluidBoundary, FluidDomain, Load, Material, Model, PointMass, ReferencePoint, Section, Set, Spring,
-    Step,
+    Step, ThermalCondition,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
@@ -288,7 +288,7 @@ definition_commands!(
     FluidDomain,
     "fluid_domain",
     "Fluid Domain",
-    r#"{"name": "Flow", "material": "Water" (a density and fluid behaviour), "min": [x, y, z], "max": [x, y, z], "spacing": 1.0 (cubic cells; every extent a whole number of spacings), "faces": {"x_min": {"type": "velocity", "velocity": [u, v, w], "profile": "uniform|parabolic"}, "x_max": {"type": "pressure", "pressure": 0}, "y_min": {"type": "wall"} | {"type": "moving_wall", "velocity": [u, v, w] (in the face's plane)} | {"type": "slip"} | {"type": "periodic"} (in opposite pairs), …} (default walls), "obstacles": ["Body1"] (solid bodies of the design or imported surfaces, by name), "surfaces": [{"face": {"body": "Body1", "face": "F2:top"}, "condition": {"type": "moving_wall", "velocity": [u, v, w]}}] (obstacle faces are walls unless listed), "initial_velocity": [u, v, w], "acceleration": [x, y, z] (gravity or a driving force per mass), "tolerance": 0.1 (obstacle triangulation; default a tenth of the spacing)}"#,
+    r#"{"name": "Flow", "material": "Water" (a density and fluid behaviour), "min": [x, y, z], "max": [x, y, z], "spacing": 1.0 (cubic cells; every extent a whole number of spacings), "faces": {"x_min": {"type": "velocity", "velocity": [u, v, w], "profile": "uniform|parabolic"}, "x_max": {"type": "pressure", "pressure": 0}, "y_min": {"type": "wall"} | {"type": "moving_wall", "velocity": [u, v, w] (in the face's plane)} | {"type": "slip"} | {"type": "periodic"} (in opposite pairs), …} (default walls), "obstacles": ["Body1"] (solid bodies of the design or imported surfaces, by name), "surfaces": [{"face": {"body": "Body1", "face": "F2:top"}, "condition": {"type": "moving_wall", "velocity": [u, v, w]}}] (obstacle faces are walls unless listed), "initial_velocity": [u, v, w], "acceleration": [x, y, z] (gravity or a driving force per mass), "tolerance": 0.1 (obstacle triangulation; default a tenth of the spacing), "thermal": {"initial_temperature": 20, "gravity": [0, -9810, 0], "expansion": 2.1e-4 (β per temperature; buoyancy needs both, Boussinesq), "faces": {"y_min": {"type": "temperature", "value": 80} | {"type": "flux", "value": 1000 (heat per area into the fluid)} | {"type": "adiabatic"}, …} (default adiabatic; a velocity inlet carries its held temperature in, a pressure outlet lets heat leave), "surfaces": [{"face": {"body": "Body1", "face": "F2:top"}, "condition": {"type": "temperature", "value": 80}}] (obstacle faces are adiabatic unless listed)} (heat in the fluid, carried by the flow and diffused with the material's conductivity and specific heat; left out, the flow is isothermal)}"#,
     super::forms::FLUID_DOMAIN,
     super::forms::FLUID_DOMAIN_DELETE,
     add_fluid_domain,
@@ -316,6 +316,24 @@ fn fluid_boundary(s: &mut Session, p: &Value) -> Result<Value> {
     let at: FluidBoundary = req(p, "at")?;
     let condition: FaceCondition = req(p, "condition")?;
     s.model.set_fluid_boundary(domain, at, condition)?;
+    Ok(json!({"domain": domain}))
+}
+
+pub const FLUID_THERMAL_BOUNDARY: CommandSpec = CommandSpec {
+    id: "model.fluid_domain.thermal_boundary",
+    label: "Temperature or Heat Flux",
+    params: r#"{"domain": "Flow", "at": "x_min" (a box face) | {"body": "Body1", "face": "F2:top"} (an obstacle face), "condition": {"type": "temperature", "value": 80} | {"type": "flux", "value": 1000 (heat per area into the fluid)} | {"type": "adiabatic"}} — sets one boundary's thermal condition; the domain needs `thermal` settings (model.fluid_domain.edit)"#,
+    form: Some(super::forms::FLUID_THERMAL_BOUNDARY),
+    kind: CommandKind::Model,
+    requires: &[Requirement::FluidDomain],
+    run: fluid_thermal_boundary,
+};
+
+fn fluid_thermal_boundary(s: &mut Session, p: &Value) -> Result<Value> {
+    let domain: &str = req(p, "domain")?;
+    let at: FluidBoundary = req(p, "at")?;
+    let condition: ThermalCondition = req(p, "condition")?;
+    s.model.set_fluid_thermal_boundary(domain, at, condition)?;
     Ok(json!({"domain": domain}))
 }
 
