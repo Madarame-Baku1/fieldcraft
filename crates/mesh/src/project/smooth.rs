@@ -283,8 +283,7 @@ pub(crate) enum Order {
     Sequential,
     /// Colour by colour ([`colour_classes`]): no two nodes of a colour share an element, so a
     /// colour's moves are independent and run in parallel, and the result does not depend on the
-    /// thread count. Reached from the crate's tests and benchmark for now.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// thread count.
     Coloured,
     /// Colour by colour with the free nodes on the registered sweep device ([`super::device`]).
     Device,
@@ -292,6 +291,10 @@ pub(crate) enum Order {
 
 /// Nodes per parallel task in a coloured sweep.
 const NODE_GRAIN: usize = 1024;
+
+/// Surface nodes per parallel task when the grid lines are straightened (each projects onto the
+/// geometry several times, and a colour holds few of them).
+const SURFACE_GRAIN: usize = 64;
 
 /// Elements per parallel task when a whole mesh is measured.
 pub(crate) const HEX_GRAIN: usize = 4096;
@@ -319,6 +322,28 @@ impl Sweep<'_> {
     /// Whether a sweep may move `v`.
     fn movable(&self, v: u32) -> bool {
         !self.held.get(v as usize).copied().unwrap_or(false) && !matches!(self.cons(v), Constraint::Corner(..))
+    }
+
+    /// Whether `v` is a surface node the straightening moves.
+    fn on_surface(&self, v: u32) -> bool {
+        self.movable(v) && matches!(self.cons(v), Constraint::Surface(_))
+    }
+
+    /// The straightening move of surface node `v` of `x`: toward the mean of its neighbours on
+    /// the surface, as far as no element around it falls below the lower of its own value and
+    /// `floor`.
+    fn straighten(&self, x: &[P], v: u32, floor: f64) -> Move {
+        let c = self.cons(v);
+        let (g, targets, ptol) = (self.g, self.targets, self.ptol);
+        let target = self.along_boundary.get(&v).and_then(|e| {
+            let (mut s, mut k) = ([0.0; 3], 0usize);
+            for &w in e {
+                s = add(s, at(x, w));
+                k += 1;
+            }
+            (k > 0).then(|| place(g, targets, c, scale(s, 1.0 / k as f64), ptol))
+        });
+        guarded(x, v, target, ptol, floor, |to| self.quality(x, v, to), |to| place(g, targets, c, to, ptol))
     }
 
     /// The quality around `v` with `v` at `p`.
@@ -728,6 +753,7 @@ fn pass(m: &mut Mesh, g: &dyn Geometry, targets: &[Vec<u32>], run: Run, sweep_fl
         starts.push(best.1);
     }
     let mut finished: Option<(SweepScore, Local, Vec<P>)> = None;
+    let surface_classes: Vec<Vec<u32>> = classes.iter().map(|c| c.iter().copied().filter(|&v| sweep.on_surface(v)).collect()).collect();
     for start in starts {
         *m.nodes = start;
         // The worst elements: each of their nodes searched for the place that raises the smallest
@@ -795,37 +821,26 @@ fn pass(m: &mut Mesh, g: &dyn Geometry, targets: &[Vec<u32>], run: Run, sweep_fl
         let floor = scaled_jacobians(m.nodes, hexes).into_iter().fold(f64::INFINITY, f64::min);
         for _ in 0..STRAIGHTEN_SWEEPS {
             let mut moved = false;
-            for v in 0..n as u32 {
-                let c = cons(v);
-                if !matches!(c, Constraint::Surface(_)) || is_held(v) {
-                    continue;
+            let mut apply = |nodes: &mut Vec<P>, v: u32, mv: Move| {
+                if let (Move::To(x), Some(slot)) = (mv, nodes.get_mut(v as usize)) {
+                    *slot = x;
+                    moved = true;
                 }
-                let p = at(m.nodes, v);
-                let Some(q) = along_boundary.get(&v).and_then(|e| {
-                    let (mut s, mut k) = ([0.0; 3], 0usize);
-                    for &w in e {
-                        s = add(s, at(m.nodes, w));
-                        k += 1;
-                    }
-                    (k > 0).then(|| place(g, targets, c, scale(s, 1.0 / k as f64), ptol))
-                }) else {
-                    continue;
-                };
-                if dist(q, p) <= ptol {
-                    continue;
+            };
+            if order == Order::Sequential {
+                for v in (0..n as u32).filter(|&v| sweep.on_surface(v)) {
+                    let mv = sweep.straighten(m.nodes, v, floor);
+                    apply(m.nodes, v, mv);
                 }
-                let before = quality(m.nodes, v);
-                for step in [1.0, 0.5, 0.25] {
-                    let x = if step == 1.0 { q } else { place(g, targets, c, add(p, scale(sub(q, p), step)), ptol) };
-                    if let Some(slot) = m.nodes.get_mut(v as usize) {
-                        *slot = x;
-                    }
-                    if quality(m.nodes, v).keeps_above(before, floor) {
-                        moved = true;
-                        break;
-                    }
-                    if let Some(slot) = m.nodes.get_mut(v as usize) {
-                        *slot = p;
+            } else {
+                // Colour by colour, as the sweeps went.
+                for surface in &surface_classes {
+                    let nodes: &[P] = m.nodes;
+                    let moves = fieldcraft_parallel::map_grained(surface.len(), SURFACE_GRAIN, |i| {
+                        surface.get(i).map_or(Move::Stay, |&v| sweep.straighten(nodes, v, floor))
+                    });
+                    for (&v, mv) in surface.iter().zip(moves) {
+                        apply(m.nodes, v, mv);
                     }
                 }
             }
