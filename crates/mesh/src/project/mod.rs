@@ -24,6 +24,8 @@ pub mod target;
 pub mod topology;
 
 #[cfg(test)]
+mod bench;
+#[cfg(test)]
 mod tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -332,6 +334,17 @@ fn edge_key(a: u32, b: u32) -> [u32; 2] {
 
 /// Mesh the topology `t` projected onto the body bounded by `surface`, through `g`.
 pub fn project_mesh(t: &Topology, surface: &BoundarySurface, g: &dyn Geometry, opts: &ProjectOptions) -> Result<ProjectedMesh> {
+    project_ordered(t, surface, g, opts, smooth::Order::Sequential)
+}
+
+/// [`project_mesh`] with the smoothing sweeps in `order`.
+pub(crate) fn project_ordered(
+    t: &Topology,
+    surface: &BoundarySurface,
+    g: &dyn Geometry,
+    opts: &ProjectOptions,
+    order: smooth::Order,
+) -> Result<ProjectedMesh> {
     t.check()?;
     if !(opts.size > 0.0 && opts.size.is_finite()) {
         return Err(Error::Invalid(format!("the element size must be a positive number, got {}", opts.size)));
@@ -779,7 +792,7 @@ pub fn project_mesh(t: &Topology, surface: &BoundarySurface, g: &dyn Geometry, o
         return Err(Error::Failed("a node of the block lattice was not placed".into()));
     }
     let corners_of = |nodes: &[P], h: &[u32; 8]| h.map(|v| nodes.get(v as usize).copied().unwrap_or_default());
-    let initial_min = lat.hexes.iter().map(|h| smooth::hex_scaled_jacobian(&corners_of(&nodes, h))).fold(f64::INFINITY, f64::min);
+    let initial_min = smooth::scaled_jacobians(&nodes, &lat.hexes).into_iter().fold(f64::INFINITY, f64::min);
 
     // The outer quads (outward, hex8 face order) and the target each lies on.
     let hex8_faces = ElementKind::Hex8.faces();
@@ -810,17 +823,21 @@ pub fn project_mesh(t: &Topology, surface: &BoundarySurface, g: &dyn Geometry, o
         smooth::Mesh { nodes: &mut nodes, hexes: &lat.hexes, constraint: &constraint, held: &held, boundary: &boundary_quads },
         g,
         &targets,
-        opts.smoothing,
-        opts.iterations,
-        1e-4 * opts.size,
+        smooth::Run { method: opts.smoothing, iterations: opts.iterations, tol: 1e-4 * opts.size, order },
     );
 
     fieldcraft_model::progress::check()?;
     // Certified quality, the gap to the geometry and the tags.
     let (mut min_sj, mut sum_sj, mut volume) = (f64::INFINITY, 0.0, 0.0);
     let mut invalid: Vec<usize> = Vec::new();
-    for (e, h) in lat.hexes.iter().enumerate() {
-        let q = element_quality(ElementKind::Hex8, &corners_of(&nodes, h))?;
+    let qualities = fieldcraft_parallel::map_grained(lat.hexes.len(), smooth::HEX_GRAIN, |e| {
+        lat.hexes.get(e).map_or_else(
+            || Err(Error::Failed("an element of the lattice is missing".into())),
+            |h| element_quality(ElementKind::Hex8, &corners_of(&nodes, h)),
+        )
+    });
+    for (e, q) in qualities.into_iter().enumerate() {
+        let q = q?;
         let sj = q.get(Metric::ScaledJacobian).unwrap_or(-1.0);
         if q.validity().is_none_or(|v| v != crate::quality::Validity::Valid) {
             invalid.push(e);

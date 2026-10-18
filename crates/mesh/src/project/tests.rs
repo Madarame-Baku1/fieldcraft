@@ -144,6 +144,51 @@ fn butterfly_disc_meshes_with_its_rim_on_the_circle() {
     }
 }
 
+/// Both sweep orders on curved blocks (where, unlike a block with planar faces, they give
+/// different meshes) at `cases` (`(sphere, size)`, else the butterfly disc): each order gives the
+/// same mesh on one thread and on four, and the coloured order (#409) stays above the quality
+/// floor and within 0.02 of the sequential order's smallest scaled Jacobian. Returns both.
+fn compare_sweep_orders(cases: &[(bool, f64)]) -> Vec<[f64; 2]> {
+    use super::smooth::Order;
+    let r = 10.0;
+    let (ss, st) = sphere(r, 96);
+    let ball = Topology::sphere([0.0; 3], r, 0.55).unwrap();
+    let (cs, ct) = cylinder(r, 2.0, 128);
+    let disc = Topology::butterfly([0.0; 3], [0.0, 0.0, 1.0], r, &[0.0, 2.0], 0.55).unwrap();
+    let mut out = Vec::new();
+    for &(is_sphere, size) in cases {
+        let (topo, s, t) = if is_sphere { (&ball, &ss, &st) } else { (&disc, &cs, &ct) };
+        let opts = options(size);
+        let run = |threads: usize, order: Order| fieldcraft_parallel::with_threads(threads, || project_ordered(topo, s, t, &opts, order)).unwrap();
+        let mut min = [0.0; 2];
+        for (k, order) in [Order::Sequential, Order::Coloured].into_iter().enumerate() {
+            let (one, four) = (run(1, order), run(4, order));
+            assert_eq!(one.nodes, four.nodes, "sphere {is_sphere} at {size}, {order:?}");
+            assert_eq!(one.report, four.report, "sphere {is_sphere} at {size}, {order:?}");
+            min[k] = one.report.min_scaled_jacobian;
+        }
+        let [sequential, coloured] = min;
+        assert!(coloured >= 0.5 && coloured >= sequential - 0.02, "sphere {is_sphere} at {size}: coloured {coloured}, sequential {sequential}");
+        out.push(min);
+    }
+    out
+}
+
+#[test]
+fn sweep_orders_on_curved_blocks_do_not_depend_on_the_thread_count() {
+    compare_sweep_orders(&[(true, 3.0), (false, 2.0)]);
+}
+
+/// [`compare_sweep_orders`] on finer meshes, printing both orders' smallest scaled Jacobians.
+#[test]
+#[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
+fn sweep_orders_on_fine_curved_blocks() {
+    let cases = [(true, 1.5), (true, 0.75), (false, 1.0), (false, 0.5)];
+    for ((is_sphere, size), [sequential, coloured]) in cases.iter().zip(compare_sweep_orders(&cases)) {
+        println!("{} at {size}: sequential {sequential:.4}, coloured {coloured:.4}", if *is_sphere { "sphere" } else { "disc" });
+    }
+}
+
 /// A plain grid on a box: corners land on the box's corners, edges on its edges.
 #[test]
 fn a_grid_on_a_cylinder_is_refused_where_corners_would_flatten() {

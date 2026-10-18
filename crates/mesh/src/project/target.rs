@@ -17,8 +17,8 @@ const ROUNDS: usize = 60;
 /// Below this `|n_a × n_b|` two targets are treated as tangent (sin 3°).
 const TANGENT_SIN: f64 = 0.052;
 
-/// What the projection needs of the geometry.
-pub trait Geometry {
+/// What the projection needs of the geometry (shared by the threads that smooth in parallel).
+pub trait Geometry: Sync {
     /// The closest point on B-rep face `face`.
     fn project(&self, face: u32, p: P) -> Option<P>;
     /// The unit normal of B-rep face `face` near `p`.

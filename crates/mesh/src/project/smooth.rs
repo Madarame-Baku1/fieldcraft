@@ -274,6 +274,152 @@ fn winslow(x: &[P], s: &Stencil) -> Option<P> {
     out.iter().all(|v| v.is_finite()).then_some(out)
 }
 
+/// The order the sweeps move the nodes in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Order {
+    /// One node after another in node order, each seeing its neighbours' new places.
+    Sequential,
+    /// Colour by colour ([`colour_classes`]): no two nodes of a colour share an element, so a
+    /// colour's moves are independent and run in parallel, and the result does not depend on the
+    /// thread count.
+    Coloured,
+}
+
+/// Nodes per parallel task in a coloured sweep.
+const NODE_GRAIN: usize = 1024;
+
+/// Elements per parallel task when a whole mesh is measured.
+pub(crate) const HEX_GRAIN: usize = 4096;
+
+/// What a sweep does with a node.
+#[derive(Debug, Clone, Copy)]
+enum Move {
+    Stay,
+    /// To this place, this far.
+    To(P, f64),
+    Refused,
+}
+
+/// What a sweep move of one node reads.
+struct Sweep<'a> {
+    hexes: &'a [[u32; 8]],
+    around: &'a [Vec<u32>],
+    constraint: &'a [Constraint],
+    held: &'a [bool],
+    stencils: &'a [Option<Stencil>],
+    edges: &'a [Vec<u32>],
+    along_boundary: &'a BTreeMap<u32, BTreeSet<u32>>,
+    g: &'a dyn Geometry,
+    targets: &'a [Vec<u32>],
+    ptol: f64,
+    floor: f64,
+}
+
+impl Sweep<'_> {
+    fn cons(&self, v: u32) -> Constraint {
+        self.constraint.get(v as usize).copied().unwrap_or(Constraint::Free)
+    }
+
+    /// Whether a sweep may move `v`.
+    fn movable(&self, v: u32) -> bool {
+        !self.held.get(v as usize).copied().unwrap_or(false) && !matches!(self.cons(v), Constraint::Corner(..))
+    }
+
+    /// The quality around `v` with `v` at `p`.
+    fn quality(&self, x: &[P], v: u32, p: P) -> Local {
+        let mut l = Local { sj: f64::INFINITY, ratio: 1.0 };
+        for hex in self.around.get(v as usize).into_iter().flatten().filter_map(|&h| self.hexes.get(h as usize)) {
+            let c = hex.map(|q| if q == v { p } else { at(x, q) });
+            l.sj = l.sj.min(hex_scaled_jacobian(&c));
+            l.ratio = l.ratio.max(hex_edge_ratio(&c));
+        }
+        l
+    }
+
+    /// The move of `v` from the grid `x`: reads only the elements around `v`.
+    fn step(&self, x: &[P], v: u32) -> Move {
+        if !self.movable(v) {
+            return Move::Stay;
+        }
+        let (g, targets, ptol) = (self.g, self.targets, self.ptol);
+        let c = self.cons(v);
+        let p = at(x, v);
+        let mean = |nbrs: &mut dyn Iterator<Item = u32>| -> Option<P> {
+            let (mut s, mut k) = ([0.0; 3], 0usize);
+            for w in nbrs {
+                s = add(s, at(x, w));
+                k += 1;
+            }
+            (k > 0).then(|| scale(s, 1.0 / k as f64))
+        };
+        let target = match c {
+            Constraint::Corner(..) => return Move::Stay,
+            Constraint::Free => match self.stencils.get(v as usize).copied().flatten() {
+                Some(s) => winslow(x, &s),
+                None => self.edges.get(v as usize).and_then(|e| mean(&mut e.iter().copied())),
+            },
+            Constraint::Surface(_) => self.along_boundary.get(&v).and_then(|e| mean(&mut e.iter().copied())).map(|q| place(g, targets, c, q, ptol)),
+            Constraint::Curve(a, b) => {
+                let on_curve = |w: &u32| match self.cons(*w) {
+                    Constraint::Curve(x, y) => (x, y) == (a, b),
+                    Constraint::Corner(x, y, z) => [x, y, z].contains(&a) && [x, y, z].contains(&b),
+                    _ => false,
+                };
+                self.along_boundary.get(&v).and_then(|e| mean(&mut e.iter().copied().filter(on_curve))).map(|q| place(g, targets, c, q, ptol))
+            }
+        };
+        let Some(q) = target else { return Move::Stay };
+        if dist(q, p) <= ptol {
+            return Move::Stay;
+        }
+        // The full move, else half, else a quarter of it, whichever keeps the quality.
+        let before = self.quality(x, v, p);
+        for step in [1.0, 0.5, 0.25] {
+            let to = if step == 1.0 { q } else { place(g, targets, c, add(p, scale(sub(q, p), step)), ptol) };
+            if self.quality(x, v, to).keeps_above(before, self.floor) {
+                return Move::To(to, dist(to, p));
+            }
+        }
+        Move::Refused
+    }
+}
+
+/// The movable nodes in classes no two nodes of which share an element (a greedy colouring in
+/// node order; eight classes on a structured grid), each class in node order.
+fn colour_classes(s: &Sweep, n: usize) -> Vec<Vec<u32>> {
+    let mut colour = vec![usize::MAX; n];
+    let mut classes: Vec<Vec<u32>> = Vec::new();
+    let mut used: Vec<bool> = Vec::new();
+    for v in 0..n as u32 {
+        if !s.movable(v) {
+            continue;
+        }
+        used.clear();
+        used.resize(classes.len(), false);
+        for hex in s.around.get(v as usize).into_iter().flatten().filter_map(|&h| s.hexes.get(h as usize)) {
+            for &w in hex {
+                if let Some(slot) = colour.get(w as usize).and_then(|&c| used.get_mut(c)) {
+                    *slot = true;
+                }
+            }
+        }
+        let c = used.iter().position(|u| !u).unwrap_or(classes.len());
+        if c == classes.len() {
+            classes.push(Vec::new());
+        }
+        if let (Some(class), Some(slot)) = (classes.get_mut(c), colour.get_mut(v as usize)) {
+            class.push(v);
+            *slot = c;
+        }
+    }
+    classes
+}
+
+/// Every element's smallest scaled Jacobian, in element order (measured in parallel).
+pub(crate) fn scaled_jacobians(x: &[P], hexes: &[[u32; 8]]) -> Vec<f64> {
+    fieldcraft_parallel::map_grained(hexes.len(), HEX_GRAIN, |e| hexes.get(e).map_or(f64::INFINITY, |h| hex_scaled_jacobian(&h.map(|q| at(x, q)))))
+}
+
 /// What the smoother reports.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SmoothReport {
@@ -293,30 +439,40 @@ pub(crate) struct Mesh<'a> {
     pub boundary: &'a [[u32; 4]],
 }
 
-/// The edge neighbours of every node.
-fn edge_neighbours(n: usize, hexes: &[[u32; 8]]) -> Vec<BTreeSet<u32>> {
-    let mut edges: Vec<BTreeSet<u32>> = vec![BTreeSet::new(); n];
-    for hex in hexes {
-        for (k, bits) in CORNERS.iter().enumerate() {
-            for d in 0..3 {
-                let mut b = *bits;
-                b[d] = 1 - b[d];
-                if let Some(e) = edges.get_mut(hex[k] as usize) {
-                    e.insert(hex[corner_at(b)]);
+/// The edge neighbours of every node, ascending, from the elements around it (in parallel).
+fn edge_neighbours(around: &[Vec<u32>], hexes: &[[u32; 8]]) -> Vec<Vec<u32>> {
+    fieldcraft_parallel::map_grained(around.len(), NODE_GRAIN, |v| {
+        let mut e = Vec::with_capacity(24);
+        for hex in around.get(v).into_iter().flatten().filter_map(|&h| hexes.get(h as usize)) {
+            for (k, bits) in CORNERS.iter().enumerate() {
+                if hex[k] as usize != v {
+                    continue;
+                }
+                for d in 0..3 {
+                    let mut b = *bits;
+                    b[d] = 1 - b[d];
+                    e.push(hex[corner_at(b)]);
                 }
             }
         }
-    }
-    edges
+        e.sort_unstable();
+        e.dedup();
+        e
+    })
 }
 
 /// The smallest scaled Jacobian and the largest edge ratio of a mesh.
 fn mesh_quality(x: &[P], hexes: &[[u32; 8]]) -> Local {
+    let each = fieldcraft_parallel::map_grained(hexes.len(), HEX_GRAIN, |e| {
+        hexes.get(e).map_or((f64::INFINITY, 1.0), |hex| {
+            let c = hex.map(|q| at(x, q));
+            (hex_scaled_jacobian(&c), hex_edge_ratio(&c))
+        })
+    });
     let mut l = Local { sj: f64::INFINITY, ratio: 1.0 };
-    for hex in hexes {
-        let c = hex.map(|q| at(x, q));
-        l.sj = l.sj.min(hex_scaled_jacobian(&c));
-        l.ratio = l.ratio.max(hex_edge_ratio(&c));
+    for (sj, ratio) in each {
+        l.sj = l.sj.min(sj);
+        l.ratio = l.ratio.max(ratio);
     }
     l
 }
@@ -347,15 +503,24 @@ const START_TIE: f64 = 0.01;
 
 fn sweep_score(x: &[P], hexes: &[[u32; 8]]) -> SweepScore {
     let (mut min, mut sum) = (f64::INFINITY, 0.0);
-    for hex in hexes {
-        let sj = hex_scaled_jacobian(&hex.map(|q| at(x, q)));
+    for sj in scaled_jacobians(x, hexes) {
         min = min.min(sj);
         sum += sj;
     }
     SweepScore { min, mean: if hexes.is_empty() { 0.0 } else { sum / hexes.len() as f64 } }
 }
 
-/// Smooth in place: at most `iterations` sweeps, stopping when no node moves more than `tol`.
+/// How to smooth: the method, at most `iterations` sweeps, stopping when no node moves more than
+/// `tol`, the nodes moved in `order`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Run {
+    pub method: Smoothing,
+    pub iterations: usize,
+    pub tol: f64,
+    pub order: Order,
+}
+
+/// Smooth in place ([`Run`]): at most `iterations` sweeps, stopping when no node moves more than `tol`.
 ///
 /// The sweeps let a move take an element down to [`SWEEP_FLOOR`] (a sheared block straightens
 /// only when its nodes move together, and a node-by-node rule that never lowers a poor element
@@ -365,16 +530,16 @@ fn sweep_score(x: &[P], hexes: &[[u32; 8]]) -> SweepScore {
 /// below [`QUALITY_FLOOR`]; and when neither holds it, the grid stays as it was. So smoothing never
 /// leaves the mesh worse than it found it (a regular grid of graded layers, which Laplace's
 /// equation would even out, is kept).
-pub(crate) fn smooth(m: Mesh, g: &dyn Geometry, targets: &[Vec<u32>], method: Smoothing, iterations: usize, tol: f64) -> SmoothReport {
+pub(crate) fn smooth(m: Mesh, g: &dyn Geometry, targets: &[Vec<u32>], run: Run) -> SmoothReport {
     let start = m.nodes.clone();
     let before = mesh_quality(&start, m.hexes);
     let mut m = m;
-    let mut report = pass(&mut m, g, targets, method, iterations, tol, SWEEP_FLOOR);
+    let mut report = pass(&mut m, g, targets, run, SWEEP_FLOOR);
     if mesh_quality(m.nodes, m.hexes).holds(before) {
         return report;
     }
     m.nodes.clone_from(&start);
-    let strict = pass(&mut m, g, targets, method, iterations, tol, QUALITY_FLOOR);
+    let strict = pass(&mut m, g, targets, run, QUALITY_FLOOR);
     report = SmoothReport { iterations: report.iterations + strict.iterations, refused: report.refused + strict.refused };
     if !mesh_quality(m.nodes, m.hexes).holds(before) {
         *m.nodes = start;
@@ -384,7 +549,8 @@ pub(crate) fn smooth(m: Mesh, g: &dyn Geometry, targets: &[Vec<u32>], method: Sm
 
 /// One smoothing run; sweep moves keep every element at or above the lower of its scaled
 /// Jacobian before and `sweep_floor`.
-fn pass(m: &mut Mesh, g: &dyn Geometry, targets: &[Vec<u32>], method: Smoothing, iterations: usize, tol: f64, sweep_floor: f64) -> SmoothReport {
+fn pass(m: &mut Mesh, g: &dyn Geometry, targets: &[Vec<u32>], run: Run, sweep_floor: f64) -> SmoothReport {
+    let Run { method, iterations, tol, order } = run;
     let n = m.nodes.len();
     let mut around: Vec<Vec<u32>> = vec![Vec::new(); n];
     for (h, hex) in m.hexes.iter().enumerate() {
@@ -395,7 +561,7 @@ fn pass(m: &mut Mesh, g: &dyn Geometry, targets: &[Vec<u32>], method: Smoothing,
         }
     }
     // Edge neighbours (all) and boundary neighbours (along boundary quads).
-    let edges = edge_neighbours(n, m.hexes);
+    let edges = edge_neighbours(&around, m.hexes);
     let mut along_boundary: BTreeMap<u32, BTreeSet<u32>> = BTreeMap::new();
     for q in m.boundary {
         for i in 0..4 {
@@ -406,25 +572,29 @@ fn pass(m: &mut Mesh, g: &dyn Geometry, targets: &[Vec<u32>], method: Smoothing,
     }
     let cons = |v: u32| m.constraint.get(v as usize).copied().unwrap_or(Constraint::Free);
     let is_held = |v: u32| m.held.get(v as usize).copied().unwrap_or(false);
-    let mut stencils: Vec<Option<Stencil>> = vec![None; n];
-    if matches!(method, Smoothing::Elliptic | Smoothing::EllipticControlled) {
-        for v in 0..n as u32 {
-            if cons(v) == Constraint::Free {
-                let mut s = around.get(v as usize).and_then(|a| stencil(v, a, m.hexes));
-                if let (Some(st), Smoothing::EllipticControlled) = (s.as_mut(), method) {
-                    let p = at(m.nodes, v);
-                    for d in 0..3 {
-                        let (mi, pl) = (at(m.nodes, st.nb[d][0]), at(m.nodes, st.nb[d][1]));
-                        let xi = scale(sub(pl, mi), 0.5);
-                        let xii = sub(add(pl, mi), scale(p, 2.0));
-                        let l2 = dot(xi, xi);
-                        st.control[d] = if l2 > 0.0 { (-dot(xi, xii) / l2).clamp(-MAX_CONTROL, MAX_CONTROL) } else { 0.0 };
-                    }
-                }
-                stencils[v as usize] = s;
+    let stencils: Vec<Option<Stencil>> = if matches!(method, Smoothing::Elliptic | Smoothing::EllipticControlled) {
+        let nodes: &[P] = m.nodes;
+        fieldcraft_parallel::map_grained(n, NODE_GRAIN, |i| {
+            let v = i as u32;
+            if cons(v) != Constraint::Free {
+                return None;
             }
-        }
-    }
+            let mut s = around.get(i).and_then(|a| stencil(v, a, m.hexes));
+            if let (Some(st), Smoothing::EllipticControlled) = (s.as_mut(), method) {
+                let p = at(nodes, v);
+                for d in 0..3 {
+                    let (mi, pl) = (at(nodes, st.nb[d][0]), at(nodes, st.nb[d][1]));
+                    let xi = scale(sub(pl, mi), 0.5);
+                    let xii = sub(add(pl, mi), scale(p, 2.0));
+                    let l2 = dot(xi, xi);
+                    st.control[d] = if l2 > 0.0 { (-dot(xi, xii) / l2).clamp(-MAX_CONTROL, MAX_CONTROL) } else { 0.0 };
+                }
+            }
+            s
+        })
+    } else {
+        vec![None; n]
+    };
     let hexes = m.hexes;
     let quality = |x: &[P], v: u32| -> Local {
         let mut l = Local { sj: f64::INFINITY, ratio: 1.0 };
@@ -444,61 +614,48 @@ fn pass(m: &mut Mesh, g: &dyn Geometry, targets: &[Vec<u32>], method: Smoothing,
     // element down to the sweep floor), so where they stop decides the result; keep the best grid
     // seen (smallest scaled Jacobian, then the mean) and lift the worst elements from that.
     let mut best = (sweep_score(m.nodes, hexes), m.nodes.clone());
+    let sweep = Sweep {
+        hexes,
+        around: &around,
+        constraint: m.constraint,
+        held: m.held,
+        stencils: &stencils,
+        edges: &edges,
+        along_boundary: &along_boundary,
+        g,
+        targets,
+        ptol,
+        floor: sweep_floor,
+    };
+    let classes = if order == Order::Coloured { colour_classes(&sweep, n) } else { Vec::new() };
     for it in 0..iterations {
         report.iterations = it + 1;
         let mut moved = 0.0f64;
-        for v in 0..n as u32 {
-            if is_held(v) {
-                continue;
-            }
-            let c = cons(v);
-            let p = at(m.nodes, v);
-            let mean = |nbrs: &mut dyn Iterator<Item = u32>| -> Option<P> {
-                let (mut s, mut k) = ([0.0; 3], 0usize);
-                for w in nbrs {
-                    s = add(s, at(m.nodes, w));
-                    k += 1;
-                }
-                (k > 0).then(|| scale(s, 1.0 / k as f64))
-            };
-            let target = match c {
-                Constraint::Corner(..) => continue,
-                Constraint::Free => match stencils.get(v as usize).copied().flatten() {
-                    Some(s) => winslow(m.nodes, &s),
-                    None => edges.get(v as usize).and_then(|e| mean(&mut e.iter().copied())),
-                },
-                Constraint::Surface(_) => along_boundary.get(&v).and_then(|e| mean(&mut e.iter().copied())).map(|q| place(g, targets, c, q, ptol)),
-                Constraint::Curve(a, b) => {
-                    let on_curve = |w: &u32| match cons(*w) {
-                        Constraint::Curve(x, y) => (x, y) == (a, b),
-                        Constraint::Corner(x, y, z) => [x, y, z].contains(&a) && [x, y, z].contains(&b),
-                        _ => false,
-                    };
-                    along_boundary.get(&v).and_then(|e| mean(&mut e.iter().copied().filter(on_curve))).map(|q| place(g, targets, c, q, ptol))
-                }
-            };
-            let Some(q) = target else { continue };
-            if dist(q, p) <= 1e-3 * tol {
-                continue;
-            }
-            // The full move, else half, else a quarter of it, whichever keeps the quality.
-            let before = quality(m.nodes, v);
-            let mut accepted = false;
-            for step in [1.0, 0.5, 0.25] {
-                let x = if step == 1.0 { q } else { place(g, targets, c, add(p, scale(sub(q, p), step)), ptol) };
-                if let Some(slot) = m.nodes.get_mut(v as usize) {
+        let mut apply = |nodes: &mut Vec<P>, v: u32, mv: Move| match mv {
+            Move::Stay => {}
+            Move::To(x, d) => {
+                if let Some(slot) = nodes.get_mut(v as usize) {
                     *slot = x;
                 }
-                if quality(m.nodes, v).keeps_above(before, sweep_floor) {
-                    moved = moved.max(dist(x, p));
-                    accepted = true;
-                    break;
+                moved = moved.max(d);
+            }
+            Move::Refused => report.refused += 1,
+        };
+        match order {
+            Order::Sequential => {
+                for v in 0..n as u32 {
+                    let mv = sweep.step(m.nodes, v);
+                    apply(m.nodes, v, mv);
                 }
             }
-            if !accepted {
-                report.refused += 1;
-                if let Some(slot) = m.nodes.get_mut(v as usize) {
-                    *slot = p;
+            Order::Coloured => {
+                for class in &classes {
+                    let nodes: &[P] = m.nodes;
+                    let moves =
+                        fieldcraft_parallel::map_grained(class.len(), NODE_GRAIN, |i| class.get(i).map_or(Move::Stay, |&v| sweep.step(nodes, v)));
+                    for (&v, mv) in class.iter().zip(moves) {
+                        apply(m.nodes, v, mv);
+                    }
                 }
             }
         }
@@ -527,8 +684,13 @@ fn pass(m: &mut Mesh, g: &dyn Geometry, targets: &[Vec<u32>], method: Smoothing,
         // IJNME 40:3979–4002, 1997, on Knupp's hexahedral metric), boundary nodes kept on their
         // targets.
         for _ in 0..OPTIMIZE_ROUNDS {
-            let mut poor: Vec<u32> =
-                m.hexes.iter().filter(|h| hex_scaled_jacobian(&h.map(|q| at(m.nodes, q))) < LIFT_BELOW).flat_map(|h| h.iter().copied()).collect();
+            let mut poor: Vec<u32> = m
+                .hexes
+                .iter()
+                .zip(scaled_jacobians(m.nodes, m.hexes))
+                .filter(|(_, sj)| *sj < LIFT_BELOW)
+                .flat_map(|(h, _)| h.iter().copied())
+                .collect();
             poor.sort_unstable();
             poor.dedup();
             if poor.is_empty() {
@@ -578,7 +740,7 @@ fn pass(m: &mut Mesh, g: &dyn Geometry, targets: &[Vec<u32>], method: Smoothing,
         // toward the mean of its neighbours on the surface, as far as no element round it falls below
         // the lower of its own value and the mesh's smallest after the search (so the mesh's worst
         // element is no worse for it).
-        let floor = hexes.iter().map(|h| hex_scaled_jacobian(&h.map(|q| at(m.nodes, q)))).fold(f64::INFINITY, f64::min);
+        let floor = scaled_jacobians(m.nodes, hexes).into_iter().fold(f64::INFINITY, f64::min);
         for _ in 0..STRAIGHTEN_SWEEPS {
             let mut moved = false;
             for v in 0..n as u32 {
