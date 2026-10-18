@@ -26,6 +26,7 @@
 
 mod bernstein;
 pub mod conformity;
+mod hex8;
 pub mod jacobian;
 mod report;
 pub(crate) mod shape;
@@ -217,6 +218,11 @@ fn exact_tet_sign(xyz: &[[f64; 3]]) -> Option<Sign> {
 /// hex20) from its node coordinates in node order.
 pub fn element_validity(kind: ElementKind, xyz: &[[f64; 3]]) -> Result<JacobianCheck> {
     let p = local(kind, xyz)?;
+    if kind == ElementKind::Hex8
+        && let Some((check, _, _)) = hex8::hex8(&corners(&p)?)
+    {
+        return Ok(check);
+    }
     checked(kind, xyz, &p).map(|(_, check)| check)
 }
 
@@ -237,32 +243,49 @@ fn hex_metrics(columns: &Columns) -> (f64, f64) {
 /// Rods and beams are an error ([`is_measured`]).
 pub fn element_quality(kind: ElementKind, xyz: &[[f64; 3]]) -> Result<ElementQuality> {
     let p = local(kind, xyz)?;
+    if kind == ElementKind::Hex8 {
+        let c = corners::<8>(&p)?;
+        if let Some((check, scaled, knupp)) = hex8::hex8(&c) {
+            let metrics = vec![
+                (Metric::EdgeRatio, shape::edge_ratio(&c, &jacobian::HEX_EDGES)),
+                (Metric::ScaledJacobian, scaled),
+                (Metric::Shape, knupp),
+                (Metric::JacobianRatio, check.ratio),
+            ];
+            return Ok(ElementQuality { kind, size: check.volume, jacobian: Some(check), metrics });
+        }
+    }
+    generic_quality(kind, xyz, &p)
+}
+
+/// [`element_quality`] through the generic Bernstein path (every kind).
+fn generic_quality(kind: ElementKind, xyz: &[[f64; 3]], p: &[[f64; 3]]) -> Result<ElementQuality> {
     let mut metrics = match kind {
         ElementKind::Tri3 | ElementKind::Tri6 => {
-            let (area, metrics) = shape::tri(corners(&p)?);
+            let (area, metrics) = shape::tri(corners(p)?);
             return Ok(ElementQuality { kind, size: area, jacobian: None, metrics });
         }
         ElementKind::Quad4 | ElementKind::Quad8 => {
-            let (area, metrics) = shape::quad(corners(&p)?);
+            let (area, metrics) = shape::quad(corners(p)?);
             return Ok(ElementQuality { kind, size: area, jacobian: None, metrics });
         }
         ElementKind::Rod2 | ElementKind::Rod3 | ElementKind::Beam2 => {
             return Err(Error::Invalid(format!("quality metrics are not defined for {}", kind.name())));
         }
-        ElementKind::Tet4 | ElementKind::Tet10 => shape::tet(corners(&p)?),
+        ElementKind::Tet4 | ElementKind::Tet10 => shape::tet(corners(p)?),
         ElementKind::Wedge6 => {
-            let c: [[f64; 3]; 6] = corners(&p)?;
+            let c: [[f64; 3]; 6] = corners(p)?;
             let edges = [(0, 1), (1, 2), (2, 0), (3, 4), (4, 5), (5, 3), (0, 3), (1, 4), (2, 5)];
             vec![(Metric::ScaledJacobian, shape::wedge_scaled_jacobian(c)), (Metric::EdgeRatio, shape::edge_ratio(&c, &edges))]
         }
         ElementKind::Pyramid5 => {
-            let c: [[f64; 3]; 5] = corners(&p)?;
+            let c: [[f64; 3]; 5] = corners(p)?;
             let edges = [(0, 1), (1, 2), (2, 3), (3, 0), (0, 4), (1, 4), (2, 4), (3, 4)];
             vec![(Metric::ScaledJacobian, shape::pyramid_scaled_jacobian(c)), (Metric::EdgeRatio, shape::edge_ratio(&c, &edges))]
         }
-        ElementKind::Hex8 | ElementKind::Hex20 => vec![(Metric::EdgeRatio, shape::edge_ratio(&corners::<8>(&p)?, &jacobian::HEX_EDGES))],
+        ElementKind::Hex8 | ElementKind::Hex20 => vec![(Metric::EdgeRatio, shape::edge_ratio(&corners::<8>(p)?, &jacobian::HEX_EDGES))],
     };
-    let (columns, check) = checked(kind, xyz, &p)?;
+    let (columns, check) = checked(kind, xyz, p)?;
     if let Some(columns) = columns.as_ref().filter(|_| matches!(kind, ElementKind::Hex8 | ElementKind::Hex20)) {
         let (scaled, knupp) = hex_metrics(columns);
         metrics.extend([(Metric::ScaledJacobian, scaled), (Metric::Shape, knupp)]);
