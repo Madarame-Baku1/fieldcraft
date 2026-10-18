@@ -383,3 +383,72 @@ fn a_fixed_patch_the_blocks_do_not_match_is_an_error() {
     let broken = FixedPatch { quads: vec![[0, 0, 1, 2]], ..patch_of(&m, 0) };
     assert!(project_mesh(&topo, &s, &t, &ProjectOptions { fixed: vec![broken], ..options(1.0) }).is_err());
 }
+
+/// A sweep device in double precision ([`super::device::reference_move`]): the host's split
+/// into device and host nodes, the frozen grid per class and the updates both ways, without a
+/// GPU.
+struct ReferenceDevice {
+    nodes: Vec<P>,
+    hexes: Vec<[u32; 8]>,
+    around: Vec<Vec<u32>>,
+    classes: Vec<Vec<super::device::DeviceNode>>,
+    floor: f64,
+    min_move: f64,
+}
+
+impl super::device::SweepDevice for ReferenceDevice {
+    fn name(&self) -> String {
+        "reference".into()
+    }
+    fn sweep(&mut self, class: usize) -> crate::Result<Vec<super::device::Move>> {
+        let mesh = super::device::SweepMesh {
+            nodes: &self.nodes,
+            hexes: &self.hexes,
+            around: &self.around,
+            classes: Vec::new(),
+            floor: self.floor,
+            min_move: self.min_move,
+        };
+        let moves: Vec<_> = self.classes[class].iter().map(|n| super::device::reference_move(&mesh, &self.nodes, n)).collect();
+        for (n, mv) in self.classes[class].iter().zip(&moves) {
+            if let super::device::Move::To(x) = mv {
+                self.nodes[n.node as usize] = *x;
+            }
+        }
+        Ok(moves)
+    }
+    fn set(&mut self, moved: &[(u32, P)]) -> crate::Result<()> {
+        for &(v, x) in moved {
+            self.nodes[v as usize] = x;
+        }
+        Ok(())
+    }
+}
+
+/// The device path with the reference device gives the CPU's coloured sweeps bit for bit.
+#[test]
+fn a_reference_sweep_device_gives_the_coloured_sweeps() {
+    use super::smooth::Order;
+    super::device::register_sweep_device(Box::new(|m| {
+        Ok(Box::new(ReferenceDevice {
+            nodes: m.nodes.to_vec(),
+            hexes: m.hexes.to_vec(),
+            around: m.around.to_vec(),
+            classes: m.classes.clone(),
+            floor: m.floor,
+            min_move: m.min_move,
+        }))
+    }));
+    let r = 10.0;
+    let (ss, st) = sphere(r, 96);
+    let ball = Topology::sphere([0.0; 3], r, 0.55).unwrap();
+    let (cs, ct) = cylinder(r, 2.0, 128);
+    let disc = Topology::butterfly([0.0; 3], [0.0, 0.0, 1.0], r, &[0.0, 2.0], 0.55).unwrap();
+    for (topo, s, t, size) in [(&ball, &ss, &st, 3.0), (&disc, &cs, &ct, 2.0)] {
+        let opts = options(size);
+        let coloured = project_ordered(topo, s, t, &opts, Order::Coloured).unwrap();
+        let device = project_mesh(topo, s, t, &ProjectOptions { backend: Backend::Device, ..opts.clone() }).unwrap();
+        assert_eq!(coloured.nodes, device.nodes, "size {size}");
+        assert_eq!(coloured.report, device.report, "size {size}");
+    }
+}

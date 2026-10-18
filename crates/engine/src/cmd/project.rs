@@ -548,6 +548,7 @@ fn hex_project(s: &mut Session, raw: &Value) -> Result<Value> {
         fixed,
         planes: Vec::new(),
         field,
+        backend: Default::default(),
     };
     let merge = merge_distance(p.merge, diag)?;
     project_body(s, &p.body, b, &t, &opts, merge)

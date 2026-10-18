@@ -25,9 +25,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use super::device::{DeviceNode, Move, Rule, SweepMesh, sweep_device_factory};
 use super::target::{Constraint, Geometry, place};
 use super::topology::{CORNERS, corner_at};
 use crate::vec3::{P, add, cross, dist, dot, norm, scale, sub};
+use crate::{Error, Result};
 
 /// Smoothing never takes an element's scaled Jacobian below this (unless it already was).
 pub const QUALITY_FLOOR: f64 = 0.5;
@@ -151,7 +153,7 @@ pub(crate) fn hex_edge_ratio(x: &[P; 8]) -> f64 {
 
 /// The quality around a node: the smallest scaled Jacobian and the largest edge ratio.
 #[derive(Debug, Clone, Copy)]
-struct Local {
+pub(crate) struct Local {
     sj: f64,
     ratio: f64,
 }
@@ -178,10 +180,10 @@ impl Local {
 /// The structured stencil of a regular interior node: `nb[d] = [minus, plus]` and the face
 /// diagonals `diag[pair][sa][sb]` for the direction pairs (0, 1), (0, 2), (1, 2).
 #[derive(Debug, Clone, Copy)]
-struct Stencil {
-    nb: [[u32; 2]; 3],
-    diag: [[[u32; 2]; 2]; 3],
-    control: [f64; 3],
+pub(crate) struct Stencil {
+    pub nb: [[u32; 2]; 3],
+    pub diag: [[[u32; 2]; 2]; 3],
+    pub control: [f64; 3],
 }
 
 const PAIRS: [(usize, usize); 3] = [(0, 1), (0, 2), (1, 2)];
@@ -249,7 +251,7 @@ fn at(x: &[P], v: u32) -> P {
 }
 
 /// The Winslow update of a regular node.
-fn winslow(x: &[P], s: &Stencil) -> Option<P> {
+pub(crate) fn winslow(x: &[P], s: &Stencil) -> Option<P> {
     let xi: [P; 3] = [0, 1, 2].map(|d| scale(sub(at(x, s.nb[d][1]), at(x, s.nb[d][0])), 0.5));
     let g = |i: usize, j: usize| dot(xi[i], xi[j]);
     let (g11, g22, g33, g12, g13, g23) = (g(0, 0), g(1, 1), g(2, 2), g(0, 1), g(0, 2), g(1, 2));
@@ -281,8 +283,11 @@ pub(crate) enum Order {
     Sequential,
     /// Colour by colour ([`colour_classes`]): no two nodes of a colour share an element, so a
     /// colour's moves are independent and run in parallel, and the result does not depend on the
-    /// thread count.
+    /// thread count. Reached from the crate's tests and benchmark for now.
+    #[cfg_attr(not(test), allow(dead_code))]
     Coloured,
+    /// Colour by colour with the free nodes on the registered sweep device ([`super::device`]).
+    Device,
 }
 
 /// Nodes per parallel task in a coloured sweep.
@@ -290,15 +295,6 @@ const NODE_GRAIN: usize = 1024;
 
 /// Elements per parallel task when a whole mesh is measured.
 pub(crate) const HEX_GRAIN: usize = 4096;
-
-/// What a sweep does with a node.
-#[derive(Debug, Clone, Copy)]
-enum Move {
-    Stay,
-    /// To this place, this far.
-    To(P, f64),
-    Refused,
-}
 
 /// What a sweep move of one node reads.
 struct Sweep<'a> {
@@ -327,13 +323,7 @@ impl Sweep<'_> {
 
     /// The quality around `v` with `v` at `p`.
     fn quality(&self, x: &[P], v: u32, p: P) -> Local {
-        let mut l = Local { sj: f64::INFINITY, ratio: 1.0 };
-        for hex in self.around.get(v as usize).into_iter().flatten().filter_map(|&h| self.hexes.get(h as usize)) {
-            let c = hex.map(|q| if q == v { p } else { at(x, q) });
-            l.sj = l.sj.min(hex_scaled_jacobian(&c));
-            l.ratio = l.ratio.max(hex_edge_ratio(&c));
-        }
-        l
+        quality_around(x, self.hexes, self.around.get(v as usize).map_or(&[][..], Vec::as_slice), v, p)
     }
 
     /// The move of `v` from the grid `x`: reads only the elements around `v`.
@@ -343,7 +333,6 @@ impl Sweep<'_> {
         }
         let (g, targets, ptol) = (self.g, self.targets, self.ptol);
         let c = self.cons(v);
-        let p = at(x, v);
         let mean = |nbrs: &mut dyn Iterator<Item = u32>| -> Option<P> {
             let (mut s, mut k) = ([0.0; 3], 0usize);
             for w in nbrs {
@@ -368,20 +357,38 @@ impl Sweep<'_> {
                 self.along_boundary.get(&v).and_then(|e| mean(&mut e.iter().copied().filter(on_curve))).map(|q| place(g, targets, c, q, ptol))
             }
         };
-        let Some(q) = target else { return Move::Stay };
-        if dist(q, p) <= ptol {
-            return Move::Stay;
-        }
-        // The full move, else half, else a quarter of it, whichever keeps the quality.
-        let before = self.quality(x, v, p);
-        for step in [1.0, 0.5, 0.25] {
-            let to = if step == 1.0 { q } else { place(g, targets, c, add(p, scale(sub(q, p), step)), ptol) };
-            if self.quality(x, v, to).keeps_above(before, self.floor) {
-                return Move::To(to, dist(to, p));
-            }
-        }
-        Move::Refused
+        guarded(x, v, target, ptol, self.floor, |to| self.quality(x, v, to), |to| place(g, targets, c, to, ptol))
     }
+}
+
+/// The quality of the elements `around` node `v` with `v` at `p`.
+pub(crate) fn quality_around(x: &[P], hexes: &[[u32; 8]], around: &[u32], v: u32, p: P) -> Local {
+    let mut l = Local { sj: f64::INFINITY, ratio: 1.0 };
+    for hex in around.iter().filter_map(|&h| hexes.get(h as usize)) {
+        let c = hex.map(|q| if q == v { p } else { at(x, q) });
+        l.sj = l.sj.min(hex_scaled_jacobian(&c));
+        l.ratio = l.ratio.max(hex_edge_ratio(&c));
+    }
+    l
+}
+
+/// The guarded move of node `v` of `x` toward `target`: none when it is shorter than
+/// `min_move`; else the full move, else half, else a quarter of it (each `place`d back on the
+/// node's geometry), whichever keeps `quality` around the node ([`Local::keeps_above`] `floor`).
+pub(crate) fn guarded(x: &[P], v: u32, target: Option<P>, min_move: f64, floor: f64, quality: impl Fn(P) -> Local, place: impl Fn(P) -> P) -> Move {
+    let p = at(x, v);
+    let Some(q) = target else { return Move::Stay };
+    if dist(q, p) <= min_move {
+        return Move::Stay;
+    }
+    let before = quality(p);
+    for step in [1.0, 0.5, 0.25] {
+        let to = if step == 1.0 { q } else { place(add(p, scale(sub(q, p), step))) };
+        if quality(to).keeps_above(before, floor) {
+            return Move::To(to);
+        }
+    }
+    Move::Refused
 }
 
 /// The movable nodes in classes no two nodes of which share an element (a greedy colouring in
@@ -530,26 +537,26 @@ pub(crate) struct Run {
 /// below [`QUALITY_FLOOR`]; and when neither holds it, the grid stays as it was. So smoothing never
 /// leaves the mesh worse than it found it (a regular grid of graded layers, which Laplace's
 /// equation would even out, is kept).
-pub(crate) fn smooth(m: Mesh, g: &dyn Geometry, targets: &[Vec<u32>], run: Run) -> SmoothReport {
+pub(crate) fn smooth(m: Mesh, g: &dyn Geometry, targets: &[Vec<u32>], run: Run) -> Result<SmoothReport> {
     let start = m.nodes.clone();
     let before = mesh_quality(&start, m.hexes);
     let mut m = m;
-    let mut report = pass(&mut m, g, targets, run, SWEEP_FLOOR);
+    let mut report = pass(&mut m, g, targets, run, SWEEP_FLOOR)?;
     if mesh_quality(m.nodes, m.hexes).holds(before) {
-        return report;
+        return Ok(report);
     }
     m.nodes.clone_from(&start);
-    let strict = pass(&mut m, g, targets, run, QUALITY_FLOOR);
+    let strict = pass(&mut m, g, targets, run, QUALITY_FLOOR)?;
     report = SmoothReport { iterations: report.iterations + strict.iterations, refused: report.refused + strict.refused };
     if !mesh_quality(m.nodes, m.hexes).holds(before) {
         *m.nodes = start;
     }
-    report
+    Ok(report)
 }
 
 /// One smoothing run; sweep moves keep every element at or above the lower of its scaled
 /// Jacobian before and `sweep_floor`.
-fn pass(m: &mut Mesh, g: &dyn Geometry, targets: &[Vec<u32>], run: Run, sweep_floor: f64) -> SmoothReport {
+fn pass(m: &mut Mesh, g: &dyn Geometry, targets: &[Vec<u32>], run: Run, sweep_floor: f64) -> Result<SmoothReport> {
     let Run { method, iterations, tol, order } = run;
     let n = m.nodes.len();
     let mut around: Vec<Vec<u32>> = vec![Vec::new(); n];
@@ -607,7 +614,7 @@ fn pass(m: &mut Mesh, g: &dyn Geometry, targets: &[Vec<u32>], run: Run, sweep_fl
     };
     let mut report = SmoothReport { iterations: 0, refused: 0 };
     if method == Smoothing::None {
-        return report;
+        return Ok(report);
     }
     let ptol = 1e-3 * tol;
     // The sweeps do not raise the smallest scaled Jacobian monotonically (a move may take an
@@ -627,17 +634,37 @@ fn pass(m: &mut Mesh, g: &dyn Geometry, targets: &[Vec<u32>], run: Run, sweep_fl
         ptol,
         floor: sweep_floor,
     };
-    let classes = if order == Order::Coloured { colour_classes(&sweep, n) } else { Vec::new() };
+    let classes = if order == Order::Sequential { Vec::new() } else { colour_classes(&sweep, n) };
+    // On a device: each class split into the free nodes the device moves and the rest, moved here.
+    let mut device = None;
+    let mut split: Vec<(Vec<u32>, Vec<u32>)> = Vec::new();
+    if order == Order::Device {
+        let factory = sweep_device_factory().ok_or_else(|| {
+            Error::Unsupported("this build has no GPU smoothing (no sweep device is registered): smooth with the `cpu` or `coloured` backend".into())
+        })?;
+        let mut device_classes = Vec::with_capacity(classes.len());
+        for class in &classes {
+            let (free, rest): (Vec<u32>, Vec<u32>) = class.iter().partition(|&&v| sweep.cons(v) == Constraint::Free);
+            let rule = |v: u32| match stencils.get(v as usize).copied().flatten() {
+                Some(s) => Rule::Winslow { nb: s.nb, diag: s.diag, control: s.control },
+                None => Rule::Mean(edges.get(v as usize).cloned().unwrap_or_default()),
+            };
+            device_classes.push(free.iter().map(|&v| DeviceNode { node: v, rule: rule(v) }).collect());
+            split.push((free, rest));
+        }
+        let mesh = SweepMesh { nodes: m.nodes, hexes, around: &around, classes: device_classes, floor: sweep_floor, min_move: ptol };
+        device = Some(factory(&mesh)?);
+    }
     for it in 0..iterations {
         report.iterations = it + 1;
         let mut moved = 0.0f64;
         let mut apply = |nodes: &mut Vec<P>, v: u32, mv: Move| match mv {
             Move::Stay => {}
-            Move::To(x, d) => {
+            Move::To(x) => {
                 if let Some(slot) = nodes.get_mut(v as usize) {
+                    moved = moved.max(dist(x, *slot));
                     *slot = x;
                 }
-                moved = moved.max(d);
             }
             Move::Refused => report.refused += 1,
         };
@@ -656,6 +683,31 @@ fn pass(m: &mut Mesh, g: &dyn Geometry, targets: &[Vec<u32>], run: Run, sweep_fl
                     for (&v, mv) in class.iter().zip(moves) {
                         apply(m.nodes, v, mv);
                     }
+                }
+            }
+            Order::Device => {
+                let Some(dev) = device.as_mut() else { return Err(Error::Failed("the sweep device is missing".into())) };
+                for (k, (free, rest)) in split.iter().enumerate() {
+                    // The device moves the free nodes of the class while the host moves the rest,
+                    // both from the grid as it was before the class.
+                    let moves = dev.sweep(k)?;
+                    if moves.len() != free.len() {
+                        return Err(Error::Failed(format!("{} moved {} of {} nodes", dev.name(), moves.len(), free.len())));
+                    }
+                    let nodes: &[P] = m.nodes;
+                    let here =
+                        fieldcraft_parallel::map_grained(rest.len(), NODE_GRAIN, |i| rest.get(i).map_or(Move::Stay, |&v| sweep.step(nodes, v)));
+                    for (&v, mv) in free.iter().zip(moves) {
+                        apply(m.nodes, v, mv);
+                    }
+                    let mut placed = Vec::new();
+                    for (&v, mv) in rest.iter().zip(here) {
+                        if let Move::To(x) = mv {
+                            placed.push((v, x));
+                        }
+                        apply(m.nodes, v, mv);
+                    }
+                    dev.set(&placed)?;
                 }
             }
         }
@@ -790,5 +842,5 @@ fn pass(m: &mut Mesh, g: &dyn Geometry, targets: &[Vec<u32>], run: Run, sweep_fl
     if let Some((_, _, nodes)) = finished {
         *m.nodes = nodes;
     }
-    report
+    Ok(report)
 }

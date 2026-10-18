@@ -17,6 +17,7 @@
 //! index space, carved, projected face → surface, edge → curve, vertex → point, then smoothed);
 //! the algorithms are the papers cited in each module.
 
+pub mod device;
 pub mod fixed;
 mod lattice;
 pub mod smooth;
@@ -105,6 +106,24 @@ pub struct ProjectOptions {
     /// chosen: an edge's length is then measured in units of the field ([`crate::size::ideal_divisions`]).
     /// Its global size is `size`.
     pub field: Option<crate::size::RegionSize>,
+    /// Where the smoothing sweeps run.
+    pub backend: Backend,
+}
+
+/// Where a projection's smoothing sweeps run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backend {
+    /// On the CPU, node by node: the reference, the same mesh on every machine.
+    #[default]
+    Cpu,
+    /// On the CPU, colour by colour (no two nodes of a colour share an element), each colour in
+    /// parallel: the same mesh on every machine and thread count, a slightly different one from
+    /// [`Backend::Cpu`]'s; the reference of [`Backend::Device`].
+    Coloured,
+    /// Colour by colour with the free nodes on the registered sweep device ([`device`]): single
+    /// precision there, deterministic per device, the same verdicts as [`Backend::Coloured`] and a
+    /// smallest scaled Jacobian within 0.02 of it; an error when none is registered.
+    Device,
 }
 
 impl Default for ProjectOptions {
@@ -121,6 +140,7 @@ impl Default for ProjectOptions {
             fixed: Vec::new(),
             planes: Vec::new(),
             field: None,
+            backend: Backend::Cpu,
         }
     }
 }
@@ -334,7 +354,12 @@ fn edge_key(a: u32, b: u32) -> [u32; 2] {
 
 /// Mesh the topology `t` projected onto the body bounded by `surface`, through `g`.
 pub fn project_mesh(t: &Topology, surface: &BoundarySurface, g: &dyn Geometry, opts: &ProjectOptions) -> Result<ProjectedMesh> {
-    project_ordered(t, surface, g, opts, smooth::Order::Sequential)
+    let order = match opts.backend {
+        Backend::Cpu => smooth::Order::Sequential,
+        Backend::Coloured => smooth::Order::Coloured,
+        Backend::Device => smooth::Order::Device,
+    };
+    project_ordered(t, surface, g, opts, order)
 }
 
 /// [`project_mesh`] with the smoothing sweeps in `order`.
@@ -824,7 +849,7 @@ pub(crate) fn project_ordered(
         g,
         &targets,
         smooth::Run { method: opts.smoothing, iterations: opts.iterations, tol: 1e-4 * opts.size, order },
-    );
+    )?;
 
     fieldcraft_model::progress::check()?;
     // Certified quality, the gap to the geometry and the tags.
