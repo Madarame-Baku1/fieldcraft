@@ -110,7 +110,7 @@ pub const FLUID: CommandSpec = CommandSpec {
 pub const PROBE: CommandSpec = CommandSpec {
     id: "solve.probe",
     label: "Probe Results",
-    params: r#"{"step": "Load", "nodes": [1, 2] (or "set": "fillet", a set's nodes), "mode": 1, "frame": 0} — the stored result at nodes (with `max_von_mises`, the largest among them, for static steps): displacement, rotation, reaction, reaction moment, stress and von Mises (static, with `elements` each element's results: solid, 2D and truss nodal stresses (and, in a nonlinear step, the equivalent plastic strain at the integration points of a plastic element), shell section forces (N, M, Q per length in the element's axes) and bottom, middle and top stresses, beam end forces (N, V_y, V_z, T, M_y, M_z in its axes)), the shape of mode `mode` with its rotations (frequency, from 1), or displacement and velocity in field frame `frame` (explicit, from 0; the last by default) at `nodes` (or at the nodes nearest to points: "at": [[x, y, z], ...], lowest label on a tie, each entry then giving its `xyz` and `distance`) and, with `elements` (explicit), each element's stress, von Mises stress, strain, equivalent plastic strain, damage, temperature and whether it has eroded; a coupled reference point's label gives its six displacements (translations, rotations) and reactions (forces, moments). Fluid steps: {"step": "Flow", "points": [[x, y, z]], "frame": 10 (default the last)} gives velocity, pressure and (with heat) temperature in the cells at the points; {"step": "Flow", "forces": ["x_min", "F2:top", "Body1/F2:top"]} gives those walls' force histories and {"step": "Flow", "heat": ["y_min"]} the heat into them over time (power, positive into the wall)"#,
+    params: r#"{"step": "Load", "nodes": [1, 2] (or "set": "fillet", a set's nodes), "mode": 1, "frame": 0} — the stored result at nodes (with `max_von_mises`, the largest among them, for static steps): displacement, rotation, reaction, reaction moment, stress, principal stresses (the values, largest first, without their directions) and von Mises (static, with `elements` each element's results: solid, 2D and truss nodal stresses (and, in a nonlinear step, the equivalent plastic strain at the integration points of a plastic element), shell section forces (N, M, Q per length in the element's axes) and bottom, middle and top stresses, beam end forces (N, V_y, V_z, T, M_y, M_z in its axes)), the shape of mode `mode` with its rotations (frequency, from 1), or displacement and velocity in field frame `frame` (explicit, from 0; the last by default) at `nodes` (or at the nodes nearest to points: "at": [[x, y, z], ...], lowest label on a tie, each entry then giving its `xyz` and `distance`) and, with `elements` (explicit), each element's stress, von Mises stress, strain, equivalent plastic strain, damage, temperature and whether it has eroded; a coupled reference point's label gives its six displacements (translations, rotations) and reactions (forces, moments). Fluid steps: {"step": "Flow", "points": [[x, y, z]], "frame": 10 (default the last)} gives velocity, pressure and (with heat) temperature in the cells at the points; {"step": "Flow", "forces": ["x_min", "F2:top", "Body1/F2:top"]} gives those walls' force histories and {"step": "Flow", "heat": ["y_min"]} the heat into them over time (power, positive into the wall)"#,
     form: Some(super::forms::SOLVE_PROBE),
     kind: CommandKind::Model,
     requires: &[Requirement::Result],
@@ -717,6 +717,7 @@ fn probe_implicit(result: &ImplicitResult, step: &str, nodes: &[u32], p: &Value)
                             "reaction": r.reaction.get(i),
                             "reaction_moment": r.reaction_moment.get(i),
                             "stress": r.stress.get(i),
+                            "principal": r.stress.get(i).map(fieldcraft_fem::principal),
                             "von_mises": r.von_mises.get(i),
                             "temperature": r.temperature.as_ref().and_then(|t| t.get(i)),
                         });
@@ -945,6 +946,10 @@ pub(crate) mod tests {
         let probe = s.execute("solve.probe", &json!({"step": "Bend", "nodes": [11, 1]})).unwrap();
         assert!(probe["nodes"][0]["displacement"][2].as_f64().unwrap() < -3.8, "{probe}");
         assert!(probe["nodes"][1]["reaction"][2].as_f64().unwrap() != 0.0, "{probe}");
+        // The principal stresses of the nodal stress, largest first.
+        let root = &probe["nodes"][1];
+        let stress: [f64; 6] = serde_json::from_value(root["stress"].clone()).unwrap();
+        assert_eq!(root["principal"], json!(fieldcraft_fem::principal(&stress)), "{root}");
         // By location: the nearest node, with where it is.
         let at = s.execute("solve.probe", &json!({"step": "Bend", "at": [[10.1, -0.2, 0.1], [0, 0, 0]]})).unwrap();
         assert_eq!((at["nodes"][0]["node"].clone(), at["nodes"][1]["node"].clone()), (json!(11), json!(1)), "{at}");
