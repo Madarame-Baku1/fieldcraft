@@ -1,0 +1,18 @@
+[
+ {"command": "mesh.block", "params": {"body": "lower_flange", "kind": "hex20", "corners": [[0.0, -1.05, -1.0], [0.0, -0.95, -1.0], [0.0, -0.95, -0.05], [0.0, -1.05, -0.05], [10.0, -1.05, -1.0], [10.0, -0.95, -1.0], [10.0, -0.95, -0.05], [10.0, -1.05, -0.05]], "divisions": [2, 4, 32], "faces": {"1": "root", "2": "tip"}}},
+ {"command": "mesh.block", "params": {"body": "lower_corner", "kind": "hex20", "corners": [[0.0, -1.05, -0.05], [0.0, -0.95, -0.05], [0.0, -0.95, 0.05], [0.0, -1.05, 0.05], [10.0, -1.05, -0.05], [10.0, -0.95, -0.05], [10.0, -0.95, 0.05], [10.0, -1.05, 0.05]], "divisions": [2, 2, 32], "faces": {"1": "root", "2": "tip"}}},
+ {"command": "mesh.block", "params": {"body": "web", "kind": "hex20", "corners": [[0.0, -0.95, -0.05], [0.0, 0.95, -0.05], [0.0, 0.95, 0.05], [0.0, -0.95, 0.05], [10.0, -0.95, -0.05], [10.0, 0.95, -0.05], [10.0, 0.95, 0.05], [10.0, -0.95, 0.05]], "divisions": [8, 2, 32], "faces": {"1": "root", "2": "tip"}}},
+ {"command": "mesh.block", "params": {"body": "upper_corner", "kind": "hex20", "corners": [[0.0, 0.95, -0.05], [0.0, 1.05, -0.05], [0.0, 1.05, 0.05], [0.0, 0.95, 0.05], [10.0, 0.95, -0.05], [10.0, 1.05, -0.05], [10.0, 1.05, 0.05], [10.0, 0.95, 0.05]], "divisions": [2, 2, 32], "faces": {"1": "root", "2": "tip"}}},
+ {"command": "mesh.block", "params": {"body": "upper_flange", "kind": "hex20", "corners": [[0.0, 0.95, 0.05], [0.0, 1.05, 0.05], [0.0, 1.05, 1.0], [0.0, 0.95, 1.0], [10.0, 0.95, 0.05], [10.0, 1.05, 0.05], [10.0, 1.05, 1.0], [10.0, 0.95, 1.0]], "divisions": [2, 4, 32], "faces": {"1": "root", "2": "tip"}}},
+ {"command": "model.set.create", "params": {"name": "all", "geometry": [{"body": "lower_flange"}, {"body": "lower_corner"}, {"body": "web"}, {"body": "upper_corner"}, {"body": "upper_flange"}]}},
+ {"command": "model.set.create", "params": {"name": "root", "geometry": [{"body": "lower_flange", "face": "root"}, {"body": "lower_corner", "face": "root"}, {"body": "web", "face": "root"}, {"body": "upper_corner", "face": "root"}, {"body": "upper_flange", "face": "root"}]}},
+ {"command": "model.set.create", "params": {"name": "lower_tip", "geometry": [{"body": "lower_flange", "face": "tip"}]}},
+ {"command": "model.set.create", "params": {"name": "upper_tip", "geometry": [{"body": "upper_flange", "face": "tip"}]}},
+ {"command": "model.material.create", "params": {"name": "Steel", "elastic": {"type": "isotropic", "young": 210000.0, "poisson": 0.3}}},
+ {"command": "model.section.create", "params": {"name": "z_section", "set": "all", "material": "Steel", "kind": {"type": "solid"}}},
+ {"command": "model.boundary_condition.create", "params": {"name": "root", "type": "fixed", "target": {"set": "root"}}},
+ {"command": "model.load.create", "params": {"name": "lower_shear", "type": "force", "target": {"set": "lower_tip"}, "vector": [0, 0, -0.6]}},
+ {"command": "model.load.create", "params": {"name": "upper_shear", "type": "force", "target": {"set": "upper_tip"}, "vector": [0, 0, 0.6]}},
+ {"command": "model.step.create", "params": {"name": "Torque", "procedure": {"type": "static"}, "boundary_conditions": ["root"], "loads": ["lower_shear", "upper_shear"]}},
+ {"command": "solve.static", "params": {}, "id": "solve"}
+]

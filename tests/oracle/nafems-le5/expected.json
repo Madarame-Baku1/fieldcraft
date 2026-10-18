@@ -1,0 +1,15 @@
+{
+ "title": "NAFEMS LE5 Z-section cantilever (hex20)",
+ "kind": "benchmark",
+ "source": "NAFEMS, The Standard NAFEMS Benchmarks, TNSB Rev. 3, October 1990, test LE5 (target: axial stress −108 MPa at A, mid-surface); the problem and target as reproduced in the Abaqus 2016 Benchmarks Guide, section 4.2.5 'LE5: Z-section cantilever', and in the ESRD StressCheck Benchmarks Guide 'The Standard NAFEMS Benchmarks: Linear Elastic Tests' (2018), p. 15",
+ "quantities": [
+  {
+   "id": "sxx_A",
+   "quantity": "σ_xx at A (2.5, −1, −1), mid-surface of the lower flange at its free edge",
+   "measure": {"command": "solve.probe", "params": {"step": "Torque", "at": [[2.5, -1, -1]]}, "pointer": "/nodes/0/stress/0"},
+   "value": -108.0,
+   "tolerance": {"relative": 0.02},
+   "reason": "the target is published to three figures and comes from a thin-walled idealisation; a 3D solid model of the section converges about 1.5% beyond it (ours: −109.46 here, −109.60 on the next mesh; ESRD's p-version solid: −109.5, see README)"
+  }
+ ]
+}
