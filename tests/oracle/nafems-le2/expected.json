@@ -1,0 +1,23 @@
+{
+ "title": "NAFEMS LE2 cylindrical shell bending patch test (MITC4 shells)",
+ "kind": "benchmark",
+ "source": "NAFEMS, The Standard NAFEMS Benchmarks, TNSB Rev. 3, October 1990, test LE2 (target: tangential stress 60 MPa on the outer surface at E, both load cases); the problem and target as reproduced in the Abaqus 2016 Benchmarks Guide, section 4.2.2 'LE2: Cylindrical shell bending patch test', and in the ESRD StressCheck Benchmarks Guide 'The Standard NAFEMS Benchmarks: Linear Elastic Tests' (2018), p. 8",
+ "quantities": [
+  {
+   "id": "stt_E_moment",
+   "quantity": "tangential stress at E, outer surface, load case 1 (edge moment)",
+   "measure": {"command": "solve.probe", "params": {"step": "Moment", "at": [[250, 0, 1000]]}, "pointer": "/nodes/0/stress/1"},
+   "value": 60.0,
+   "tolerance": {"relative": 0.01},
+   "reason": "the target is the exact thin-shell value (6M/t²) and the stress is uniform over the patch; the 8 × 8 flat facets tilt the element axes by ±1.875° from the hoop direction, which moves 0.1% of it into σ_zz, and 16 × 16 is within 0.03% (see README)"
+  },
+  {
+   "id": "stt_E_pressure",
+   "quantity": "tangential stress at E, outer surface, load case 2 (pressure and edge traction)",
+   "measure": {"command": "solve.probe", "params": {"step": "Pressure", "at": [[250, 0, 1000]]}, "pointer": "/nodes/0/stress/1"},
+   "value": 60.0,
+   "tolerance": {"relative": 0.01},
+   "reason": "the target is the exact membrane value (pR/t) and the stress is uniform over the patch; as in load case 1 the facets' tilt and the pressure on flat facets keep 8 × 8 within 0.2%, 16 × 16 within 0.05% (see README)"
+  }
+ ]
+}

@@ -1,0 +1,15 @@
+{
+ "title": "NAFEMS LE3 hemispherical shell with point loads (MITC4 shells)",
+ "kind": "benchmark",
+ "source": "NAFEMS, The Standard NAFEMS Benchmarks, TNSB Rev. 3, October 1990, test LE3 (target: radial displacement 0.185 m at A); the problem and target as reproduced in the Abaqus 2016 Benchmarks Guide, section 4.2.3 'LE3: Hemispherical shell with point loads', and in the ESRD StressCheck Benchmarks Guide 'The Standard NAFEMS Benchmarks: Linear Elastic Tests' (2018), p. 12",
+ "quantities": [
+  {
+   "id": "ur_A",
+   "quantity": "radial displacement at A (10, 0, 0), m",
+   "measure": {"command": "solve.probe", "params": {"step": "Load", "at": [[10, 0, 0]]}, "pointer": "/nodes/0/displacement/0"},
+   "value": 0.185,
+   "tolerance": {"relative": 0.02},
+   "reason": "the target is published to three figures; the displacement under a point load on a shear-deformable shell keeps growing slowly as the mesh is refined (32 × 32 is 0.44% low, 64 × 64 0.16%; see README)"
+  }
+ ]
+}
