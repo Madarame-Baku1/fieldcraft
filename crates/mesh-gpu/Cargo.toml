@@ -1,0 +1,15 @@
+[package]
+name = "fieldcraft-mesh-gpu"
+description = "FieldCraft's projection smoothing on the GPU: the coloured Winslow sweeps' free nodes as wgpu compute shaders, driven through fieldcraft-mesh's sweep device and checked against the CPU's coloured sweeps"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+fieldcraft-mesh = { workspace = true }
+fieldcraft-gpu = { workspace = true }
+wgpu = { workspace = true }
+pollster = { workspace = true }

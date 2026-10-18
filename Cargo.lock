@@ -1272,6 +1272,7 @@ dependencies = [
  "fieldcraft-engine",
  "fieldcraft-io",
  "fieldcraft-lbm-gpu",
+ "fieldcraft-mesh-gpu",
  "fieldcraft-ui-egui",
  "fieldcraft-update",
  "getrandom 0.4.3",
@@ -1293,6 +1294,7 @@ dependencies = [
  "fieldcraft-io",
  "fieldcraft-lbm-gpu",
  "fieldcraft-mcp",
+ "fieldcraft-mesh-gpu",
  "fieldcraft-render",
  "fieldcraft-update",
  "png",
@@ -1440,6 +1442,16 @@ dependencies = [
  "num-traits",
  "robust",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "fieldcraft-mesh-gpu"
+version = "0.7.0"
+dependencies = [
+ "fieldcraft-gpu",
+ "fieldcraft-mesh",
+ "pollster 1.0.1",
+ "wgpu",
 ]
 
 [[package]]

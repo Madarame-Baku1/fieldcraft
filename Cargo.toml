@@ -30,6 +30,7 @@ fieldcraft-mcp = { path = "crates/mcp" }
 fieldcraft-update = { path = "crates/update" }
 fieldcraft-gpu = { path = "crates/gpu" }
 fieldcraft-lbm-gpu = { path = "crates/lbm-gpu" }
+fieldcraft-mesh-gpu = { path = "crates/mesh-gpu" }
 
 # foundation
 thiserror = "2"

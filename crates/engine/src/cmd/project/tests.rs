@@ -92,6 +92,10 @@ fn hostile_parameters_change_nothing() {
         json!({"body": "Ball", "template": "sphere", "inset": 2}),
         json!({"body": "Ball", "template": "sphere", "smoothing": "magic"}),
         json!({"body": "Ball", "template": "sphere", "iterations": 1_000_000}),
+        json!({"body": "Ball", "template": "sphere", "backend": "tpu"}),
+        json!({"body": "Ball", "template": "sphere", "backend": 7}),
+        // No sweep device is registered in this test binary: an error, not a panic.
+        json!({"body": "Ball", "template": "sphere", "backend": "gpu"}),
         json!({"body": "Ball", "template": "sphere", "faces": [{"block": 0, "face": 1, "to": ["nope"]}]}),
         json!({"body": "Ball", "template": "sphere", "divisions": [{"block": 99, "direction": 1, "count": 2}]}),
         json!({"body": "Ball", "template": "sphere", "divisions": [{"block": 0, "direction": 4, "count": 2}]}),

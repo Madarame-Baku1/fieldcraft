@@ -1340,6 +1340,9 @@ pub const HEX_PROJECT: &[Field] = &[
         .help("How interior nodes are smoothed after projection, with the boundary held on the geometry.")
         .def("\"elliptic\""),
     int("iterations", "Iterations", 1, 100_000).help("Smoothing iterations.").def("100"),
+    choice("backend", "Backend", &[("cpu", "CPU"), ("coloured", "Coloured (threads)"), ("gpu", "GPU")])
+        .help("Where the smoothing sweeps run: the CPU node by node (the same mesh on every machine), colour by colour on every core, or the GPU FIELDCRAFT_GPU picks (single precision, the same verdicts as coloured, smallest scaled Jacobian within 0.02 of it).")
+        .def("\"cpu\""),
     range("min_quality", "Minimum quality", D::None, 0.0, 1.0).help("Smallest scaled Jacobian accepted.").def("0.2"),
     range("max_arc_angle", "Max arc angle", D::Degree, 0.0, 90.0)
         .help("The most a curved face may turn across one element; the divisions grow to keep it. 0 for no limit.")

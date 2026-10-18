@@ -226,6 +226,7 @@ fn parse_args(args: impl IntoIterator<Item = String>, env_port: Option<String>) 
 fn main() -> eframe::Result {
     // The lattice Boltzmann GPU backend, for `solve.fluid` with `backend: "gpu"`.
     fieldcraft_lbm_gpu::register();
+    fieldcraft_mesh_gpu::register();
     let args = match parse_args(std::env::args().skip(1), std::env::var("FIELDCRAFT_CONTROL_PORT").ok()) {
         Ok(Some(a)) => a,
         Ok(None) => return Ok(()),
