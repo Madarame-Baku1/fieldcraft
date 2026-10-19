@@ -1,0 +1,25 @@
+{
+ "title": "NAFEMS LE6 skew plate under normal pressure (MITC4 shells)",
+ "kind": "benchmark",
+ "slow": true,
+ "source": "NAFEMS, The Standard NAFEMS Benchmarks, TNSB Rev. 3, October 1990, test LE6 (target: maximum principal stress 0.802 MPa on the lower surface at E, the centre of the plate), as reproduced in the Abaqus 2016 Benchmarks Guide, section 4.2.6 'LE6: Skew plate under normal pressure', and in the ESRD StressCheck Benchmarks Guide 'The Standard NAFEMS Benchmarks: Linear Elastic Tests' (2018), p. 19, which also gives its converged thin-solid result, 0.820 MPa (p. 20), and notes that its thin-solid formulation can differ from the plate model behind the target (p. 22)",
+ "quantities": [
+  {
+   "id": "s1_E",
+   "quantity": "maximum principal stress at E (933.01, 250), lower surface",
+   "measure": {"command": "solve.probe", "params": {"step": "Load", "at": [[933.0127018922193, 250, 0]]}, "pointer": "/nodes/0/principal/0"},
+   "value": 0.802,
+   "tolerance": {"relative": 0.02},
+   "reason": "the target is published to three figures for the thin-plate model of the problem",
+   "known_failure": "the target is a thin-plate value; at the specified 10 mm the transverse shear deformation the MITC4 shell keeps raises it to 0.8197 (+2.2%; converged about 0.821), as ESRD's converged thin-solid model does (quantity s1_E_solid), and thinner plates move towards 0.802 only slowly (about 0.809 at 1 mm, see README); FieldCraft has no thin-plate (Kirchhoff) element"
+  },
+  {
+   "id": "s1_E_solid",
+   "quantity": "maximum principal stress at E (933.01, 250), lower surface, against the converged thin-solid model",
+   "measure": {"command": "solve.probe", "params": {"step": "Load", "at": [[933.0127018922193, 250, 0]]}, "pointer": "/nodes/0/principal/0"},
+   "value": 0.820,
+   "tolerance": {"relative": 0.01},
+   "reason": "a model that keeps transverse shear, like ESRD's thin solid, which reports 0.820 on two meshes (0.822 with triangles); ours is 0.8197 and the next refinement moves it by 0.15% (see README)"
+  }
+ ]
+}
