@@ -91,11 +91,12 @@ pub fn show(app: &mut ModelApp, ui: &mut egui::Ui) {
 fn overlays(app: &mut ModelApp, ui: &egui::Ui, rect: Rect, t: &Tokens) -> Vec<Rect> {
     let mut out: Vec<Rect> = [axis_view_rect(rect), nav_bar_rect(rect)].into_iter().filter(|r| rect.contains_rect(*r)).collect();
     if let Some(plot) = app.plot() {
-        let legend = crate::results_panel::legend_rect(&plot, &ui.painter_at(rect), rect, t);
+        let bar = selection_bar_rect(ui.ctx());
+        let legend = crate::results_panel::legend_rect(&plot, &ui.painter_at(rect), rect, bar, t);
         app.place("legend", legend);
         out.push(legend);
     }
-    out.extend(ui.ctx().memory(|m| m.area_rect(egui::Id::new(SELECTION_BAR))));
+    out.extend(selection_bar_rect(ui.ctx()));
     out
 }
 
@@ -322,6 +323,12 @@ fn context_menu(app: &mut ModelApp, response: &egui::Response) {
 }
 
 const SELECTION_BAR: &str = "fc_selection_bar";
+
+/// Where the selection bar was drawn last: egui keeps an area's rectangle after it stops being
+/// drawn, so a hidden bar (the Start screen) still answers with where it was.
+pub(crate) fn selection_bar_rect(ctx: &egui::Context) -> Option<Rect> {
+    ctx.memory(|m| m.area_rect(egui::Id::new(SELECTION_BAR)))
+}
 
 /// The selection bar, top centre: what a click picks, box selection, and what is selected.
 fn selection_bar(app: &mut ModelApp, ui: &mut egui::Ui, rect: Rect, t: &Tokens) {

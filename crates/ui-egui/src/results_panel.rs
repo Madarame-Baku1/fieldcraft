@@ -34,7 +34,8 @@ const LABEL_PAD: egui::Vec2 = vec2(8.0, 4.0);
 pub fn show(app: &mut ModelApp, ui: &mut egui::Ui, rect: Rect, t: &Tokens) {
     let Some(plot) = app.plot() else { return };
     let painter = ui.painter_at(rect);
-    let extremes = legend(&plot, &painter, rect, t);
+    let bar = crate::viewport::selection_bar_rect(ui.ctx());
+    let extremes = legend(&plot, &painter, rect, bar, t);
     if app.ui.result_extremes {
         markers(app, &plot, &painter, rect, t);
     }
@@ -76,10 +77,13 @@ struct Legend {
 }
 
 const LEGEND_LINE: f32 = 16.0;
+/// The room the legend keeps from the selection bar (points).
+const LEGEND_GAP: f32 = 6.0;
 
-/// Where the legend of `plot` goes in the viewport `rect` (a fit leaves it free).
-pub fn legend_rect(plot: &Plot, painter: &egui::Painter, rect: Rect, t: &Tokens) -> Rect {
-    legend_layout(plot, painter, rect, t).frame
+/// Where the legend of `plot` goes in the viewport `rect`, clear of the selection `bar` (a fit
+/// leaves it free).
+pub fn legend_rect(plot: &Plot, painter: &egui::Painter, rect: Rect, bar: Option<Rect>, t: &Tokens) -> Rect {
+    legend_layout(plot, painter, rect, bar, t).frame
 }
 
 /// The legend's title: the field with its unit (a mode shape normalised), or the shape drawn.
@@ -121,9 +125,9 @@ fn extreme_lines(plot: &Plot) -> Option<[(String, u32); 2]> {
     Some([line("Max", l.max), line("Min", l.min)])
 }
 
-/// The legend's text and frame: top left, as wide as its longest line and as tall as its lines
-/// and bands.
-fn legend_layout(plot: &Plot, painter: &egui::Painter, rect: Rect, t: &Tokens) -> Legend {
+/// The legend's text and frame: top left (below the selection bar when they would meet), as wide
+/// as its longest line and as tall as its lines and bands.
+fn legend_layout(plot: &Plot, painter: &egui::Painter, rect: Rect, bar: Option<Rect>, t: &Tokens) -> Legend {
     let mut lines: Vec<(String, Color32)> = Vec::new();
     let title = title(plot);
     let mut step = format!("Step {}", plot.view.step);
@@ -165,7 +169,12 @@ fn legend_layout(plot: &Plot, painter: &egui::Painter, rect: Rect, t: &Tokens) -
     let width = (widest.max(title_w) + 20.0).max(170.0);
     // Padding and title, the lines, then the swatches with the range lines under them.
     let height = 36.0 + line_h * lines.len() as f32 + if bands > 0.0 { 16.0 + bands * SWATCH.y + 2.0 * line_h } else { 0.0 };
-    Legend { frame: Rect::from_min_size(origin, vec2(width, height)), title, lines }
+    let mut frame = Rect::from_min_size(origin, vec2(width, height));
+    // A viewport too narrow for the legend beside the selection bar puts it below the bar (#559).
+    if let Some(b) = bar.filter(|b| b.expand(LEGEND_GAP).intersects(frame)) {
+        frame = Rect::from_min_size(pos2(origin.x, b.bottom() + LEGEND_GAP), frame.size());
+    }
+    Legend { frame, title, lines }
 }
 
 /// The legend's swatches: the bands, and the "over" band above a clamped maximum.
@@ -175,8 +184,8 @@ fn swatches(b: &fieldcraft_render::contour::Bands) -> u32 {
 
 /// The legend, top left under the view buttons. Returns the Max and Min lines' rects with their
 /// nodes.
-fn legend(plot: &Plot, painter: &egui::Painter, rect: Rect, t: &Tokens) -> Vec<(Rect, u32)> {
-    let Legend { frame, title, lines } = legend_layout(plot, painter, rect, t);
+fn legend(plot: &Plot, painter: &egui::Painter, rect: Rect, bar: Option<Rect>, t: &Tokens) -> Vec<(Rect, u32)> {
+    let Legend { frame, title, lines } = legend_layout(plot, painter, rect, bar, t);
     let origin = frame.min;
     let (font, line_h) = (FontId::proportional(12.0), LEGEND_LINE);
     painter.rect_filled(frame, 4.0, t.overlay);

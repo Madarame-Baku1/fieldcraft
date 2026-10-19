@@ -3359,6 +3359,26 @@ mod tests {
         }
     }
 
+    /// At the smallest window the legend goes below the selection bar instead of under it; a wide
+    /// one keeps it at the top (#559).
+    #[test]
+    fn the_legend_stays_clear_of_the_selection_bar() {
+        for (w, h, at_top) in [(960.0, 600.0, false), (1400.0, 900.0, true)] {
+            let mut app = ModelApp::new(Session::default());
+            let ctx = egui::Context::default();
+            app.run("file.sample", json!({"name": "cantilever"})).unwrap();
+            app.run("solve.run", json!({})).unwrap();
+            for _ in 0..3 {
+                draw(&mut app, &ctx, w, h);
+            }
+            let (legend, bar) = (region(&app, "legend"), region(&app, "selection_bar"));
+            assert!(!legend.intersects(bar), "{w}×{h}: legend {legend:?}, selection bar {bar:?}");
+            let view = app.viewport.rect.unwrap();
+            assert!(view.contains_rect(legend), "{w}×{h}: legend {legend:?} outside the viewport {view:?}");
+            assert_eq!(legend.top() == view.top() + 12.0, at_top, "{w}×{h}: legend {legend:?}, viewport {view:?}");
+        }
+    }
+
     /// Every standard view frames the whole model: the cantilever's front view keeps both ends
     /// (#147), in orthographic and perspective.
     #[test]
