@@ -600,6 +600,8 @@ pub fn handle(app: &mut ModelApp, ctx: &egui::Context, req: &ControlRequest) -> 
         }
         "ui.resize" => {
             let (Some(w), Some(h)) = (f("width"), f("height")) else { return err("missing width/height") };
+            // A size is a restored window's: one that started maximized on a small monitor too.
+            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(false));
             ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(w.clamp(320.0, 8192.0) as f32, h.clamp(240.0, 8192.0) as f32)));
             ok(Value::Null)
         }

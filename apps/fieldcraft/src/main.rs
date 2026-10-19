@@ -46,6 +46,39 @@ fn app_icon() -> egui::IconData {
 /// How often unsaved changes are autosaved for recovery (seconds).
 const AUTOSAVE_SECONDS: f64 = 30.0;
 
+/// The first window's inner size and the smallest the window may be (points).
+const WINDOW_SIZE: egui::Vec2 = egui::vec2(1400.0, 900.0);
+const MIN_WINDOW_SIZE: egui::Vec2 = egui::vec2(960.0, 600.0);
+/// What the taskbar, dock or panels and the title bar may take off each side of the monitor: winit
+/// reports the monitor's size but not its work area (points).
+const WORK_AREA_RESERVE: f32 = 80.0;
+
+/// Where the first window goes on a monitor of `monitor` points when the default size does not fit
+/// in its work area (#601): as large as the monitor leaves after the reserve (never below the
+/// minimum), centred across the monitor and at its top, so the system's cascade cannot push its
+/// bottom under the taskbar. `None` when the default fits or the monitor's size is unknown. The
+/// position is the monitor's own (winit gives no monitor origin): the primary monitor's, where a
+/// first window opens.
+fn fitted_window(monitor: egui::Vec2) -> Option<egui::Rect> {
+    if !(monitor.is_finite() && monitor.min_elem() > 0.0) {
+        return None;
+    }
+    let room = monitor - egui::Vec2::splat(WORK_AREA_RESERVE);
+    let size = WINDOW_SIZE.min(room).max(MIN_WINDOW_SIZE);
+    let at = egui::pos2(((monitor.x - size.x) * 0.5).max(0.0), 0.0);
+    (size != WINDOW_SIZE).then(|| egui::Rect::from_min_size(at, size))
+}
+
+/// On a monitor too small for the default size, the first window starts maximized (the system
+/// knows the work area exactly), restoring to a size and place that fit.
+fn fit_first_window(ctx: &egui::Context) {
+    let Some(fit) = ctx.input(|i| i.viewport().monitor_size).and_then(fitted_window) else { return };
+    log::info!("window: {} × {} points do not fit the monitor; maximized, restoring to {fit:?}", WINDOW_SIZE.x, WINDOW_SIZE.y);
+    ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(fit.min));
+    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(fit.size()));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+}
+
 struct App {
     app: ModelApp,
     /// Autosave for crash recovery (`None` when the recovery folder is unavailable).
@@ -71,6 +104,9 @@ impl App {
 impl eframe::App for App {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if self.frames < 2 {
+            if self.frames == 0 {
+                fit_first_window(ctx);
+            }
             self.frames += 1;
             // A second frame right away, which means the first was presented: the app is up.
             ctx.request_repaint();
@@ -252,8 +288,8 @@ fn main() -> eframe::Result {
             .with_title("FieldCraft")
             .with_app_id(APP_ID)
             .with_icon(app_icon())
-            .with_inner_size([1400.0, 900.0])
-            .with_min_inner_size([960.0, 600.0])
+            .with_inner_size(WINDOW_SIZE)
+            .with_min_inner_size(MIN_WINDOW_SIZE)
             .with_drag_and_drop(true)
             // The app bar is the title bar (as in the other Craft apps): on macOS under the
             // traffic lights, elsewhere with its own caption buttons and resize zones.
@@ -340,6 +376,26 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_first_window_fits_the_work_area() {
+        let fit = |w, h| fitted_window(egui::vec2(w, h)).map(|r| (r.min.x, r.min.y, r.width(), r.height()));
+        // Large monitors keep the default size and the system's placement; an unknown monitor too.
+        assert_eq!(fit(2560.0, 1440.0), None);
+        assert_eq!(fit(1536.0, 1080.0), None);
+        assert_eq!(fit(0.0, 0.0), None);
+        assert_eq!(fit(f32::NAN, 900.0), None);
+        // 3440 × 1440 at 150 % (#601): 2293 × 960 points, a 912-point work area. Restored at the
+        // top, its bottom (880) stays above the taskbar wherever the cascade would have put it.
+        assert_eq!(fit(2293.0, 960.0), Some((446.5, 0.0, 1400.0, 880.0)));
+        // 1920 × 1080 at 150 % and at 125 %.
+        assert_eq!(fit(1280.0, 720.0), Some((40.0, 0.0, 1200.0, 640.0)));
+        assert_eq!(fit(1536.0, 864.0), Some((68.0, 0.0, 1400.0, 784.0)));
+        // Too narrow only: still at the top.
+        assert_eq!(fit(1440.0, 1100.0), Some((40.0, 0.0, 1360.0, 900.0)));
+        // Never below the minimum size.
+        assert_eq!(fit(800.0, 600.0), Some((0.0, 0.0, 960.0, 600.0)));
+    }
 
     fn parse(a: &[&str], env: Option<&str>) -> Result<Option<Args>, String> {
         parse_args(a.iter().map(|s| s.to_string()), env.map(str::to_string))
