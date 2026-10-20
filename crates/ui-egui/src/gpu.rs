@@ -129,6 +129,7 @@ mod tests {
     /// they moved into `fieldcraft-gpu`.
     #[test]
     fn the_window_draws_what_a_capture_draws() {
+        let _turn = crate::gpu_turn();
         let cap = match Capturer::open(Policy::from_env().unwrap()) {
             Ok(Some(c)) => c,
             Ok(None) if select::gpu_required() => panic!("FIELDCRAFT_REQUIRE_GPU=1 but no GPU adapter"),

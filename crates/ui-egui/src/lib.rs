@@ -2495,6 +2495,15 @@ fn probe_rows(reply: &Value, plot: Option<&results::Plot>, units: &DisplaySystem
     rows
 }
 
+/// The tests that open a GPU device take turns, for as long as the device lives: several devices
+/// open at once in one process hung NVIDIA's driver on a GB10 (#614). A test that failed while
+/// holding the turn leaves it to the next.
+#[cfg(test)]
+pub(crate) fn gpu_turn() -> std::sync::MutexGuard<'static, ()> {
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    TURN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use fieldcraft_render::Vec3;
@@ -2988,6 +2997,7 @@ mod tests {
     #[test]
     fn renders_on_the_windows_gpu() {
         use fieldcraft_gpu::{Renderer, capture::Capturer, select};
+        let _turn = crate::gpu_turn();
         let mut app = ModelApp::new(Session::default());
         app.run_script(&fieldcraft_engine::sample::script()).unwrap();
         draw(&mut app, &egui::Context::default(), 1280.0, 800.0);
