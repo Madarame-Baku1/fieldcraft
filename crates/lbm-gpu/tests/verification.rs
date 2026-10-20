@@ -6,10 +6,15 @@
 //! 1e-6; with heat, temperatures within 2e-5 of the field's range and wall heats within 1e-4 of
 //! the largest (a heat is a difference of populations, so it keeps fewer digits). Skipped without
 //! a GPU adapter unless `FIELDCRAFT_REQUIRE_GPU=1`, which makes a missing adapter a failure;
-//! `FIELDCRAFT_GPU` picks the adapter (`hardware` refuses a software one).
+//! `FIELDCRAFT_GPU` picks the adapter (`hardware` refuses a software one). The tests take the
+//! device one at a time ([`Gpu`]): several devices open at once in one process hung NVIDIA's
+//! driver on a GB10 (#614).
 
 #[path = "../../lbm/tests/common/mod.rs"]
 mod common;
+
+use std::ops::{Deref, DerefMut};
+use std::sync::{Mutex, MutexGuard};
 
 use common::*;
 use fieldcraft_gpu::select::{Policy, gpu_required};
@@ -22,14 +27,42 @@ use fieldcraft_model::{
 
 const PERIODIC: FaceCondition = FaceCondition::Periodic {};
 
+/// Whose turn it is on the GPU.
+static TURN: Mutex<()> = Mutex::new(());
+
+/// The next turn on the GPU (a test that failed while holding it leaves it to the next).
+fn turn() -> MutexGuard<'static, ()> {
+    TURN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A flow on the GPU, holding the turn until it is dropped (the flow first, then the turn).
+struct Gpu {
+    flow: GpuFlow,
+    _turn: MutexGuard<'static, ()>,
+}
+
+impl Deref for Gpu {
+    type Target = GpuFlow;
+    fn deref(&self) -> &GpuFlow {
+        &self.flow
+    }
+}
+
+impl DerefMut for Gpu {
+    fn deref_mut(&mut self) -> &mut GpuFlow {
+        &mut self.flow
+    }
+}
+
 /// The flow on the GPU `FIELDCRAFT_GPU` picks, or `None` to skip (a failure when a GPU is
 /// required).
-fn gpu(flow: &Flow, streaming: Streaming) -> Option<GpuFlow> {
+fn gpu(flow: &Flow, streaming: Streaming) -> Option<Gpu> {
     let policy = Policy::from_env().expect("FIELDCRAFT_GPU names a policy");
+    let turn = turn();
     match GpuFlow::with_options(flow, policy, Options { streaming, profile: false }) {
         Ok(g) => {
             println!("GPU: {} ({streaming:?})", g.adapter_name());
-            Some(g)
+            Some(Gpu { flow: g, _turn: turn })
         }
         Err(e) if gpu_required() => panic!("a GPU is required: {e}"),
         // Only a missing device skips: a shader that does not compile is a failure anywhere.
@@ -42,7 +75,7 @@ fn gpu(flow: &Flow, streaming: Streaming) -> Option<GpuFlow> {
 }
 
 /// Both backends through every step; the CPU's fields and the GPU's.
-fn both(setup: &Setup, mut cpu: Flow, streaming: Streaming) -> Option<(Flow, GpuFlow)> {
+fn both(setup: &Setup, mut cpu: Flow, streaming: Streaming) -> Option<(Flow, Gpu)> {
     let mut gpu = gpu(&cpu, streaming)?;
     cpu.advance(setup.steps).unwrap();
     gpu.advance(setup.steps).unwrap();
@@ -421,7 +454,7 @@ fn runs_to_steady_state_stop_where_the_cpu_does() {
         let Some(mut g) = gpu(&flow, Streaming::default()) else { return };
         let mut cpu = flow;
         let a = fieldcraft_lbm::run(&setup, &mut cpu, &limits).unwrap();
-        let b = fieldcraft_lbm::run(&setup, &mut g, &limits).unwrap();
+        let b = fieldcraft_lbm::run(&setup, &mut *g, &limits).unwrap();
         let (ra, rb) = (a.steady.unwrap(), b.steady.unwrap());
         println!("{name}: CPU {:?} at step {}, GPU {:?} at step {}", ra.reason, a.stats.steps, rb.reason, b.stats.steps);
         assert_eq!(ra.reason, fieldcraft_lbm::StopReason::Steady, "{ra:?}");
@@ -528,6 +561,7 @@ fn fans_and_porous_zones_are_refused_clearly() {
     }];
     let m = model(1.0, 0.1, d, step(10.0, 1.0, None));
     let (_, flow) = prepare(&m, &[]);
+    let _turn = turn();
     let e = GpuFlow::with_options(&flow, Policy::from_env().expect("FIELDCRAFT_GPU names a policy"), Options::default()).err().map(|e| e.to_string());
     assert!(e.as_deref().is_some_and(|e| e.contains("Vent") && e.contains("cpu")), "{e:?}");
 }
