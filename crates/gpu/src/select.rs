@@ -6,8 +6,11 @@
 //! - `cpu` forces the CPU rasterizer.
 //!
 //! Backends are Metal on macOS, DX12 and Vulkan on Windows, Vulkan and GL elsewhere;
-//! `WGPU_BACKEND` narrows them. A discrete GPU outranks an integrated one, then a virtual one,
-//! then any other; a CPU device is the software tier.
+//! `WGPU_BACKEND` narrows them (`WGPU_BACKEND=gl` forces GL). Where both Vulkan and GL are on
+//! offer, Vulkan is asked first and GL is brought up only when Vulkan has no adapter of the tier
+//! the policy wants: NVIDIA's EGL torn down beside a working Vulkan device in the same process
+//! deadlocked its driver on a GB10 (#614). A discrete GPU outranks an integrated one, then a
+//! virtual one, then any other; a CPU device is the software tier.
 //!
 //! wgpu's backend options follow its environment variables: on DX12, `WGPU_DX12_COMPILER`
 //! (`fxc` or `dxc`; unset, DXC when `dxcompiler.dll` is on the DLL search path, else FXC, see
@@ -105,16 +108,37 @@ pub fn adapter(policy: Policy) -> Result<Option<(wgpu::Adapter, Tier)>> {
     if policy == Policy::Cpu {
         return Ok(None);
     }
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends: backends(),
-        backend_options: backend_options(wgpu::BackendOptions::from_env_or_default())?,
-        ..wgpu::InstanceDescriptor::new_without_display_handle()
-    });
-    let mut adapters = pollster::block_on(instance.enumerate_adapters(backends()));
-    let types: Vec<_> = adapters.iter().map(|a| a.get_info().device_type).collect();
+    let all = backends();
+    let first = if all.contains(wgpu::Backends::VULKAN | wgpu::Backends::GL) { wgpu::Backends::VULKAN } else { all };
+    let mut adapters = enumerate(first)?;
+    if first != all && !settled(&device_types(&adapters), policy) {
+        adapters.extend(enumerate(all - first)?);
+    }
+    let types = device_types(&adapters);
     let Some(i) = pick(&types, policy)? else { return Ok(None) };
     let tier = types.get(i).map_or(Tier::Hardware, |t| rank(*t).0);
     Ok((i < adapters.len()).then(|| (adapters.swap_remove(i), tier)))
+}
+
+/// The adapters of `backends`.
+fn enumerate(backends: wgpu::Backends) -> Result<Vec<wgpu::Adapter>> {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends,
+        backend_options: backend_options(wgpu::BackendOptions::from_env_or_default())?,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    Ok(pollster::block_on(instance.enumerate_adapters(backends)))
+}
+
+fn device_types(adapters: &[wgpu::Adapter]) -> Vec<wgpu::DeviceType> {
+    adapters.iter().map(|a| a.get_info().device_type).collect()
+}
+
+/// Whether adapters of `types` already hold one of the tier `policy` wants, so the other
+/// backends need not be brought up.
+fn settled(types: &[wgpu::DeviceType], policy: Policy) -> bool {
+    let want = if policy == Policy::Software { Tier::Software } else { Tier::Hardware };
+    types.iter().any(|t| rank(*t).0 == want)
 }
 
 /// `options`, unless they ask for a DX12 compiler this build does not have.
@@ -156,6 +180,18 @@ mod tests {
         assert!(pick(&[Cpu], Policy::Hardware).is_err());
         assert!(pick(&[DiscreteGpu], Policy::Software).is_err());
         assert!(pick(&[], Policy::Hardware).is_err());
+    }
+
+    /// #614: GL is brought up only when Vulkan has no adapter of the tier the policy wants.
+    #[test]
+    fn vulkan_settles_when_it_has_the_wanted_tier() {
+        assert!(settled(&[Cpu, IntegratedGpu], Policy::Auto));
+        assert!(settled(&[DiscreteGpu], Policy::Hardware));
+        assert!(settled(&[Cpu], Policy::Software));
+        // Only a software adapter: auto still asks GL for a hardware one, as before.
+        assert!(!settled(&[Cpu], Policy::Auto));
+        assert!(!settled(&[DiscreteGpu], Policy::Software));
+        assert!(!settled(&[], Policy::Hardware));
     }
 
     #[test]
