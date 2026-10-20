@@ -13,6 +13,8 @@ use wgpu::util::DeviceExt;
 
 const SHADER: &str = include_str!("lbm.wgsl");
 const WG: u32 = 256;
+/// The widest row of workgroups. A dispatch wider than one row is exactly this wide ([`groups`]),
+/// so the shader flattens every dispatch's workgroups with this one row width.
 const MAX_GROUPS_X: u32 = 32768;
 const KIND_PULL: u32 = 0;
 const KIND_BOUNCE: u32 = 1;
@@ -56,7 +58,8 @@ fn reserved<T>(len: usize, what: &str) -> Result<Vec<T>> {
     Ok(v)
 }
 
-/// Workgroup counts (x, y) covering `count` items.
+/// Workgroup counts (x, y) covering `count` items: one row of up to [`MAX_GROUPS_X`], or rows of
+/// exactly that many.
 fn groups(count: usize) -> Result<(u32, u32)> {
     let total = u32::try_from(count.div_ceil(WG as usize).max(1)).map_err(|_| Error::Limit("too many cells for one dispatch".into()))?;
     let gx = total.min(MAX_GROUPS_X);
@@ -362,7 +365,7 @@ impl GpuFlow {
             u(flow.grid().cells[0])?,
             u(flow.grid().cells[1])?,
             u(flow.grid().cells[2])?,
-            cells.0,
+            MAX_GROUPS_X,
             u(links.len())?,
             u(open.len())?,
             u(group_count)?,
@@ -874,5 +877,23 @@ impl Backend for GpuFlow {
 
     fn conducting(&self) -> &[Vec<u32>] {
         &[]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shader flattens every dispatch with one row width: a dispatch of several rows must be
+    /// exactly [`MAX_GROUPS_X`] wide, whatever the cell count (a link dispatch wider than the
+    /// cells' row once overlapped itself and skipped links), and cover its items.
+    #[test]
+    fn every_dispatch_of_several_rows_is_max_groups_x_wide() {
+        let row = (MAX_GROUPS_X * WG) as usize;
+        for count in [0, 1, 255, 256, 257, row - 1, row, row + 1, 3 * row - 7, 5_120_000, 15_360_000, 190_000_000] {
+            let (gx, gy) = groups(count).unwrap();
+            assert!(gy == 1 || gx == MAX_GROUPS_X, "{count}: {gx} × {gy}");
+            assert!((gx * gy * WG) as usize >= count, "{count}: {gx} × {gy}");
+        }
     }
 }

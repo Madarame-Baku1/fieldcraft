@@ -48,6 +48,7 @@ struct Params {
     nx: u32,
     ny: u32,
     nz: u32,
+    // The row width of every dispatch wider than one row (MAX_GROUPS_X in native.rs).
     groups_x: u32,
     links: u32,
     open: u32,
