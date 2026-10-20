@@ -9,13 +9,18 @@
 //! `WGPU_BACKEND` narrows them (`WGPU_BACKEND=gl` forces GL). Where both Vulkan and GL are on
 //! offer, Vulkan is asked first and GL is brought up only when Vulkan has no adapter of the tier
 //! the policy wants: NVIDIA's EGL torn down beside a working Vulkan device in the same process
-//! deadlocked its driver on a GB10 (#614). A discrete GPU outranks an integrated one, then a
-//! virtual one, then any other; a CPU device is the software tier.
+//! deadlocked its driver on a GB10 (#614). Each backend set has one `wgpu::Instance` for the
+//! whole process: NVIDIA's driver stops showing the GPU to new instances once 25 of them have
+//! opened a device, even after they are gone (#636), so a long session would lose the GPU at
+//! its 26th solve. A discrete GPU outranks an integrated one, then a virtual one, then any
+//! other; a CPU device is the software tier.
 //!
 //! wgpu's backend options follow its environment variables: on DX12, `WGPU_DX12_COMPILER`
 //! (`fxc` or `dxc`; unset, DXC when `dxcompiler.dll` is on the DLL search path, else FXC, see
 //! #561). `staticdxc` is refused: it needs wgpu's `static-dxc` feature, which FieldCraft does not
 //! build, and wgpu would panic on it.
+
+use std::sync::Mutex;
 
 use crate::{GpuError, Result};
 
@@ -122,12 +127,31 @@ pub fn adapter(policy: Policy) -> Result<Option<(wgpu::Adapter, Tier)>> {
 
 /// The adapters of `backends`.
 fn enumerate(backends: wgpu::Backends) -> Result<Vec<wgpu::Adapter>> {
+    let instance = instance(backends)?;
+    Ok(pollster::block_on(instance.enumerate_adapters(backends)))
+}
+
+/// The instances made so far, by backend set and backend options (`Dx12Compiler` has no
+/// equality, so the options are compared by their debug form).
+static INSTANCES: Mutex<Vec<(wgpu::Backends, String, wgpu::Instance)>> = Mutex::new(Vec::new());
+
+/// The process's instance of `backends` with the backend options the environment asks for: the
+/// one made at its first use, so the driver sees one instance per backend set however many
+/// devices are opened (#636).
+fn instance(backends: wgpu::Backends) -> Result<wgpu::Instance> {
+    let options = backend_options(wgpu::BackendOptions::from_env_or_default())?;
+    let key = format!("{options:?}");
+    let mut made = INSTANCES.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, _, instance)) = made.iter().find(|(b, k, _)| *b == backends && *k == key) {
+        return Ok(instance.clone());
+    }
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends,
-        backend_options: backend_options(wgpu::BackendOptions::from_env_or_default())?,
+        backend_options: options,
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
-    Ok(pollster::block_on(instance.enumerate_adapters(backends)))
+    made.push((backends, key, instance.clone()));
+    Ok(instance)
 }
 
 fn device_types(adapters: &[wgpu::Adapter]) -> Vec<wgpu::DeviceType> {
@@ -192,6 +216,18 @@ mod tests {
         assert!(!settled(&[Cpu], Policy::Auto));
         assert!(!settled(&[DiscreteGpu], Policy::Software));
         assert!(!settled(&[], Policy::Hardware));
+    }
+
+    /// #636: one instance per backend set for the process, however often adapters are asked for.
+    #[test]
+    fn a_backend_set_keeps_one_instance() {
+        let count = |b: wgpu::Backends| INSTANCES.lock().unwrap().iter().filter(|(k, _, _)| *k == b).count();
+        let b = wgpu::Backends::NOOP;
+        for _ in 0..3 {
+            let _ = instance(b).unwrap();
+            let _ = enumerate(b).unwrap();
+        }
+        assert_eq!(count(b), 1);
     }
 
     #[test]
