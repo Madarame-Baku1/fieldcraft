@@ -311,31 +311,10 @@ impl GpuFlow {
             )));
         }
 
-        // The state and the flags.
-        // Populations as deviations from their weights (see lbm.wgsl); solid cells stay zero.
-        let mut f = filled(Q * n, 0.0f32, "populations")?;
-        for q in 0..Q {
-            let w = fieldcraft_lbm::lattice::W.get(q).copied().unwrap_or(0.0);
-            for cell in 0..n {
-                if let (Some(slot), true) = (f.get_mut(q * n + cell), flow.is_fluid(cell)) {
-                    *slot = (flow.population(q, cell) - w) as f32;
-                }
-            }
-        }
-        // The scalar populations as deviations from w_q T₀ (see lbm.wgsl).
+        // The state and the flags. The populations go up one direction at a time (below), so
+        // the host never holds a whole single-precision copy of them beside the flow's.
         let thermal = flow.thermal();
         let t0 = thermal.map_or(0.0, |t| t.initial());
-        let mut tpop = filled(if thermal.is_some() { QT * n } else { 0 }, 0.0f32, "temperature populations")?;
-        if thermal.is_some() {
-            for q in 0..QT {
-                let w = WT.get(q).copied().unwrap_or(0.0) * t0;
-                for cell in 0..n {
-                    if let (Some(slot), true) = (tpop.get_mut(q * n + cell), flow.is_fluid(cell)) {
-                        *slot = (flow.thermal_population(q, cell) - w) as f32;
-                    }
-                }
-            }
-        }
         let mut fluid = filled(n, false, "cell flags")?;
         let mut fluid_u32 = filled(n, 0u32, "cell flags")?;
         for cell in 0..n {
@@ -517,7 +496,27 @@ impl GpuFlow {
         });
         let fluid_buf = storage("lbm fluid", &bytes_u32(&fluid_u32));
         // AA reuses binding g for boundary scratch only, never another full population field.
-        let pops = [storage("lbm f", &bytes_f32(&f)), empty("lbm g / AA boundary scratch", if aa { 4 * links.len() as u64 } else { pop_bytes })];
+        let pops = [empty("lbm f", pop_bytes), empty("lbm g / AA boundary scratch", if aa { 4 * links.len() as u64 } else { pop_bytes })];
+        // Populations as deviations (see lbm.wgsl), one direction at a time: `value(q, cell)` less
+        // `offset(q)`, zero in solid cells. Each direction's write is submitted and waited for
+        // before the next: a write's staging copy lives until its submission completes, so the
+        // directions would otherwise pile up into a whole copy of the populations.
+        let mut direction = filled(n, 0.0f32, "populations")?;
+        let mut upload = |buffer: &wgpu::Buffer, count: usize, offset: &dyn Fn(usize) -> f64, value: &dyn Fn(usize, usize) -> f64| -> Result<()> {
+            for q in 0..count {
+                let w = offset(q);
+                for (cell, slot) in direction.iter_mut().enumerate() {
+                    *slot = if flow.is_fluid(cell) { (value(q, cell) - w) as f32 } else { 0.0 };
+                }
+                queue.write_buffer(buffer, 4 * (q * n) as u64, &bytes_f32(&direction));
+                queue.submit([]);
+                device
+                    .poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(DEVICE_TIMEOUT) })
+                    .map_err(|e| gpu_error(format!("the device did not answer within {} s: {e}", DEVICE_TIMEOUT.as_secs())))?;
+            }
+            Ok(())
+        };
+        upload(&pops[0], Q, &|q| fieldcraft_lbm::lattice::W.get(q).copied().unwrap_or(0.0), &|q, cell| flow.population(q, cell))?;
         let link_u = storage("lbm links", &bytes_u32(&link_u));
         let link_f = storage("lbm link du", &bytes_f32(&link_f));
         let open_u = storage("lbm open cells", &bytes_u32(&open_u));
@@ -532,7 +531,10 @@ impl GpuFlow {
         let partials = empty("lbm partials", 4 * partial_count as u64);
         let therm_bytes = elem * (QT * n) as u64;
         let therm = if thermal.is_some() {
-            [storage("lbm t", &bytes_f32(&tpop)), empty("lbm t2", therm_bytes)]
+            let tb = [empty("lbm t", therm_bytes), empty("lbm t2", therm_bytes)];
+            // The scalar populations as deviations from w_q T₀ (see lbm.wgsl).
+            upload(&tb[0], QT, &|q| WT.get(q).copied().unwrap_or(0.0) * t0, &|q, cell| flow.thermal_population(q, cell))?;
+            tb
         } else {
             [empty("lbm t", 16), empty("lbm t2", 16)]
         };
