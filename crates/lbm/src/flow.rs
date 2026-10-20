@@ -478,7 +478,7 @@ impl Flow {
                             (false, _) => {
                                 let rule = obstacle_link(cell, from, q);
                                 if let (true, Some(solid), Rule::Bounce { group, .. }) = (q < QT, conducting_at(from as usize), rule) {
-                                    interface.push(Interface { cell: cell as u32, q: q as u8, solid, group, weight: 0.0 });
+                                    interface.push(Interface { cell: cell as u32, q: q as u8, solid, group, link: links.len() as u32, weight: 0.0 });
                                 }
                                 rule
                             }
