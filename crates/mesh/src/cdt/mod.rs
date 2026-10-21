@@ -348,7 +348,9 @@ impl Recovery {
             if let Some(slot) = id.get_mut(v) {
                 *slot = points.len() as u32;
             }
-            points.push(self.cx.approx(v as u32)?);
+            // Rounded into the exact predicates' domain: between an end a hair off a coordinate
+            // plane (1e-35, admissible) and one on it, a point lands below 2^-120.
+            points.push(self.cx.approx(v as u32)?.map(crate::predicates::snap_to_domain));
             steiner.push(SteinerPoint { segment: self.segment(s)?.ends, t });
         }
         let mut tets = Vec::new();

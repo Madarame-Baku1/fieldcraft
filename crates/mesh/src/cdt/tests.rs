@@ -85,6 +85,29 @@ fn schonhardt(twist_deg: f64) -> (Vec<[f64; 3]>, Vec<[u32; 3]>) {
     (p, t)
 }
 
+/// A Steiner point between a vertex a hair off a coordinate plane and one on it lands closer
+/// still. Schönhardt's prism, turned and moved so that its reflex diagonal 0–4 lies in the plane
+/// y = 0, with vertex 0 1e-36 off it (admissible): the diagonal's Steiner point lands a fraction
+/// of that off the plane, below the exact predicates' 2^-120. Rounded into their domain, every
+/// point of the tetrahedralization can go on to the quality stage.
+#[test]
+fn steiner_points_stay_in_the_predicate_domain() {
+    let (mut p, t) = schonhardt(30.0);
+    let (sin, cos) = 15f64.to_radians().sin_cos();
+    for q in &mut p {
+        *q = [q[0] * cos - q[1] * sin, q[0] * sin + q[1] * cos - sin, q[2]];
+    }
+    p[0][1] = 1e-36;
+    p[4][1] = 0.0;
+    let s = surface(&p, &t, [0.0, -sin, 0.75]);
+    let m = tetrahedralize(&s, &CdtOptions::default()).unwrap();
+    check(&s, &m);
+    assert!(m.steiner.iter().any(|sp| sp.segment == [0, 4]), "{:?}", m.steiner);
+    for q in &m.points {
+        assert!(q.iter().all(|x| crate::predicates::is_admissible(*x)), "{q:?}");
+    }
+}
+
 #[test]
 fn schonhardt_prism_gets_steiner_points_and_conforms() {
     let (p, t) = schonhardt(30.0);
