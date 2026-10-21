@@ -41,6 +41,44 @@ pub(crate) fn cube() -> TetComplex {
     TetComplex::new(&p, kinds, &tets, &boundary, &[], 1000, 10_000).unwrap()
 }
 
+/// A complex of these tetrahedra (each turned positive) and vertex kinds, every face not shared on
+/// the boundary with the tag `tag` gives it (by its sorted vertices).
+fn complex_of(p: &[[f64; 3]], raw: &[[u32; 4]], kinds: Vec<VertexKind>, tag: impl Fn([u32; 3]) -> u32) -> TetComplex {
+    let tets: Vec<[u32; 4]> = raw
+        .iter()
+        .map(|t| {
+            let x = t.map(|v| p[v as usize]);
+            if measure::volume6(&x) > 0.0 { *t } else { [t[1], t[0], t[2], t[3]] }
+        })
+        .collect();
+    let mut boundary = Vec::new();
+    for (t, vs) in tets.iter().enumerate() {
+        for k in 0..4 {
+            let f = sorted3(face_toward(*vs, k));
+            if !tets.iter().enumerate().any(|(u, ws)| u != t && (0..4).any(|j| sorted3(face_toward(*ws, j)) == f)) {
+                boundary.push((t as u32, k, tag(f)));
+            }
+        }
+    }
+    TetComplex::new(p, kinds, &tets, &boundary, &[], 100, 100).unwrap()
+}
+
+/// The link condition (Dey, Edelsbrunner, Guha, Nekhayev 1999). The cube's boundary edge 0–1 may
+/// be contracted; its inner diagonal 0–7 may not, as both ends see the boundary and the edge does
+/// not. Round an edge of three tetrahedra, the triangle of the ring is empty (its edges are in the
+/// mesh, the face is not): contracting one of its edges would lay that edge on another, so the
+/// third vertex, seen by both ends off the edge's ring, refuses it.
+#[test]
+fn the_link_condition_refuses_contractions_that_pinch() {
+    let mut cx = cube();
+    assert!(link_condition(&mut cx, 0, 1).unwrap());
+    assert!(!link_condition(&mut cx, 0, 7).unwrap());
+    let p = [[0.0, 0.0, -1.0], [0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [-0.5, 0.8, 0.0], [-0.5, -0.8, 0.0]];
+    let mut cx = complex_of(&p, &[[0, 1, 2, 3], [0, 1, 3, 4], [0, 1, 4, 2]], vec![VertexKind::Corner; 5], |_| 0);
+    assert!(!link_condition(&mut cx, 2, 3).unwrap());
+    assert!(link_condition(&mut cx, 0, 2).unwrap());
+}
+
 fn volume(cx: &TetComplex) -> f64 {
     cx.live_tets().map(|(_, vs)| measure::volume6(&cx.coords(vs).unwrap()) / 6.0).sum()
 }
@@ -545,6 +583,55 @@ fn a_boundary_insertion_never_rings_a_kept_face() {
     cx.validate().unwrap();
     let floating: Vec<[u32; 4]> = cx.live_tets().filter(|(t, _)| cx.adj(*t).unwrap().iter().all(|&n| n == NONE)).map(|(_, vs)| vs).collect();
     assert!(floating.is_empty(), "tetrahedra with every face on the boundary: {floating:?}");
+}
+
+/// A move keeps each boundary face round the vertex within 30° of its orientation: positive
+/// tetrahedra alone let a boundary vertex fold its faces over the ones beside it. Corner 1 of
+/// the cube moved out to x = 3 leaves both its tetrahedra positive but turns its faces on the
+/// side x = 1 by 63°; moved to x = 1.1, by 6°.
+#[test]
+fn a_move_never_turns_a_boundary_face_over() {
+    let mut cx = cube();
+    let star = cx.star(1).unwrap();
+    let to = |p: [f64; 3]| Point3::try_from(p).unwrap();
+    assert!(cx.move_is_valid(1, &to([1.1, 0.0, 0.0]), &star).unwrap());
+    assert!(!cx.move_is_valid(1, &to([3.0, 0.0, 0.0]), &star).unwrap());
+}
+
+/// The fillet of a plate on a rib (our own recipe: a 60 × 30 × 6 mm plate on a 6 mm triangular
+/// rib, its top edges rounded at 2 mm, meshed at 3 mm), where vertex 1 has three boundary faces
+/// round it: (0, 1, 2), (0, 1, 5) and (1, 2, 5). Removing edge 0–1 ends in a 2-2 flip of the
+/// boundary onto the edge 2–5, which the mesh has already: one of the new boundary faces is
+/// (1, 2, 5), held by tetrahedron 0 too. The fillet's curvature lets every orientation pass. The
+/// removal must make no face the mesh has.
+#[test]
+fn an_edge_removal_never_flips_the_boundary_onto_a_face_it_has() {
+    let p = [
+        [42.66838317202295, 11.015049414715271, 39.676406229007135],
+        [42.18976625943718, 10.738523431897063, 39.858043495916334],
+        [42.144070440995236, 11.092938909632773, 39.62524418327976],
+        [41.984755325992694, 10.464231377518912, 39.91145084982469],
+        [42.37942326300024, 11.234853867339881, 40.483532518490776],
+        [42.52174059791378, 10.687602908819951, 39.86884416654581],
+    ];
+    let tets = [[1, 3, 2, 5], [4, 1, 0, 5], [1, 0, 2, 4]];
+    // The faces on the fillet (tag 1); the others were shared with the rest of the mesh.
+    let fillet = [[1, 2, 5], [2, 3, 5], [0, 1, 5], [0, 1, 2]];
+    let kinds = [1, 1, 1, 1, 0, 1].map(|f| if f == 1 { VertexKind::Face(1) } else { VertexKind::Interior }).to_vec();
+    let mut cx = complex_of(&p, &tets, kinds, |f| u32::from(fillet.contains(&f)));
+    remove_edge_at(&mut cx, 2, 0, 1).unwrap();
+    cx.validate().unwrap();
+    let mut held: std::collections::BTreeMap<[u32; 3], (u32, bool)> = std::collections::BTreeMap::new();
+    for (t, vs) in cx.live_tets() {
+        let adj = cx.adj(t).unwrap();
+        for k in 0..4 {
+            let e = held.entry(sorted3(face_toward(vs, k))).or_default();
+            e.0 += 1;
+            e.1 |= adj[k] == NONE;
+        }
+    }
+    let folded: Vec<_> = held.into_iter().filter(|(_, (n, on_boundary))| *n > 2 || (*n == 2 && *on_boundary)).collect();
+    assert!(folded.is_empty(), "faces held twice over: {folded:?}");
 }
 
 /// The validity gate refuses a tetrahedron that shares no face with the rest of the mesh, even

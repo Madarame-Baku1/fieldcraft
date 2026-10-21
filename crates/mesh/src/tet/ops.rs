@@ -19,7 +19,7 @@
 use crate::Result;
 use crate::predicates::{Point3, Sign};
 
-use super::complex::{Change, EDGES, IdMap, NONE, TetComplex, VertexKind, face_toward, sorted2, sorted3};
+use super::complex::{Change, EDGES, IdMap, NONE, TetComplex, VertexKind, face_toward, sorted2, sorted3, turns_over};
 use super::measure::{self, P};
 
 /// The quality objective of a tetrahedron given by vertex ids ([`measure::quality`]).
@@ -121,6 +121,15 @@ pub fn remove_edge_at(cx: &mut TetComplex, t: u32, a: u32, b: u32) -> Result<boo
         return Ok(false);
     }
     let v = ring.verts.clone();
+    // An open ring ends in a 2-2 flip that lays the boundary across v_0 v_{m−1} (below). Should
+    // the mesh have that edge already (round a boundary vertex with three faces), a face would
+    // get a third tetrahedron; [`TetComplex::replace`] refuses every other edge or face a
+    // triangulation duplicates.
+    if let (false, Some(&v0), Some(&vl)) = (ring.closed, v.first(), v.last())
+        && cx.edge_tet(v0, vl)?.is_some()
+    {
+        return Ok(false);
+    }
     let x = |id: u32| cx.xyz(id);
     let (xa, xb) = (x(a)?, x(b)?);
     // An open ring runs from boundary face (a, b, v_0) to (a, b, v_{m−1}): both must lie on one
@@ -608,6 +617,73 @@ pub fn edges_of(cx: &TetComplex, tets: &[u32]) -> Result<Vec<(u32, u32)>> {
     Ok(out)
 }
 
+/// The link condition for contracting edge `ab` (T. K. Dey, H. Edelsbrunner, S. Guha,
+/// D. V. Nekhayev, *Topology preserving edge contraction*, Publ. Inst. Math. (Beograd) 66,
+/// 1999): what `a` and `b` both see — a vertex, or an edge opposite them in a face — must be in
+/// the link of the edge itself, the vertices round it and the edges between neighbouring ones.
+/// The boundary counts as one more vertex joined to every boundary face (the paper's cone): a
+/// boundary neighbour of both must be an end of the edge's open ring, and no boundary edge may
+/// face both. Else the contraction pinches the mesh: an edge or face it moves lands on one the
+/// mesh has, in a third tetrahedron. False when there is no edge `ab`.
+pub(super) fn link_condition(cx: &mut TetComplex, a: u32, b: u32) -> Result<bool> {
+    let Some(ring) = cx.edge_ring(a, b)? else { return Ok(false) };
+    let n = ring.verts.len();
+    let mut ring_edges: Vec<(u32, u32)> =
+        (0..n).filter(|&i| ring.closed || i + 1 < n).filter_map(|i| Some(sorted2(*ring.verts.get(i)?, *ring.verts.get((i + 1) % n)?))).collect();
+    ring_edges.sort_unstable();
+    let ends = if ring.closed { Vec::new() } else { [ring.verts.first(), ring.verts.last()].into_iter().flatten().copied().collect() };
+    // What `v` sees: the other vertices of its tetrahedra, the edges opposite it in its faces,
+    // and of those the ones in boundary faces.
+    let mut link = |v: u32| -> Result<VertexLink> {
+        let (mut verts, mut edges, mut boundary_edges) = (Vec::new(), Vec::new(), Vec::new());
+        for t in cx.star(v)? {
+            let (vs, adj) = (cx.tet(t)?, cx.adj(t)?);
+            for k in 0..4 {
+                let face = face_toward(vs, k);
+                let Some(i) = face.iter().position(|&x| x == v) else { continue };
+                let e = sorted2(face[(i + 1) % 3], face[(i + 2) % 3]);
+                edges.push(e);
+                if adj[k] == NONE {
+                    boundary_edges.push(e);
+                }
+            }
+            verts.extend(vs.into_iter().filter(|&x| x != v));
+        }
+        let boundary_verts = sorted(boundary_edges.iter().flat_map(|e| [e.0, e.1]).collect());
+        Ok(VertexLink { verts: sorted(verts), edges: sorted(edges), boundary_verts, boundary_edges: sorted(boundary_edges) })
+    };
+    let (la, lb) = (link(a)?, link(b)?);
+    // A vertex both see, other than `a` and `b`, that `fits` refuses.
+    let shared_unless =
+        |x: &[u32], y: &[u32], fits: &dyn Fn(&u32) -> bool| x.iter().any(|v| *v != a && *v != b && y.binary_search(v).is_ok() && !fits(v));
+    let off_ring = shared_unless(&la.verts, &lb.verts, &|v| ring.verts.contains(v))
+        || la.edges.iter().any(|e| lb.edges.binary_search(e).is_ok() && ring_edges.binary_search(e).is_err());
+    let boundary = if ring.closed {
+        // An inner edge between two boundary vertices: both see the boundary, the edge does not.
+        !la.boundary_verts.is_empty() && !lb.boundary_verts.is_empty()
+    } else {
+        shared_unless(&la.boundary_verts, &lb.boundary_verts, &|v| ends.contains(v))
+            || la.boundary_edges.iter().any(|e| lb.boundary_edges.binary_search(e).is_ok())
+    };
+    Ok(!(off_ring || boundary))
+}
+
+/// `v` sorted, without repeats.
+fn sorted<T: Ord>(mut v: Vec<T>) -> Vec<T> {
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// What a vertex sees ([`link_condition`]), each list sorted.
+#[derive(Default)]
+struct VertexLink {
+    verts: Vec<u32>,
+    edges: Vec<(u32, u32)>,
+    boundary_verts: Vec<u32>,
+    boundary_edges: Vec<(u32, u32)>,
+}
+
 /// Collapse vertex `a` onto its neighbour `b` (edge contraction): every tetrahedron around `a`
 /// takes `b` in its place and those holding the edge disappear. Allowed when `a` may move to `b`
 /// without leaving its boundary entity — an interior vertex anywhere, a face vertex along an edge
@@ -675,7 +751,7 @@ pub fn collapse(cx: &mut TetComplex, a: u32, b: u32, max_len: f64, floor: f64) -
             let g = f.map(|v| if v == a { b } else { v });
             let n0 = measure::triangle_normal(cx.xyz(f[0])?, cx.xyz(f[1])?, cx.xyz(f[2])?);
             let n1 = measure::triangle_normal(cx.xyz(g[0])?, cx.xyz(g[1])?, cx.xyz(g[2])?);
-            if !(measure::dot(n0, n1) >= COLLAPSE_NORMAL_COS) {
+            if turns_over(n0, n1) {
                 return Ok(false);
             }
             new_boundary.push((g, tags[k]));
@@ -705,6 +781,9 @@ pub fn collapse(cx: &mut TetComplex, a: u32, b: u32, max_len: f64, floor: f64) -
             }
         }
     }
+    if !link_condition(cx, a, b)? {
+        return Ok(false);
+    }
     let change = Change { old: star, new, new_boundary, drop_curves: drop.clone() };
     if cx.replace(&change)?.is_none() {
         return Ok(false);
@@ -717,6 +796,3 @@ pub fn collapse(cx: &mut TetComplex, a: u32, b: u32, max_len: f64, floor: f64) -
     }
     Ok(true)
 }
-
-/// cos 30°: the largest turn of a boundary face's normal a collapse may cause.
-const COLLAPSE_NORMAL_COS: f64 = 0.866_025_403_784_438_6;

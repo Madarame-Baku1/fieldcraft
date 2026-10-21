@@ -6,7 +6,8 @@
 //! set filling the same region. The replacement is checked before anything is changed — every new
 //! tetrahedron positive by the exact `orient3d` and admissible by FieldCraft's validity criterion, every face of the region's outside matched once,
 //! every new face either shared by two new tetrahedra, matched outside, or declared a new
-//! boundary face — and refused (no change) otherwise. So every operation built on it (flips, edge
+//! boundary face, and no face or edge it makes already in the mesh outside the region (a third
+//! tetrahedron on a face folds the mesh over itself) — and refused (no change) otherwise. So every operation built on it (flips, edge
 //! removal, insertion) either keeps a valid, conforming mesh or does nothing, and every operation
 //! can be undone by the inverse replacement ([`Journal`]).
 //!
@@ -30,6 +31,18 @@ pub const ADMISSIBLE_MARGIN: f64 = 1e3 * fieldcraft_model::MIN_NORMALIZED_JACOBI
 
 /// No tetrahedron, no vertex, no tag.
 pub const NONE: u32 = u32::MAX;
+
+/// cos 30°: the largest turn of a boundary face's normal that moving or collapsing one of its
+/// vertices may cause. Positive tetrahedra alone let a boundary vertex fold its faces over the
+/// ones beside it.
+pub const BOUNDARY_TURN_COS: f64 = 0.866_025_403_784_438_6;
+
+/// Whether a boundary face whose unit normal was `before` turns by more than 30° to `after`
+/// ([`BOUNDARY_TURN_COS`]); a face with no area before has no orientation to keep.
+pub fn turns_over(before: [f64; 3], after: [f64; 3]) -> bool {
+    before != [0.0; 3] && !(super::measure::dot(before, after) >= BOUNDARY_TURN_COS)
+}
+
 /// Marks a recycled tetrahedron slot.
 const DEAD: u32 = u32::MAX - 1;
 
@@ -463,6 +476,13 @@ impl TetComplex {
         }
     }
 
+    /// Whether a live tetrahedron outside the visited region holds every one of `vs` (an edge
+    /// or a face), looked for round the vertex with the fewest.
+    fn held_outside(&self, vs: &[u32]) -> bool {
+        let around = vs.iter().filter_map(|&v| self.vtets.get(v as usize)).min_by_key(|l| l.len());
+        around.is_some_and(|l| l.iter().any(|&t| !self.visited(t) && self.tets.get(t as usize).is_some_and(|tv| vs.iter().all(|v| tv.contains(v)))))
+    }
+
     fn visited(&self, t: u32) -> bool {
         self.mark.get(t as usize).is_some_and(|&m| m == self.epoch)
     }
@@ -523,7 +543,7 @@ impl TetComplex {
         if self.tet(t)?.contains(&b) {
             return Ok(Some(t));
         }
-        Ok(self.star(a)?.into_iter().find(|&t| self.tet(t).is_ok_and(|vs| vs.contains(&b))))
+        Ok(self.vtets.get(a as usize).into_iter().flatten().copied().filter(|&t| self.tet(t).is_ok_and(|vs| vs.contains(&b))).min())
     }
 
     /// The ring of tetrahedra around edge `ab`: the link vertices `v_0, …, v_{m−1}` and the
@@ -761,8 +781,16 @@ impl TetComplex {
         Ok(())
     }
 
+    /// Vertex `u`, at `p` when it is the moved `v`.
+    fn point_moved(&self, u: u32, moved: Option<(u32, Point3)>) -> Result<Point3> {
+        match moved {
+            Some((v, p)) if v == u => Ok(p),
+            _ => self.point(u),
+        }
+    }
+
     /// Whether every tetrahedron of `star` (around `v`) stays positive and admissible with `v`
-    /// at `p`.
+    /// at `p`, and every boundary face round `v` turns by at most 30° ([`BOUNDARY_TURN_COS`]).
     pub fn move_is_valid(&self, v: u32, p: &Point3, star: &[u32]) -> Result<bool> {
         for &t in star {
             let vs = self.tet(t)?;
@@ -776,6 +804,17 @@ impl TetComplex {
             }
             if !(normalized_jacobian(&tet4_jacobian(&x)) > ADMISSIBLE_MARGIN) {
                 return Ok(false);
+            }
+            let adj = self.adj(t)?;
+            for j in (0..4).filter(|&j| j != k && adj[j] == NONE) {
+                let normal = |moved| -> Result<[f64; 3]> {
+                    let [a, b, c] = face_toward(vs, j);
+                    let x = |u| self.point_moved(u, moved).map(|q| q.coords());
+                    Ok(super::measure::triangle_normal(x(a)?, x(b)?, x(c)?))
+                };
+                if turns_over(normal(None)?, normal(Some((v, *p)))?) {
+                    return Ok(false);
+                }
             }
         }
         Ok(true)
@@ -884,6 +923,9 @@ impl TetComplex {
                     }
                     links.push((i, k, Link::New(j)));
                     links.push((j, l, Link::New(i)));
+                    if self.held_outside(&key) {
+                        return Ok(None);
+                    }
                     continue;
                 }
                 inner.insert(key, (i, k));
@@ -906,12 +948,31 @@ impl TetComplex {
                 if !same_cycle(face, oriented) || self.is_frozen(tag) {
                     return Ok(None);
                 }
+                if self.held_outside(&key) {
+                    return Ok(None);
+                }
                 links.push((i, k, Link::Boundary(tag)));
             } else {
                 return Ok(None);
             }
         }
         if used_declared != declared.len() {
+            return Ok(None);
+        }
+        // Nor an edge it makes (above, a face): one the mesh has outside the old region already
+        // folds it over itself (an edge removal or flip triangulating across it, a collapse
+        // laying an edge onto it). Every check above is local to the region and passes that.
+        let mut old_sorted = old_edges.clone();
+        old_sorted.sort_unstable();
+        let mut made_edges: Vec<(u32, u32)> = change
+            .new
+            .iter()
+            .flat_map(|vs| EDGES.iter().map(move |&(i, j)| sorted2(vs[i], vs[j])))
+            .filter(|e| old_sorted.binary_search(e).is_err())
+            .collect();
+        made_edges.sort_unstable();
+        made_edges.dedup();
+        if made_edges.iter().any(|e| self.held_outside(&[e.0, e.1])) {
             return Ok(None);
         }
         // What is left outside must be boundary faces the change removes, and none frozen.

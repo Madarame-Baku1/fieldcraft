@@ -330,7 +330,10 @@ Delaunay methods with Voronoi/ODT improvement, then (2) all-hex and hex-dominant
   theory: faces below half the local size are not split, no vertex closer than 0.05 of the size to another, a
   tetrahedron whose point could not go in is not retried, caps on insertions and tetrahedra. Before refinement, edge
   collapse coarsens the boundary recovery's dense Steiner points (X. Li, M. S. Shephard, M. W. Beall, *3D anisotropic
-  mesh adaptation by mesh modification*, CMAME 194(48–49):4915–4950, 2005).
+  mesh adaptation by mesh modification*, CMAME 194(48–49):4915–4950, 2005). A collapse keeps the link condition
+  (T. K. Dey, H. Edelsbrunner, S. Guha, D. V. Nekhayev, *Topology preserving edge contraction*, Publ. Inst. Math.
+  (Beograd) (N.S.) 66(80):23–45, 1999), the boundary coned to one extra vertex as in the paper, so it never lays an edge
+  or face onto one the mesh has.
 
 **A3.2 Cheng, Dey, Shewchuk, *Delaunay Mesh Generation* (CRC, 2012).** **Verdict: reference (the textbook).**
 - **Links.** DOI [10.1201/b12987](https://doi.org/10.1201/b12987).
@@ -395,19 +398,21 @@ Delaunay methods with Voronoi/ODT improvement, then (2) all-hex and hex-dominant
 - **Complexity.** Moderate: edge removal requires Shewchuk's dynamic programming over the edge ring.
   PDF: https://people.eecs.berkeley.edu/~jrs/papers/edge.pdf, not separately verified.
 - **Code.** The Stellar code's licence was not verified, so it is not read.
-- **Implemented** in `fieldcraft-mesh::tet::{ops, improve}` from the two papers: Klincsek's dynamic programming for edge
-  removal (interior edges; boundary edges of one flat B-rep face end in a 2-2 flip), multi-face removal grown greedily
-  over the sandwiched faces, nonsmooth optimization smoothing (active set, smallest vector of the convex hull of the
-  active gradients, line search; gradients by central differences), and the composite vertex insertion with rollback
-  (barycentres of boundary faces, of the tetrahedron, midpoints of boundary edges, and a point inside off a flat
-  boundary edge). Deviations: the inserted vertex takes the Delaunay cavity rather than the optimal cut of §3.4; each pass
-  smooths and flips the tetrahedra below sin 40° and inserts only when the worst did not improve; passes and the
-  insertion list are capped. Objective: the smaller of the minimum dihedral sine and the scaled Jacobian at the worst
-  corner weighted so that a Jacobian of 0.3 counts as a 30° dihedral angle: the sine misses needles (every dihedral
-  angle fine, one corner nearly flat; Shewchuk 2002); the scaled Jacobian analysts check (Knupp 2001, B6.6) catches
-  them, and with the weight it decides only near that limit. Every operation is a checked replacement of a region
-  (positive by exact `orient3d`, faces matched with opposite orientation, removed vertices fully inside), so the mesh is
-  valid after each step.
+- **Implemented** in `fieldcraft-mesh::tet::{ops, improve}` from the two papers: Klincsek's dynamic programming for
+  edge removal (interior edges; boundary edges of one flat B-rep face end in a 2-2 flip; the triangulation never takes
+  an edge the mesh has elsewhere, else a boundary vertex with three faces round it is flipped onto a face the mesh
+  has), multi-face removal grown greedily over the sandwiched faces, nonsmooth optimization smoothing (active set,
+  smallest vector of the convex hull of the active gradients, line search; gradients by central differences; a
+  boundary vertex moves only while none of its faces turns by more than 30°), and the composite vertex insertion with
+  rollback (barycentres of boundary faces, of the tetrahedron, midpoints of boundary edges, and a point inside off a
+  flat boundary edge). Deviations: the inserted vertex takes the Delaunay cavity rather than the optimal cut of §3.4;
+  each pass smooths and flips the tetrahedra below sin 40° and inserts only when the worst did not improve; passes and
+  the insertion list are capped. Objective: the smaller of the minimum dihedral sine and the scaled Jacobian at the
+  worst corner weighted so that a Jacobian of 0.3 counts as a 30° dihedral angle: the sine misses needles (every
+  dihedral angle fine, one corner nearly flat; Shewchuk 2002); the scaled Jacobian analysts check (Knupp 2001, B6.6)
+  catches them, and with the weight it decides only near that limit. Every operation is a checked replacement of a
+  region (positive by exact `orient3d`, faces matched with opposite orientation, removed vertices fully inside, no
+  face or edge it makes held by a tetrahedron outside it), so the mesh is valid after each step.
 
 **A3.7 Cheng, Dey, Edelsbrunner, Facello, Teng 2000, Sliver exudation.** **Verdict: reference.**
 - **Citation.** J. ACM 47(5):883–904, 2000. DOI [10.1145/355483.355487](https://doi.org/10.1145/355483.355487).
