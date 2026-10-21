@@ -598,6 +598,50 @@ fn a_move_never_turns_a_boundary_face_over() {
     assert!(!cx.move_is_valid(1, &to([3.0, 0.0, 0.0]), &star).unwrap());
 }
 
+/// With the skin indexed, a move or a change whose boundary faces would pass through another part
+/// of the skin is refused, however positive its tetrahedra. A square pyramid, its apex 0 in its
+/// top face, under a separate tetrahedron whose bottom face lies 0.1 above: lifting the apex 0.2
+/// keeps the pyramid positive and turns its top faces by 11°, but pushes them through that face,
+/// whether the apex moves or a change puts a new vertex there; lifting it 0.05 does not.
+#[test]
+fn the_skin_never_passes_through_itself() {
+    let p = [
+        [0.0, 0.0, 0.0],
+        [1.0, 1.0, 0.0],
+        [-1.0, 1.0, 0.0],
+        [-1.0, -1.0, 0.0],
+        [1.0, -1.0, 0.0],
+        [0.0, 0.0, -1.0],
+        [-1.0, -1.0, 0.1],
+        [1.0, -1.0, 0.1],
+        [0.0, 1.0, 0.1],
+        [0.0, 0.0, 1.0],
+    ];
+    let pyramid = [[0, 1, 2, 5], [0, 2, 3, 5], [0, 3, 4, 5], [0, 4, 1, 5]];
+    let mut tets = pyramid.to_vec();
+    tets.push([6, 7, 8, 9]);
+    let plain = complex_of(&p, &tets, vec![VertexKind::Corner; p.len()], |_| 0);
+    let mut indexed = plain.clone();
+    indexed.index_skin(1.0).unwrap();
+    let to = |z: f64| Point3::try_from([0.0, 0.0, z]).unwrap();
+    for (mut cx, skin) in [(plain, false), (indexed, true)] {
+        let star = cx.star(0).unwrap();
+        assert!(cx.move_is_valid(0, &to(0.05), &star).unwrap());
+        assert_eq!(cx.move_is_valid(0, &to(0.2), &star).unwrap(), !skin);
+        // The same lift as a change: a new apex 10, the old one gone.
+        let v = cx.add_point(to(0.2), VertexKind::Face(0)).unwrap();
+        let mut change = Change { old: (0..4).collect(), ..Change::default() };
+        for t in pyramid {
+            let x = [v, t[1], t[2], t[3]];
+            let x = if measure::volume6(&cx.coords(x).unwrap()) > 0.0 { x } else { [x[1], x[0], x[2], x[3]] };
+            let top = x.iter().position(|&u| u == 5).unwrap();
+            change.new_boundary.push((face_toward(x, top), 0));
+            change.new.push(x);
+        }
+        assert_eq!(cx.replace(&change).unwrap().is_some(), !skin);
+    }
+}
+
 /// The fillet of a plate on a rib (our own recipe: a 60 × 30 × 6 mm plate on a 6 mm triangular
 /// rib, its top edges rounded at 2 mm, meshed at 3 mm), where vertex 1 has three boundary faces
 /// round it: (0, 1, 2), (0, 1, 5) and (1, 2, 5). Removing edge 0–1 ends in a 2-2 flip of the

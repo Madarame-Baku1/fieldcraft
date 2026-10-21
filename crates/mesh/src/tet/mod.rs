@@ -515,6 +515,8 @@ pub fn quality_mesh(surface: &BoundarySurface, cdt: &TetMesh, analytic: Vec<Opti
             }
         }
     }
+    // From here on, no change or move lets the skin pass through itself.
+    cx.index_skin(global)?;
     // Coarsen what the boundary recovery made denser than the size field asks for.
     report.collapsed = refine::coarsen(&mut cx, &ctx, 0.6, 1.4, 0.05, 6)?;
     seed_curves(&mut cx, &ctx, &o.seeds, global)?;

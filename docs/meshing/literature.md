@@ -403,16 +403,19 @@ Delaunay methods with Voronoi/ODT improvement, then (2) all-hex and hex-dominant
   an edge the mesh has elsewhere, else a boundary vertex with three faces round it is flipped onto a face the mesh
   has), multi-face removal grown greedily over the sandwiched faces, nonsmooth optimization smoothing (active set,
   smallest vector of the convex hull of the active gradients, line search; gradients by central differences; a
-  boundary vertex moves only while none of its faces turns by more than 30°), and the composite vertex insertion with
-  rollback (barycentres of boundary faces, of the tetrahedron, midpoints of boundary edges, and a point inside off a
-  flat boundary edge). Deviations: the inserted vertex takes the Delaunay cavity rather than the optimal cut of §3.4;
-  each pass smooths and flips the tetrahedra below sin 40° and inserts only when the worst did not improve; passes and
-  the insertion list are capped. Objective: the smaller of the minimum dihedral sine and the scaled Jacobian at the
-  worst corner weighted so that a Jacobian of 0.3 counts as a 30° dihedral angle: the sine misses needles (every
-  dihedral angle fine, one corner nearly flat; Shewchuk 2002); the scaled Jacobian analysts check (Knupp 2001, B6.6)
-  catches them, and with the weight it decides only near that limit. Every operation is a checked replacement of a
-  region (positive by exact `orient3d`, faces matched with opposite orientation, removed vertices fully inside, no
-  face or edge it makes held by a tetrahedron outside it), so the mesh is valid after each step.
+  boundary vertex moves only while none of its faces turns by more than 30° or crosses another boundary face), and the
+  composite vertex insertion with rollback (barycentres of boundary faces, of the tetrahedron, midpoints of boundary
+  edges, and a point inside off a flat boundary edge). Deviations: the inserted vertex takes the Delaunay cavity
+  rather than the optimal cut of §3.4; each pass smooths and flips the tetrahedra below sin 40° and inserts only when
+  the worst did not improve; passes and the insertion list are capped. Objective: the smaller of the minimum dihedral
+  sine and the scaled Jacobian at the worst corner weighted so that a Jacobian of 0.3 counts as a 30° dihedral angle:
+  the sine misses needles (every dihedral angle fine, one corner nearly flat; Shewchuk 2002); the scaled Jacobian
+  analysts check (Knupp 2001, B6.6) catches them, and with the weight it decides only near that limit. Every operation
+  is a checked replacement of a region (positive by exact `orient3d`, faces matched with opposite orientation, removed
+  vertices fully inside, no face or edge it makes held by a tetrahedron outside it, its new boundary faces meeting the
+  rest of the boundary only in shared vertices by the exact triangle test of the surface checks, found through a grid
+  of the boundary faces), so the mesh is valid after each step: two sheets of a thin run-out, hundredths of a
+  millimetre apart, are not pushed through each other.
 
 **A3.7 Cheng, Dey, Edelsbrunner, Facello, Teng 2000, Sliver exudation.** **Verdict: reference.**
 - **Citation.** J. ACM 47(5):883–904, 2000. DOI [10.1145/355483.355487](https://doi.org/10.1145/355483.355487).

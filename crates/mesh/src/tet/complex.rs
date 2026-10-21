@@ -11,6 +11,12 @@
 //! removal, insertion) either keeps a valid, conforming mesh or does nothing, and every operation
 //! can be undone by the inverse replacement ([`Journal`]).
 //!
+//! Those checks are local to the region; the skin can still pass through a part of itself the
+//! region does not touch (two sheets of a thin run-out, hundredths of a millimetre apart). With
+//! the skin indexed by place ([`TetComplex::index_skin`]), a change's new boundary faces and a
+//! moved vertex's boundary faces must meet every other boundary face properly (exactly, in their
+//! shared vertices) or the change or move is refused.
+//!
 //! Layout: per tetrahedron four vertex ids in tet4 order (`det[b − a, c − a, d − a] > 0`), four
 //! neighbour ids (neighbour `k` across the face opposite vertex `k`, [`NONE`] on the boundary) and
 //! four face tags (the B-rep face of a boundary face, [`NONE`] inside). Slots of removed
@@ -22,6 +28,8 @@ use std::hash::{BuildHasherDefault, Hasher};
 use fieldcraft_model::{normalized_jacobian, tet4_jacobian};
 
 use crate::predicates::{Point3, Sign, insphere, tet_volume_sign};
+use crate::surface::Box3;
+use crate::surface::intersect::{is_degenerate, projections_apart, surface_pair_intersects};
 use crate::{Error, Result};
 
 /// Every tetrahedron a change creates has a normalized Jacobian above this: FieldCraft's validity
@@ -73,6 +81,43 @@ impl Hasher for IdHasher {
 
 /// A hash map keyed by vertex ids.
 pub type IdMap<K, V> = HashMap<K, V, BuildHasherDefault<IdHasher>>;
+
+/// The most grid cells one boundary face is listed in ([`Skin`]); a larger face goes on the list
+/// every lookup reads.
+const SKIN_FACE_CELLS: i64 = 512;
+
+/// The boundary faces by place ([`TetComplex::index_skin`]): per cell of a uniform grid, the
+/// tetrahedra with a boundary face whose bounding box touches it. Entries are only added, where a
+/// face is made or moved and where a rollback restores one; a lookup reads the live mesh and
+/// passes over what is stale. Rebuilt when the entries have doubled since the last rebuild.
+#[derive(Debug, Clone, Default)]
+struct Skin {
+    cell: f64,
+    cells: IdMap<u64, Vec<u32>>,
+    /// Tetrahedra with a face too large for [`SKIN_FACE_CELLS`].
+    wide: Vec<u32>,
+    entries: usize,
+    /// Rebuilt beyond this many entries.
+    limit: usize,
+}
+
+impl Skin {
+    /// The keys of the cells a box touches; `None` beyond [`SKIN_FACE_CELLS`] of them.
+    fn keys(&self, b: &Box3) -> Option<impl Iterator<Item = u64> + use<>> {
+        let cell = |x: f64| (x / self.cell).floor() as i64;
+        let (lo, hi) = (b.lo.map(cell), b.hi.map(cell));
+        let n = (0..3).fold(1i64, |n, k| n.saturating_mul(hi[k].saturating_sub(lo[k]).saturating_add(1)));
+        (n <= SKIN_FACE_CELLS)
+            .then(|| (lo[0]..=hi[0]).flat_map(move |x| (lo[1]..=hi[1]).flat_map(move |y| (lo[2]..=hi[2]).map(move |z| skin_key([x, y, z])))))
+    }
+}
+
+/// A cell's key (cells that share one only add candidates), mixed: the id hasher keeps low bits
+/// low, so unmixed keys of one x would share a bucket.
+fn skin_key(c: [i64; 3]) -> u64 {
+    let p = |x: i64| (x as u64) & 0x1f_ffff;
+    (p(c[0]) | (p(c[1]) << 21) | (p(c[2]) << 42)).wrapping_mul(0x9e37_79b9_7f4a_7c15).rotate_left(32)
+}
 
 pub(crate) fn corrupt(what: &str) -> Error {
     Error::Failed(format!("tetrahedral mesh is inconsistent: {what}"))
@@ -216,6 +261,7 @@ pub struct TetComplex {
     max_tets: usize,
     max_points: usize,
     pub journal: Journal,
+    skin: Option<Skin>,
 }
 
 /// Where a walk toward a point ended ([`TetComplex::walk`]).
@@ -298,6 +344,7 @@ impl TetComplex {
             max_tets,
             max_points,
             journal: Journal::default(),
+            skin: None,
         };
         let n = cx.pts.len() as u32;
         let mut faces: IdMap<[u32; 3], (u32, usize)> = IdMap::default();
@@ -778,7 +825,7 @@ impl TetComplex {
         if self.journal.recording {
             self.journal.steps.push(Step::Moved { v, from });
         }
-        Ok(())
+        self.skin_add_around(v)
     }
 
     /// Vertex `u`, at `p` when it is the moved `v`.
@@ -790,8 +837,15 @@ impl TetComplex {
     }
 
     /// Whether every tetrahedron of `star` (around `v`) stays positive and admissible with `v`
-    /// at `p`, and every boundary face round `v` turns by at most 30° ([`BOUNDARY_TURN_COS`]).
+    /// at `p`, every boundary face round `v` turns by at most 30° ([`BOUNDARY_TURN_COS`]), and
+    /// none passes through the rest of the skin ([`Self::skin_allows`]).
     pub fn move_is_valid(&self, v: u32, p: &Point3, star: &[u32]) -> Result<bool> {
+        Ok(self.move_keeps_star(v, p, star)? && self.skin_allows(v, p, star)?)
+    }
+
+    /// [`Self::move_is_valid`] without the skin check: for a vertex moved in several steps,
+    /// whose final place alone is checked against the skin ([`Self::skin_allows`]).
+    pub fn move_keeps_star(&self, v: u32, p: &Point3, star: &[u32]) -> Result<bool> {
         for &t in star {
             let vs = self.tet(t)?;
             let k = vs.iter().position(|&u| u == v).ok_or_else(|| corrupt("star"))?;
@@ -818,6 +872,20 @@ impl TetComplex {
             }
         }
         Ok(true)
+    }
+
+    /// Whether, with `v` at `p`, the boundary faces round it (in `star`) meet the rest of the skin
+    /// properly. True without a skin index ([`Self::index_skin`]).
+    pub fn skin_allows(&self, v: u32, p: &Point3, star: &[u32]) -> Result<bool> {
+        if self.skin.is_none() {
+            return Ok(true);
+        }
+        let mut fan = Vec::new();
+        for &t in star {
+            let (vs, adj) = (self.tet(t)?, self.adj(t)?);
+            fan.extend((0..4).filter(|&j| adj[j] == NONE && vs[j] != v).map(|j| face_toward(vs, j)));
+        }
+        Ok(!self.skin_crossed(&fan, Some((v, *p)), &[])?)
     }
 
     fn alloc(&mut self, vs: [u32; 4]) -> Result<u32> {
@@ -912,6 +980,8 @@ impl TetComplex {
             return Ok(None);
         }
         let mut used_declared = 0usize;
+        // The boundary faces it makes, as the new tetrahedra see them.
+        let mut skin_made: Vec<[u32; 3]> = Vec::new();
         for (i, vs) in change.new.iter().enumerate() {
             for k in 0..4 {
                 let key = sorted3(face_toward(*vs, k));
@@ -952,6 +1022,7 @@ impl TetComplex {
                     return Ok(None);
                 }
                 links.push((i, k, Link::Boundary(tag)));
+                skin_made.push(face);
             } else {
                 return Ok(None);
             }
@@ -1013,6 +1084,14 @@ impl TetComplex {
                 }
             }
         }
+        // Its new boundary faces meet the rest of the skin, and each other, properly.
+        if !skin_made.is_empty() && self.skin.is_some() {
+            let mut removed: Vec<[u32; 3]> = outside.keys().copied().collect();
+            removed.sort_unstable();
+            if self.skin_crossed(&skin_made, None, &removed)? {
+                return Ok(None);
+            }
+        }
         // Commit (saving what it overwrites when the journal records).
         let raw = if self.journal.recording {
             let mut slots: Vec<u32> = old.clone();
@@ -1066,6 +1145,9 @@ impl TetComplex {
         self.live = self.live - old.len() + ids.len();
         if self.journal.recording {
             self.journal.steps.push(Step::Replaced { removed, added: change.new.clone(), raw: raw.unwrap_or_default() });
+        }
+        for &t in &ids {
+            self.skin_add(t)?;
         }
         Ok(Some(ids))
     }
@@ -1124,7 +1206,173 @@ impl TetComplex {
         if self.journal.recording {
             self.journal.steps.push(Step::Deleted { removed: Removed { vs, tags }, raw: raw.unwrap_or_default() });
         }
+        for m in [k, l] {
+            self.skin_add(ns[m])?;
+        }
         Ok(true)
+    }
+
+    // ---- the skin index ----
+
+    /// Index the boundary faces by place, in cells of `cell` (the mesh size), so that every later
+    /// change and move keeps the skin from passing through itself (see the module docs). Every
+    /// tetrahedron must be positive by then: the check needs non-degenerate faces.
+    pub fn index_skin(&mut self, cell: f64) -> Result<()> {
+        self.skin = (cell > 0.0 && cell.is_finite()).then(|| Skin { cell, ..Skin::default() });
+        self.skin_rebuild()
+    }
+
+    fn skin_rebuild(&mut self) -> Result<()> {
+        let Some(skin) = self.skin.as_mut() else { return Ok(()) };
+        *skin = Skin { cell: skin.cell, ..Skin::default() };
+        let listed: Vec<u32> = self.live_tets().map(|(t, _)| t).filter(|&t| self.on_skin(t)).collect();
+        for t in listed {
+            self.skin_list(t)?;
+        }
+        if let Some(skin) = self.skin.as_mut() {
+            skin.limit = 2 * skin.entries + 1024;
+        }
+        Ok(())
+    }
+
+    /// Whether tetrahedron `t` is live and has a boundary face.
+    fn on_skin(&self, t: u32) -> bool {
+        self.is_live(t) && self.adj.get(t as usize).is_some_and(|a| a.contains(&NONE))
+    }
+
+    /// List tetrahedron `t`'s boundary faces in the skin index (rebuilt instead once it has
+    /// doubled).
+    fn skin_add(&mut self, t: u32) -> Result<()> {
+        match &self.skin {
+            Some(skin) if skin.entries > skin.limit => self.skin_rebuild(),
+            Some(_) => self.skin_list(t),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Self::skin_add`] for the tetrahedra round `v`, whose boundary faces holding it have moved.
+    fn skin_add_around(&mut self, v: u32) -> Result<()> {
+        if self.skin.is_none() || self.kind(v) == VertexKind::Interior {
+            return Ok(());
+        }
+        for i in 0..self.vtets.get(v as usize).map_or(0, Vec::len) {
+            if let Some(&t) = self.vtets.get(v as usize).and_then(|l| l.get(i)) {
+                self.skin_add(t)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn skin_list(&mut self, t: u32) -> Result<()> {
+        if self.skin.is_none() || !self.on_skin(t) {
+            return Ok(());
+        }
+        let (vs, adj) = (self.tet(t)?, self.adj(t)?);
+        let boxes = (0..4).filter(|&k| adj[k] == NONE).map(|k| self.face_box(face_toward(vs, k), None)).collect::<Result<Vec<_>>>()?;
+        let Some(skin) = self.skin.as_mut() else { return Ok(()) };
+        for b in boxes {
+            let Some(keys) = skin.keys(&b) else {
+                if !skin.wide.contains(&t) {
+                    skin.wide.push(t);
+                    skin.entries += 1;
+                }
+                continue;
+            };
+            for key in keys {
+                let list = skin.cells.entry(key).or_default();
+                if !list.contains(&t) {
+                    list.push(t);
+                    skin.entries += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The bounding box of a face, with `v` at `p` when given.
+    fn face_box(&self, f: [u32; 3], moved: Option<(u32, Point3)>) -> Result<Box3> {
+        let mut b = Box3::EMPTY;
+        for u in f {
+            b.add_point(self.point_moved(u, moved)?.coords());
+        }
+        Ok(b)
+    }
+
+    /// Whether one of `faces` (with `v` at `p` when given) meets a boundary face of the mesh, or
+    /// another of `faces`, in more than their shared vertices (exact; [`surface_pair_intersects`]).
+    /// Faces holding `v` and the boundary faces `removed` (sorted keys, sorted) are passed over.
+    /// False without a skin index.
+    fn skin_crossed(&self, faces: &[[u32; 3]], moved: Option<(u32, Point3)>, removed: &[[u32; 3]]) -> Result<bool> {
+        let Some(skin) = &self.skin else { return Ok(false) };
+        if faces.is_empty() {
+            return Ok(false);
+        }
+        // The tetrahedra listed in the cells the faces' boxes touch, each cell read once.
+        let boxes = faces.iter().map(|&f| self.face_box(f, moved)).collect::<Result<Vec<_>>>()?;
+        let (mut keys, mut everywhere, mut all) = (Vec::new(), false, Box3::EMPTY);
+        for b in &boxes {
+            all.add(b);
+            match skin.keys(b) {
+                Some(k) => keys.extend(k),
+                None => everywhere = true,
+            }
+        }
+        let mut near: Vec<u32> = skin.wide.clone();
+        if everywhere {
+            near.extend(skin.cells.values().flatten());
+        } else {
+            keys.sort_unstable();
+            keys.dedup();
+            for k in keys {
+                near.extend(skin.cells.get(&k).into_iter().flatten());
+            }
+        }
+        near.sort_unstable();
+        near.dedup();
+        // Their boundary faces and `faces` themselves, each with its key and box, where they touch
+        // the faces' boxes at all.
+        let mut against: Vec<([u32; 3], [u32; 3], Box3)> = Vec::new();
+        let mut add = |g: [u32; 3]| -> Result<()> {
+            let key = sorted3(g);
+            if moved.is_some_and(|(v, _)| g.contains(&v)) || removed.binary_search(&key).is_ok() {
+                return Ok(());
+            }
+            let b = self.face_box(g, None)?;
+            if all.touches(&b) {
+                against.push((g, key, b));
+            }
+            Ok(())
+        };
+        for &g in faces {
+            add(g)?;
+        }
+        for &t in &near {
+            if !self.on_skin(t) {
+                continue;
+            }
+            let (vs, adj) = (self.tet(t)?, self.adj(t)?);
+            for k in (0..4).filter(|&k| adj[k] == NONE) {
+                add(face_toward(vs, k))?;
+            }
+        }
+        for (&f, b) in faces.iter().zip(&boxes) {
+            let fp = [self.point_moved(f[0], moved)?, self.point_moved(f[1], moved)?, self.point_moved(f[2], moved)?];
+            let key = sorted3(f);
+            for (g, gkey, gb) in &against {
+                if !b.touches(gb) || *gkey == key {
+                    continue;
+                }
+                let gp = [self.point(g[0])?, self.point(g[1])?, self.point(g[2])?];
+                if projections_apart([f, *g], fp.each_ref(), gp.each_ref()) {
+                    continue;
+                }
+                // Faces of positive tetrahedra are not degenerate; one that is has nothing to cross.
+                if !is_degenerate(gp.each_ref()) && surface_pair_intersects([f, *g], fp.each_ref(), gp.each_ref()) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// Check the data structure: neighbours point back across the same face (seen from opposite
@@ -1178,11 +1426,18 @@ impl TetComplex {
         while self.journal.steps.len() > len {
             let Some(step) = self.journal.steps.pop() else { break };
             match step {
-                Step::Replaced { raw, .. } | Step::Deleted { raw, .. } => self.restore(*raw),
+                Step::Replaced { raw, .. } | Step::Deleted { raw, .. } => {
+                    let slots: Vec<u32> = raw.slots.iter().map(|s| s.0).collect();
+                    self.restore(*raw);
+                    for t in slots {
+                        self.skin_add(t)?;
+                    }
+                }
                 Step::Moved { v, from } => {
                     if let Some(s) = self.pts.get_mut(v as usize) {
                         *s = from;
                     }
+                    self.skin_add_around(v)?;
                 }
                 Step::Added { v } => {
                     if v as usize + 1 == self.pts.len() {

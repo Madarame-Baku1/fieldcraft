@@ -21,6 +21,7 @@
 //!   convex hull of the active gradients, line search), applied only when the worst improves.
 
 use crate::Result;
+use crate::predicates::Point3;
 
 use super::complex::{NONE, TetComplex, VertexKind, face_toward};
 use super::measure::{self, P, add, dot, scale, sub};
@@ -108,10 +109,10 @@ fn try_move(cx: &mut TetComplex, ctx: &Context, v: u32, star: &[u32], f: Freedom
     let d = restrict(sub(target, x), f);
     for s in [1.0, 0.5, 0.25] {
         let Some(p) = ctx.place(cx.kind(v), add(x, scale(d, s))) else { continue };
-        if p.coords() == x || !cx.move_is_valid(v, &p, star)? {
+        if p.coords() == x || !cx.move_keeps_star(v, &p, star)? {
             continue;
         }
-        if star_quality(cx, v, p.coords(), star)? >= floor {
+        if star_quality(cx, v, p.coords(), star)? >= floor && cx.skin_allows(v, &p, star)? {
             cx.move_point(v, p)?;
             return Ok(true);
         }
@@ -241,9 +242,11 @@ pub fn smooth_vertex(cx: &mut TetComplex, ctx: &Context, v: u32) -> Result<bool>
         return Ok(false);
     }
     let delta = STEP * len;
+    // The vertex moves once, to where the steps end: nothing sees the steps on the way, and each
+    // is checked from where it started (the turn of its boundary faces too).
     let mut x = x0;
     let mut worst = local.worst_at(x);
-    let mut moved = false;
+    let mut to: Option<Point3> = None;
     for _ in 0..8 {
         // Qualities and gradients (central differences) of the tetrahedra near the worst.
         let mut qs = Vec::with_capacity(local.tets.len());
@@ -279,12 +282,11 @@ pub fn smooth_vertex(cx: &mut TetComplex, ctx: &Context, v: u32) -> Result<bool>
         for _ in 0..6 {
             let Some(p) = ctx.place(cx.kind(v), add(x, scale(d, alpha))) else { break };
             let q = local.worst_at(p.coords());
-            if p.coords() != x && q > worst && cx.move_is_valid(v, &p, &star)? {
-                cx.move_point(v, p)?;
+            if p.coords() != x && q > worst && cx.move_keeps_star(v, &p, &star)? {
                 x = p.coords();
                 worst = q;
                 accepted = true;
-                moved = true;
+                to = Some(p);
                 break;
             }
             alpha *= 0.5;
@@ -293,5 +295,11 @@ pub fn smooth_vertex(cx: &mut TetComplex, ctx: &Context, v: u32) -> Result<bool>
             break;
         }
     }
-    Ok(moved)
+    match to {
+        Some(p) if cx.skin_allows(v, &p, &star)? => {
+            cx.move_point(v, p)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }

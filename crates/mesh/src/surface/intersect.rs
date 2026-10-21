@@ -15,9 +15,12 @@
 //!   same side of it (folded onto each other).
 //!
 //! Every vertex's side of the other triangle's plane is computed once per pair; a triangle
-//! strictly on one side of the other's plane rejects the pair at once.
+//! strictly on one side of the other's plane rejects the pair at once. Triangles in one plane
+//! take the predicates' slowest path (their sides are exact zeros); [`projections_apart`] is a
+//! cheap sufficient test for them to try first.
 
 use crate::predicates::{Axis, Point3, Sign, orient2d_projected, orient3d};
+use crate::vec3::{cross, sub};
 
 type Tri<'a> = [&'a Point3; 3];
 
@@ -116,6 +119,32 @@ fn edge_enters_corner(v: &Point3, a: &Point3, side_a: Sign, c: &Point3, d: &Poin
     }
     let Some((drop, s)) = plane_axis([v, c, d]) else { return false };
     orient2d_projected(v, c, a, drop) != -s && orient2d_projected(v, a, d, drop) != -s
+}
+
+/// Whether, seen along the axis triangle `s` faces most, the two triangles of a surface meet in
+/// their shared vertices alone: then they do (no other point of `s` projects onto a shared
+/// vertex), and [`surface_pair_intersects`] is false. Told by the line through an edge of one
+/// triangle with its third vertex on one side and every vertex of the other but that edge's
+/// strictly on the other; false when no edge tells.
+pub fn projections_apart(ids: [[u32; 3]; 2], s: Tri, t: Tri) -> bool {
+    let n = cross(sub(s[1].coords(), s[0].coords()), sub(s[2].coords(), s[0].coords())).map(f64::abs);
+    let drop = if n[0] >= n[1] && n[0] >= n[2] {
+        Axis::X
+    } else if n[1] >= n[2] {
+        Axis::Y
+    } else {
+        Axis::Z
+    };
+    let apart = |x: [u32; 3], xp: Tri, y: [u32; 3], yp: Tri| {
+        let inside = orient2d_projected(xp[0], xp[1], xp[2], drop);
+        !inside.is_zero()
+            && (0..3).any(|k| {
+                let (p, q) = (k, (k + 1) % 3);
+                (0..3).all(|i| y[i] == x[p] || y[i] == x[q] || orient2d_projected(xp[p], xp[q], yp[i], drop) == -inside)
+            })
+    };
+    // Without a proper projection of `s`, another of its points could project onto a vertex.
+    !orient2d_projected(s[0], s[1], s[2], drop).is_zero() && (apart(ids[0], s, ids[1], t) || apart(ids[1], t, ids[0], s))
 }
 
 /// Whether two triangles of a surface, given by vertex ids and points, meet anywhere other than
