@@ -685,7 +685,52 @@ fn the_gate_refuses_a_detached_tetrahedron() {
     let p = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], [1.0, 1.0, 1.0], [2.0, 1.0, 1.0], [1.0, 2.0, 1.0], [1.0, 1.0, 2.0]];
     let tets = [[0, 1, 2, 3], [4, 5, 6, 7]];
     let v = 2.0 / 6.0;
-    let e = super::linear_gate(&p, &tets, v).unwrap_err().to_string();
+    let e = super::linear_gate(&p, &tets, &faces_but(&tets, &[]), v).unwrap_err().to_string();
     assert!(e.contains("share no face") && e.contains("(1, 2)"), "{e}");
-    assert!(super::linear_gate(&p, &tets[..1], v / 2.0).is_ok());
+    assert!(super::linear_gate(&p, &tets[..1], &faces_but(&tets[..1], &[]), v / 2.0).is_ok());
+}
+
+/// The validity gate refuses a mesh folded over itself even when the fold's two layers add up to
+/// the volume the boundary encloses: a face held by three tetrahedra.
+#[test]
+fn the_gate_refuses_a_face_of_three_tetrahedra() {
+    // Two tetrahedra on either side of the base triangle, and a third over it again.
+    let p = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.2, 0.2, 1.0], [0.2, 0.2, -1.0], [0.3, 0.3, 0.5]];
+    let tets = [[0, 1, 2, 3], [0, 2, 1, 4], [0, 1, 2, 5]];
+    let v = (1.0 + 1.0 + 0.5) / 6.0;
+    let e = super::linear_gate(&p, &tets, &faces_but(&tets, &[[0, 1, 2]]), v).unwrap_err().to_string();
+    assert!(e.contains("held by more than two"), "{e}");
+    assert!(super::linear_gate(&p, &tets[..2], &faces_but(&tets[..2], &[[0, 1, 2]]), 2.0 / 6.0).is_ok());
+}
+
+/// The validity gate refuses a face listed as boundary that two tetrahedra hold, one on either
+/// side: the mesh closed onto its own boundary, as across a narrow gap. The volume adds up and no
+/// face is held by three, so only the listed boundary shows it.
+#[test]
+fn the_gate_refuses_a_boundary_face_of_two_tetrahedra() {
+    let p = [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.2, 0.2, 1.0], [0.2, 0.2, -1.0]];
+    let tets = [[0, 1, 2, 3], [0, 2, 1, 4]];
+    let v = 2.0 / 6.0;
+    let e = super::linear_gate(&p, &tets, &faces_but(&tets, &[]), v).unwrap_err().to_string();
+    assert!(e.contains("1 boundary faces are held by two tetrahedra"), "{e}");
+    assert!(super::linear_gate(&p, &tets, &faces_but(&tets, &[[0, 1, 2]]), v).is_ok());
+    // A face held once but left out of the list, or listed twice.
+    let mut short = faces_but(&tets, &[[0, 1, 2]]);
+    let last = short.pop().unwrap();
+    assert!(super::linear_gate(&p, &tets, &short, v).is_err());
+    short.extend([last, last]);
+    assert!(super::linear_gate(&p, &tets, &short, v).is_err());
+}
+
+/// Every face of `tets` except `inner`, as a boundary list.
+fn faces_but(tets: &[[u32; 4]], inner: &[[u32; 3]]) -> Vec<super::TaggedFace> {
+    let mut out = Vec::new();
+    for (t, vs) in tets.iter().enumerate() {
+        for k in 0..4 {
+            if !inner.contains(&sorted3(face_toward(*vs, k))) {
+                out.push(super::TaggedFace { tet: t as u32, opposite: k as u8, face: 0 });
+            }
+        }
+    }
+    out
 }

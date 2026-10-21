@@ -46,6 +46,8 @@ pub mod smooth;
 #[cfg(test)]
 mod tests;
 
+use std::collections::BTreeMap;
+
 use fieldcraft_model::ElementKind;
 
 use crate::cdt::TetMesh;
@@ -54,7 +56,7 @@ use crate::quality::{GateOptions, GateReport, Metric, Validity, element_quality,
 use crate::surface::BoundarySurface;
 use crate::{Error, Result};
 
-use complex::{IdMap, NONE, TetComplex, VertexKind, face_toward, sorted2};
+use complex::{IdMap, NONE, TetComplex, VertexKind, face_toward, sorted2, sorted3};
 use geometry::{AnalyticSurface, GradedSize, Tessellation};
 use improve::{ImproveOptions, ImproveStats};
 use refine::{Context, RefineOptions, RefineStats};
@@ -556,7 +558,7 @@ pub fn quality_mesh(surface: &BoundarySurface, cdt: &TetMesh, analytic: Vec<Opti
     report.output = tet_quality_stats(&c.points, &c.tets)?;
     report.seeds = seed_counts(&c.points, &c.tets, &boundary, &o.seeds);
     report.boundary_volume = boundary_volume(&c.points, &c.tets, &boundary)?;
-    let gate = linear_gate(&c.points, &c.tets, report.boundary_volume)?;
+    let gate = linear_gate(&c.points, &c.tets, &boundary, report.boundary_volume)?;
     report.volume = gate.volume;
     gate.into_result()?;
     match o.order {
@@ -572,24 +574,28 @@ pub fn quality_mesh(surface: &BoundarySurface, cdt: &TetMesh, analytic: Vec<Opti
     }
 }
 
+/// How many tetrahedra hold each face.
+fn face_use(tets: &[[u32; 4]]) -> BTreeMap<[u32; 3], u32> {
+    let mut count = BTreeMap::new();
+    for t in tets {
+        for k in 0..4 {
+            *count.entry(sorted3(face_toward(*t, k))).or_default() += 1;
+        }
+    }
+    count
+}
+
 /// The tetrahedra (1-based) that share none of their faces with another one, in a mesh of more
 /// than one: each is a separate piece of boundary, joined to the mesh by vertices or an edge.
-fn detached_tets(tets: &[[u32; 4]]) -> Vec<u32> {
+fn detached_tets(tets: &[[u32; 4]], count: &BTreeMap<[u32; 3], u32>) -> Vec<u32> {
     if tets.len() < 2 {
         return Vec::new();
     }
-    let face = |t: &[u32; 4], k: usize| {
-        let mut f = [t[(k + 1) % 4], t[(k + 2) % 4], t[(k + 3) % 4]];
-        f.sort_unstable();
-        f
-    };
-    let mut count: std::collections::BTreeMap<[u32; 3], u32> = std::collections::BTreeMap::new();
-    for t in tets {
-        for k in 0..4 {
-            *count.entry(face(t, k)).or_default() += 1;
-        }
-    }
-    tets.iter().enumerate().filter(|(_, t)| (0..4).all(|k| count.get(&face(t, k)).copied().unwrap_or(0) < 2)).map(|(i, _)| i as u32 + 1).collect()
+    tets.iter()
+        .enumerate()
+        .filter(|(_, t)| (0..4).all(|k| count.get(&sorted3(face_toward(**t, k))).copied().unwrap_or(0) < 2))
+        .map(|(i, _)| i as u32 + 1)
+        .collect()
 }
 
 /// The constrained Delaunay tetrahedralization itself as a [`QualityMesh`] (no quality stage),
@@ -604,16 +610,54 @@ pub fn raw_mesh(surface: &BoundarySurface, cdt: &TetMesh) -> Result<QualityMesh>
         .collect();
     let stats = tet_quality_stats(&cdt.points, &cdt.tets)?;
     let boundary_volume = boundary_volume(&cdt.points, &cdt.tets, &boundary)?;
-    let gate = linear_gate(&cdt.points, &cdt.tets, boundary_volume)?.into_result()?;
+    let gate = linear_gate(&cdt.points, &cdt.tets, &boundary, boundary_volume)?.into_result()?;
     let report = QualityReport { input: stats, output: stats, volume: gate.volume, boundary_volume, ..QualityReport::default() };
     Ok(QualityMesh { points: cdt.points.clone(), elements: cdt.tets.iter().map(|t| t.to_vec()).collect(), kind: ElementKind::Tet4, boundary, report })
 }
 
 /// The validity gate of a linear mesh: every tetrahedron admissible, joined to the others by a
-/// face (when there are several), and the volume equal to what its boundary encloses within
-/// 1e-9 (no overlap, no gap).
-pub fn linear_gate(points: &[[f64; 3]], tets: &[[u32; 4]], boundary_volume: f64) -> Result<GateReport> {
-    let detached = detached_tets(tets);
+/// face (when there are several), no face held by more than two, the faces listed as `boundary`
+/// exactly those held by one, and the volume equal to what the boundary encloses within 1e-9
+/// (no overlap, no gap).
+pub fn linear_gate(points: &[[f64; 3]], tets: &[[u32; 4]], boundary: &[TaggedFace], boundary_volume: f64) -> Result<GateReport> {
+    let count = face_use(tets);
+    // A mesh folded over itself: the volume check misses it when the fold is consistently
+    // oriented, its two layers adding up to what the boundary encloses.
+    let folded: Vec<&[u32; 3]> = count.iter().filter(|(_, n)| **n > 2).map(|(f, _)| f).collect();
+    if let Some(first) = folded.first() {
+        let at = points.get(first[0] as usize).copied().unwrap_or_default();
+        return Err(Error::failed(crate::message![
+            format!("mesh validity gate: {} faces are held by more than two tetrahedra (the first near ", folded.len()),
+            crate::message::point(at),
+            "): the mesh overlaps itself there"
+        ]));
+    }
+    // A boundary face that two tetrahedra hold: the mesh closed onto its own boundary there (two
+    // sides of a narrow gap meeting in one face), which neither the volume nor the fold sees.
+    let mut listed = Vec::with_capacity(boundary.len());
+    for b in boundary {
+        let t = tets.get(b.tet as usize).ok_or_else(|| Error::Failed("gate: boundary face of no tetrahedron".into()))?;
+        listed.push(sorted3(face_toward(*t, usize::from(b.opposite))));
+    }
+    listed.sort_unstable();
+    listed.dedup();
+    let closed: Vec<&[u32; 3]> = listed.iter().filter(|f| count.get(*f).copied().unwrap_or(0) != 1).collect();
+    if let Some(first) = closed.first() {
+        let at = points.get(first[0] as usize).copied().unwrap_or_default();
+        return Err(Error::failed(crate::message![
+            format!("mesh validity gate: {} boundary faces are held by two tetrahedra (the first near ", closed.len()),
+            crate::message::point(at),
+            "): the mesh closes onto its own boundary there"
+        ]));
+    }
+    let once = count.values().filter(|n| **n == 1).count();
+    if listed.len() != boundary.len() || once != listed.len() {
+        return Err(Error::Failed(format!(
+            "mesh validity gate: the mesh lists {} boundary faces where {once} faces are held by one tetrahedron",
+            boundary.len()
+        )));
+    }
+    let detached = detached_tets(tets, &count);
     if !detached.is_empty() {
         let list = detached.iter().take(10).map(u32::to_string).collect::<Vec<_>>().join(", ");
         return Err(Error::Failed(format!(
