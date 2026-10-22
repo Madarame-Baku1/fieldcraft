@@ -23,9 +23,15 @@ fn sphere_on_plate_report_and_quality_agree() {
         let q = s.execute("mesh.quality", &json!({})).unwrap();
         let m = &q["metrics"];
         let f = |v: &serde_json::Value| v.as_f64().unwrap();
-        assert_eq!(f(&mesh["min_dihedral"]), f(&m["min_dihedral"]["min"]), "{order}");
-        assert_eq!(f(&mesh["max_dihedral"]), f(&m["max_dihedral"]["max"]), "{order}");
-        assert_eq!(f(&mesh["min_scaled_jacobian"]), f(&m["scaled_jacobian"]["min"]), "{order}");
+        // The model keeps the mesh in SI between the two commands, so `mesh.quality` measures
+        // coordinates that went to metres and back: the same elements to rounding, not to the bit.
+        let same = |a: &serde_json::Value, b: &serde_json::Value| {
+            let (a, b) = (f(a), f(b));
+            assert!((a - b).abs() <= 1e-9 * a.abs().max(1.0), "{order}: {a} against {b}");
+        };
+        same(&mesh["min_dihedral"], &m["min_dihedral"]["min"]);
+        same(&mesh["max_dihedral"], &m["max_dihedral"]["max"]);
+        same(&mesh["min_scaled_jacobian"], &m["scaled_jacobian"]["min"]);
         assert!(f(&mesh["min_dihedral"]) > 30.0 && f(&mesh["max_dihedral"]) < 145.0, "{order}: {mesh}");
         assert!(f(&mesh["min_scaled_jacobian"]) >= 0.3, "{order}: {mesh}");
     }
