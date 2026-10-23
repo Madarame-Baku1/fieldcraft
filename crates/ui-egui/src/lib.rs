@@ -1202,8 +1202,8 @@ impl ModelApp {
     }
 
     /// The results plot the viewport draws, rebuilt when its key changes; `None` shows the
-    /// model. Only the deformation follows the animation frame; the scale and contour values are
-    /// kept while the rest of the key (the mode and field frame drawn among it) stays.
+    /// model. The solved values and fixed colour scale are cached; proportional shape and
+    /// contour amplitudes follow the animation frame. Saved field frames rebuild the cache.
     pub fn plot(&mut self) -> Option<Arc<results::Plot>> {
         let key = self.plot_key();
         if self.plot.0 != key {
@@ -2576,6 +2576,13 @@ fn probe_rows(reply: &Value, plot: Option<&results::Plot>, units: &DisplaySystem
         Field::Displacement.shown(&p.result, si, units)
     });
     let mut rows = Vec::new();
+    // Commands return solved data, independently of display interpolation. Keep that
+    // distinction beside the numbers, including when an earlier nonlinear shape is drawn.
+    match plot.map(|p| p.result.kind()) {
+        Some(fieldcraft_engine::results::Kind::Static(_)) => rows.push(("Probe values".into(), "Solved final state".into())),
+        Some(fieldcraft_engine::results::Kind::Frequency(_)) => rows.push(("Probe values".into(), "Unscaled mode shape".into())),
+        _ => {}
+    }
     let vector_row = |rows: &mut Vec<(String, String)>, name: &str, v: [f64; 3], q: Quantity, scale: f64| {
         let u = unit(q);
         rows.push((titled(name, u.as_deref()), results::components(&v, scale)));
@@ -2616,7 +2623,8 @@ fn probe_rows(reply: &Value, plot: Option<&results::Plot>, units: &DisplaySystem
     if let Some((field, v, result)) =
         contour.filter(|(f, ..)| !matches!(f, Field::VonMises | Field::Temperature) && !f.label().starts_with("Displacement"))
     {
-        rows.push((field.label().to_string(), results::with_unit(results::number(v), field.unit(result, units).as_deref())));
+        let label = if plot.is_some_and(|p| p.amplitude.is_some()) { format!("Displayed {}", field.label()) } else { field.label().to_string() };
+        rows.push((label, results::with_unit(results::number(v), field.unit(result, units).as_deref())));
     }
     rows
 }
@@ -3678,6 +3686,99 @@ mod tests {
     }
 
     #[test]
+    fn static_animation_updates_contours_with_one_fixed_legend() {
+        let mut app = solved_app();
+        app.run("results.contour", json!({"step": "Load", "field": "von_mises", "bands": 6})).unwrap();
+        app.run("results.animate", json!({})).unwrap();
+        app.now = 0.0;
+        let zero = app.plot().unwrap();
+        let cached = app.prepared.1.contour.clone().unwrap();
+        assert!(zero.contour.as_ref().unwrap().values.iter().all(|v| *v == 0.0));
+        app.now = results::PERIOD * 0.25;
+        let half = app.plot().unwrap();
+        let node = half.contour.as_ref().unwrap().max.0;
+        app.probe_node(node).unwrap();
+        let probe = app.probe.as_ref().unwrap();
+        assert!(probe.rows.contains(&("Probe values".into(), "Solved final state".into())));
+        let field = fieldcraft_engine::results::Field::VonMises;
+        let solved = fieldcraft_engine::results::field_values(&app.session.model, &half.result, field, half.pick).unwrap();
+        let at = half.result.nodes().binary_search(&node).unwrap();
+        let expected = field.shown(&half.result, solved[at], &half.units);
+        assert!(
+            probe.rows.contains(&("Mises".into(), results::with_unit(results::number(expected), field.unit(&half.result, &half.units).as_deref())))
+        );
+        assert!((half.contour.as_ref().unwrap().max.1 - expected * 0.5).abs() < expected * 1e-12);
+        app.now = results::PERIOD * 0.5;
+        let full = app.plot().unwrap();
+        assert!(Arc::ptr_eq(&cached, app.prepared.1.contour.as_ref().unwrap()), "reuse solved nodal values");
+        let (zero_c, half_c, full_c) = (zero.contour.as_ref().unwrap(), half.contour.as_ref().unwrap(), full.contour.as_ref().unwrap());
+        assert_eq!(zero_c.bands, full_c.bands);
+        assert_eq!(half_c.bands, full_c.bands);
+        assert_eq!(full_c.bands.min, 0.0);
+        assert!(full_c.max.1 > 0.0);
+        for (half, full) in half_c.values.iter().zip(&full_c.values) {
+            assert!((half - full * 0.5).abs() < full.abs().max(1.0) * 1e-12);
+        }
+        let colors = |p: &results::Plot| {
+            results::scene(p, Style::Shaded, crate::scene::Show::DEFAULT, &theme::Tokens::dark())
+                .tris
+                .into_iter()
+                .map(|t| t.color)
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(colors(&zero), colors(&full), "the rendered stress bands change too");
+        app.run("results.deformed", json!({"show": false})).unwrap();
+        app.now = 0.0;
+        let flat_zero = app.plot().unwrap();
+        app.now = results::PERIOD * 0.5;
+        let flat_full = app.plot().unwrap();
+        assert_eq!(flat_zero.display.tris, flat_full.display.tris);
+        assert_ne!(colors(&flat_zero), colors(&flat_full), "contours animate on the undeformed mesh");
+        app.run("results.animate", json!({"on": false})).unwrap();
+        let stopped = app.plot().unwrap();
+        assert_eq!(stopped.contour.as_ref().unwrap().values, full_c.values);
+        assert!(stopped.amplitude.is_none());
+    }
+
+    #[test]
+    fn heat_contours_reuse_the_plot_when_animate_has_nothing_to_change() {
+        let mut app = ModelApp::new(Session::default());
+        app.run_script(&fieldcraft_engine::sample::cantilever()).unwrap();
+        app.run_script(&json!([
+            {"command": "model.material.edit", "params": {"name": "Steel", "elastic": {"type": "isotropic", "young": 210000, "poisson": 0.3},
+                "density": 7.85e-9, "thermal": {"conductivity": 2, "specific_heat": 3}}},
+            {"command": "model.boundary_condition.create", "params": {"name": "Cold", "type": "temperature", "target": {"set": "root"}, "value": 0}},
+            {"command": "model.boundary_condition.create", "params": {"name": "Hot", "type": "temperature", "target": {"set": "tip"}, "value": 100}},
+            {"command": "model.step.create", "params": {"name": "Heat", "procedure": {"type": "heat_transfer"}, "boundary_conditions": ["Cold", "Hot"]}},
+            {"command": "model.step.create", "params": {"name": "Warm", "procedure": {"type": "heat_transfer", "transient": {"end_time": 2, "increment": 1}},
+                "boundary_conditions": ["Cold", "Hot"]}}
+        ])).unwrap();
+        for step in ["Heat", "Warm"] {
+            app.run("solve.heat", json!({"step": step})).unwrap();
+            for field in ["temperature", "heat_flux"] {
+                app.run("results.contour", json!({"step": step, "field": field})).unwrap();
+                app.run("results.animate", json!({"on": true})).unwrap();
+                // A stale Deformed setting cannot make a heat-only result move either.
+                for deformed in [false, true] {
+                    app.session.results_view.as_mut().unwrap().deformed = deformed;
+                    app.now = 0.0;
+                    let first = app.plot().unwrap();
+                    app.now = results::PERIOD * 0.25;
+                    assert!(Arc::ptr_eq(&first, &app.plot().unwrap()), "{step}/{field}: idle playback must reuse the plot");
+                }
+            }
+        }
+        // Explicit frame selections in a heat view still invalidate the plot cache.
+        app.run("results.contour", json!({"step": "Warm", "field": "temperature"})).unwrap();
+        app.session.results_view.as_mut().unwrap().frame = Some(0);
+        let initial = app.plot().unwrap();
+        app.session.results_view.as_mut().unwrap().frame = Some(2);
+        let final_frame = app.plot().unwrap();
+        assert!(!Arc::ptr_eq(&initial, &final_frame));
+        assert_ne!(initial.contour.as_ref().unwrap().values, final_frame.contour.as_ref().unwrap().values);
+    }
+
+    #[test]
     fn probing_a_node_reads_its_values_and_stale_results_say_so() {
         let mut app = solved_app();
         app.run("results.deformed", json!({"step": "Load"})).unwrap();
@@ -3732,7 +3833,20 @@ mod tests {
         // Animated, the frames run through once per cycle.
         app.run("results.animate", json!({})).unwrap();
         app.now = results::PERIOD * 0.5;
-        assert_eq!(app.plot().unwrap().pick.frame, Some(5));
+        let animated = app.plot().unwrap();
+        assert_eq!(animated.pick.frame, Some(5));
+        assert!(animated.amplitude.is_none(), "saved frames are not proportionally scaled");
+        let expected = fieldcraft_engine::results::field_values(
+            &app.session.model,
+            &animated.result,
+            fieldcraft_engine::results::Field::VonMises,
+            animated.pick,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|v| fieldcraft_engine::results::Field::VonMises.shown(&animated.result, v, &animated.units))
+        .collect::<Vec<_>>();
+        assert_eq!(animated.contour.as_ref().unwrap().values, expected);
         let image = app.capture(capture::CaptureSize { width: 1200.0, height: 800.0, scale: 1.0 }).unwrap();
         assert_eq!(image.size, [1200, 800]);
         // Probing reads the frame drawn.

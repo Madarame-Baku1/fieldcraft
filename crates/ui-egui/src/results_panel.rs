@@ -93,6 +93,9 @@ pub fn legend_rect(plot: &Plot, painter: &egui::Painter, rect: Rect, bar: Option
 
 /// The legend's title: the field with its unit (a mode shape normalised), or the shape drawn.
 fn title(plot: &Plot) -> String {
+    if plot.unavailable {
+        return plot.view.contour.map_or_else(|| "Field unavailable".into(), |f| f.title(&plot.result, &plot.units));
+    }
     match (&plot.contour, plot.mode()) {
         (Some(l), _) => l.field.title(&plot.result, &plot.units),
         (None, Some(_)) => "Mode shape (normalised)".into(),
@@ -154,9 +157,17 @@ fn legend_layout(plot: &Plot, painter: &egui::Painter, rect: Rect, bar: Option<R
         let increments = matches!(plot.result.kind(), Kind::Static(_));
         step.push_str(&frame_text(increments, k, n, at, unit_of(Quantity::Time, &plot.units).as_deref()));
     }
+    if let Some(a) = plot.amplitude {
+        let what = if matches!(plot.result.kind(), Kind::Frequency(_)) { "Mode amplitude" } else { "Proportional load" };
+        lines.push((format!("{what} × {} (display interpolation)", number(a)), t.text_dim));
+    }
     lines.push((step, t.overlay_text));
     if !plot.is_fluid() {
         lines.push((deformation(plot), t.text_dim));
+    }
+    if plot.unavailable {
+        lines.push(("Field not saved at this increment".into(), t.warm));
+        lines.push(("Stress/contact: final state only".into(), t.warm));
     }
     if let Some(l) = plot.contour.as_ref().filter(|_| plot.view.range_min.is_some() || plot.view.range_max.is_some()) {
         let scale = l.max.1.abs().max(l.min.1.abs());
@@ -357,7 +368,8 @@ pub fn controls(app: &mut ModelApp, plot: &Plot, ui: &mut egui::Ui, t: &Tokens) 
         // The legend's range: each end follows the field (Auto) or is clamped, e.g. below a
         // singular peak (#191).
         if let Some(l) = &plot.contour {
-            for (label, key, set, value) in [("Legend max", "max", plot.view.range_max, l.max.1), ("Legend min", "min", plot.view.range_min, l.min.1)]
+            for (label, key, set, value) in
+                [("Legend max", "max", plot.view.range_max, l.bands.max), ("Legend min", "min", plot.view.range_min, l.bands.min)]
             {
                 ui.label(label);
                 ui.horizontal(|ui| {
@@ -549,7 +561,13 @@ fn deformation_rows(plot: &Plot, ui: &mut egui::Ui, run: &mut Vec<(&'static str,
     ui.end_row();
     ui.label("Animate");
     let mut animate = plot.view.animate;
-    if ui.checkbox(&mut animate, "").changed() {
+    if ui
+        .checkbox(&mut animate, "")
+        .on_hover_text(
+            "Animate shape and contours. Linear static results interpolate a proportional load; nonlinear steps play saved displacements (intermediate stresses were not saved), explicit steps play saved fields.",
+        )
+        .changed()
+    {
         run.push(("results.animate", json!({"on": animate})));
     }
     ui.end_row();
@@ -1141,6 +1159,40 @@ fn reactions_table(ui: &mut egui::Ui, r: &Value, plot: &Plot, t: &Tokens) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::results;
+
+    #[test]
+    fn nonlinear_playback_explains_missing_increment_stress() {
+        let mut app = ModelApp::new(fieldcraft_engine::Session::default());
+        app.run("file.sample", json!({"name": "cantilever"})).unwrap();
+        app.run("model.section.edit", json!({"name": "Beam", "set": "beam", "material": "Steel", "kind": {"type": "solid"}, "formulation": {}}))
+            .unwrap();
+        app.run("model.step.create", json!({"name": "Increments", "procedure": {"type": "nonlinear_static", "nonlinear_geometry": false, "initial_increment": 0.25}, "boundary_conditions": ["Clamp"], "loads": ["Push"]})).unwrap();
+        app.run("solve.nonlinear", json!({"step": "Increments"})).unwrap();
+        app.run("results.contour", json!({"field": "von_mises"})).unwrap();
+        app.run("results.animate", json!({})).unwrap();
+        app.now = 0.0;
+        let plot = app.plot().unwrap();
+        assert!(plot.unavailable && plot.contour.is_none() && plot.amplitude.is_none());
+        assert_eq!(title(&plot), "Von Mises stress [MPa]");
+        app.probe_node(plot.result.nodes()[0]).unwrap();
+        assert!(app.probe.as_ref().unwrap().rows.contains(&("Probe values".into(), "Solved final state".into())));
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let legend = legend_layout(&plot, &ui.ctx().debug_painter(), Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0)), None, &Tokens::dark());
+            assert!(legend.lines.iter().any(|(line, _)| line == "Field not saved at this increment"));
+        });
+        out.textures_delta.clear();
+        app.run("results.deformed", json!({"show": false})).unwrap();
+        app.now = results::PERIOD * (results::FRAMES - 1) as f64 / results::FRAMES as f64;
+        let final_frame = app.plot().unwrap();
+        assert_ne!(plot.pick.frame, final_frame.pick.frame, "recorded nonlinear increments keep playing without deformation");
+        assert!(final_frame.contour.is_some() && !final_frame.unavailable && final_frame.amplitude.is_none());
+        app.run("results.animate", json!({"on": false})).unwrap();
+        assert!(app.plot().unwrap().contour.is_some(), "the complete final result remains available");
+        app.run("results.frame", json!({"frame": 0})).unwrap();
+        assert!(app.plot().unwrap().unavailable, "manual increment selection is equally honest");
+    }
 
     /// The clickable extreme rows keep full-sized text inside the legend, even with a stale
     /// warning and the extra over-limit swatch at the native minimum window size (#610).

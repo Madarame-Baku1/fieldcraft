@@ -550,6 +550,24 @@ pub fn displacements(r: &StepResult, pick: Pick) -> Result<&[[f64; 3]]> {
 /// the element connectivity an explicit frame's element stresses are averaged over.
 pub fn field_values(model: &Model, r: &StepResult, field: Field, pick: Pick) -> Result<Vec<f64>> {
     let unavailable = || EngineError::Params(format!("{} is not available for step `{}`", field.label(), r.step()));
+    if (field.is_stress() || field.is_contact())
+        && let Kind::Static(s) = r.kind()
+        && let (Some(k), Some(h)) = (pick.frame, &s.nonlinear)
+    {
+        // Nonlinear frames hold displacements/reactions, not the path-dependent material
+        // and contact state. Only the complete final frame can use the final solved fields.
+        // A frame cap may truncate the history, so its last saved frame alone is not proof.
+        let final_frame = k.checked_add(1) == Some(h.frames.len())
+            && h.increments.iter().filter(|i| i.converged).count().checked_add(1) == Some(h.frames.len())
+            && h.frames.get(k).is_some_and(|f| f.displacement == s.displacement);
+        if !final_frame {
+            return Err(EngineError::Params(format!(
+                "{} was not saved at nonlinear increment {k} of step `{}`; only final-state stress/contact fields are available",
+                field.label(),
+                s.step
+            )));
+        }
+    }
     let component = |f: fn(&[f64; 3]) -> f64| -> Result<Vec<f64>> { Ok(displacements(r, pick)?.iter().map(f).collect()) };
     let stresses = || -> Result<std::borrow::Cow<'_, [[f64; 6]]>> {
         match r.kind() {
@@ -705,14 +723,19 @@ impl Session {
         let legend =
             |field: Field| json!({"min": v.range_min.map(|x| field.shown(r, x, display)), "max": v.range_max.map(|x| field.shown(r, x, display))});
         if let Some(f) = v.contour
-            && let Ok(values) = field_values(&self.model, r, f, v.pick())
+            && !matches!(r.kind(), Kind::Fluid(_))
         {
-            let ends = range(r.nodes(), &values).map(|((ln, lv), (hn, hv))| {
-                json!({"min": {"node": ln, "value": f.shown(r, lv, display)}, "max": {"node": hn, "value": f.shown(r, hv, display)}})
-            });
-            out["contour"] = json!({"field": f, "label": f.label(), "unit": f.unit(r, display), "range": ends});
-            if v.range_min.is_some() || v.range_max.is_some() {
-                out["contour"]["legend"] = legend(f);
+            match field_values(&self.model, r, f, v.pick()) {
+                Ok(values) => {
+                    let ends = range(r.nodes(), &values).map(|((ln, lv), (hn, hv))| {
+                        json!({"min": {"node": ln, "value": f.shown(r, lv, display)}, "max": {"node": hn, "value": f.shown(r, hv, display)}})
+                    });
+                    out["contour"] = json!({"field": f, "label": f.label(), "unit": f.unit(r, display), "range": ends});
+                    if v.range_min.is_some() || v.range_max.is_some() {
+                        out["contour"]["legend"] = legend(f);
+                    }
+                }
+                Err(error) => out["contour_unavailable"] = json!(error.to_string()),
             }
         }
         let time = |t: f64| shown(Quantity::Time, t, display);
@@ -827,6 +850,38 @@ mod tests {
     use super::*;
     use crate::cmd::solve::tests::cantilever;
     use serde_json::json;
+
+    #[test]
+    fn nonlinear_increment_fields_do_not_borrow_final_stress() {
+        let mut s = Session::default();
+        cantilever(&mut s);
+        s.run_script(&json!([
+            {"command": "model.section.edit", "params": {"name": "bar", "set": "all", "material": "Mat", "kind": {"type": "solid"}, "formulation": {}}},
+            {"command": "model.step.create", "params": {"name": "Large", "procedure": {"type": "nonlinear_static", "initial_increment": 0.25}, "boundary_conditions": ["clamp"], "loads": ["push"]}},
+            {"command": "solve.nonlinear", "params": {"step": "Large"}}
+        ])).unwrap();
+        let r = s.result("Large").unwrap();
+        let Kind::Static(st) = r.kind() else { panic!() };
+        let last = st.nonlinear.as_ref().unwrap().frames.len() - 1;
+        for field in Field::ALL.into_iter().filter(|f| f.is_stress() || f.is_contact()) {
+            let e = field_values(&s.model, r, field, Pick { mode: 1, frame: Some(0) }).unwrap_err().to_string();
+            assert!(e.contains("not saved at nonlinear increment 0"), "{e}");
+        }
+        assert!(field_values(&s.model, r, Field::Displacement, Pick { mode: 1, frame: Some(0) }).unwrap().iter().all(|v| *v == 0.0));
+        let final_values = field_values(&s.model, r, Field::VonMises, Pick { mode: 1, frame: None }).unwrap();
+        assert_eq!(field_values(&s.model, r, Field::VonMises, Pick { mode: 1, frame: Some(last) }).unwrap(), final_values);
+        let mut capped = st.clone();
+        capped.nonlinear.as_mut().unwrap().frames.pop();
+        let capped = StepResult::Implicit(fieldcraft_solver::StepResult::Static(capped));
+        assert!(
+            field_values(&s.model, &capped, Field::VonMises, Pick { mode: 1, frame: Some(last - 1) }).is_err(),
+            "a truncated history's last frame is not the final state"
+        );
+        s.execute("results.contour", &json!({"step": "Large", "field": "von_mises"})).unwrap();
+        let reply = s.execute("results.frame", &json!({"frame": 0})).unwrap();
+        assert!(reply["contour"].is_null());
+        assert!(reply["contour_unavailable"].as_str().unwrap().contains("not saved at nonlinear increment 0"));
+    }
 
     #[test]
     fn fields_follow_the_result() {

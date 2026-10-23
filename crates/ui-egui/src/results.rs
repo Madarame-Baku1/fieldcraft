@@ -2,8 +2,9 @@
 //! model's display data. The deformed shape moves every element by its nodes' displacements
 //! (or a mode shape) times the scale; contours split the faces into flat-coloured bands
 //! ([`fieldcraft_render::contour`]); animation steps the deformation through a fixed number of
-//! frames per cycle (an explicit step's animation runs through its field frames, contours
-//! following). A plot of a stale result (the model changed since the solve) is drawn the
+//! frames per cycle: linear static/modal contours follow their interpolated load/amplitude,
+//! while explicit/fluid frames retain their recorded fields. Nonlinear increments retain
+//! displacement, with an explanation when intermediate stresses were not saved. A plot of a stale result (the model changed since the solve) is drawn the
 //! same way and marked. A fluid step draws the part as it is, with the engine's flow display
 //! ([`fieldcraft_engine::flow`]: a slice, the obstacles coloured and streamlines) through it.
 
@@ -64,6 +65,11 @@ pub struct Plot {
     pub flow: Option<Arc<FlowPlot>>,
     /// The mode and field frame drawn.
     pub pick: Pick,
+    /// A proportional static load or normalised mode amplitude, interpolated for display;
+    /// saved nonlinear/explicit/fluid frames have no multiplier.
+    pub amplitude: Option<f64>,
+    /// The selected nodal field was not recorded for this frame.
+    pub unavailable: bool,
     /// The display units, which the numbers shown with the plot (the contour's too) are in.
     pub units: fieldcraft_model::DisplaySystem,
 }
@@ -74,6 +80,7 @@ pub struct Prepared {
     pub scale: f64,
     pub contour: Option<Arc<Contour>>,
     pub flow: Option<Arc<FlowPlot>>,
+    pub unavailable: bool,
 }
 
 /// A mode's value as the results show it: its frequency, or a buckling mode's load factor.
@@ -157,11 +164,17 @@ pub fn shown(session: &Session) -> Option<(&ResultsView, &Arc<StepResult>, bool)
     Some((view, result, current))
 }
 
-/// The animation frame shown at time `now` (seconds), when animating. A deformed step swings its
-/// shape; a fluid step plays its frames though it does not deform; a step with nothing to animate
-/// (Animate on but Deformed off, and not fluid) stays still.
+/// The animation frame shown at time `now` (seconds), when something in the plot animates.
+/// Mechanical deformation and proportional contours animate independently; recorded fluid,
+/// explicit and nonlinear frames keep playing. Heat-only plots do not advance frames.
 pub fn frame(view: &ResultsView, result: &StepResult, now: f64) -> Option<u64> {
-    let plays = view.deformed || matches!(result.kind(), Kind::Fluid(_));
+    let plays = match result.kind() {
+        Kind::Heat(_) => false,
+        Kind::Fluid(_) => true,
+        Kind::Explicit(_) => view.deformed || view.contour.is_some(),
+        Kind::Static(r) if r.nonlinear.is_some() => view.deformed || view.contour.is_some(),
+        Kind::Static(_) | Kind::Frequency(_) => view.deformed || view.contour.is_some_and(|f| !f.is_thermal()),
+    };
     (view.animate && plays && now.is_finite()).then(|| ((now.max(0.0) / PERIOD * FRAMES as f64).floor() as u64) % FRAMES)
 }
 
@@ -176,6 +189,17 @@ pub fn swing(result: &StepResult, frame: Option<u64>) -> f64 {
         Kind::Static(r) if r.nonlinear.is_some() => 1.0,
         Kind::Static(_) => 0.5 * (1.0 - a.cos()),
         Kind::Explicit(_) | Kind::Fluid(_) | Kind::Heat(_) => 1.0,
+    }
+}
+
+/// Only linear static and modal plots interpolate a solved field. Other procedures draw
+/// their recorded frames, without an extra load multiplier.
+fn amplitude(result: &StepResult, frame: Option<u64>) -> Option<f64> {
+    frame?;
+    match result.kind() {
+        Kind::Static(r) if r.nonlinear.is_none() => Some(swing(result, frame)),
+        Kind::Frequency(_) => Some(swing(result, frame)),
+        _ => None,
     }
 }
 
@@ -217,11 +241,18 @@ pub fn prepare(session: &Session, base: &DisplayMesh, pick: Pick, bodies: &[&str
             let bands = Bands { min: c.field.shown(result, c.bands.min, units), max: c.field.shown(result, c.bands.max, units), ..c.bands };
             Arc::new(Contour { field: c.field, bands, min: cell(c.field, c.min), max: cell(c.field, c.max), values: Vec::new() })
         });
-        return Some(Prepared { scale: 0.0, contour, flow: flow.map(Arc::new) });
+        return Some(Prepared { scale: 0.0, contour, flow: flow.map(Arc::new), unavailable: false });
     }
     let units = session.units();
+    let mut unavailable = false;
     let contour = view.contour.and_then(|field| {
-        let mut values = field_values(&session.model, result, field, pick).ok()?;
+        let mut values = match field_values(&session.model, result, field, pick) {
+            Ok(values) => values,
+            Err(_) => {
+                unavailable = true;
+                return None;
+            }
+        };
         // In the display units, the legend's range too (stored in SI).
         for v in &mut values {
             *v = field.shown(result, *v, units);
@@ -234,10 +265,22 @@ pub fn prepare(session: &Session, base: &DisplayMesh, pick: Pick, bodies: &[&str
         }
         let (min, max) = range(result.nodes(), &values)?;
         let shown = |v: Option<f64>| v.map(|v| field.shown(result, v, units));
-        let bands = Bands::clamped(min.1, max.1, shown(view.range_min), shown(view.range_max), view.bands);
+        // Keep one colour scale throughout a proportional animation. Rescaling each frame
+        // to its current extremes would make a growing stress field look constant again.
+        let (lo, hi) = if view.animate && !field.is_thermal() && amplitude(result, Some(0)).is_some() {
+            if matches!(result.kind(), Kind::Frequency(_)) && !matches!(field, Field::Displacement | Field::VonMises) {
+                let peak = min.1.abs().max(max.1.abs());
+                (-peak, peak)
+            } else {
+                (min.1.min(0.0), max.1.max(0.0))
+            }
+        } else {
+            (min.1, max.1)
+        };
+        let bands = Bands::clamped(lo, hi, shown(view.range_min), shown(view.range_max), view.bands);
         Some(Arc::new(Contour { field, bands, min, max, values }))
     });
-    Some(Prepared { scale: scale(view, result, pick, base, units), contour, flow: None })
+    Some(Prepared { scale: scale(view, result, pick, base, units), contour, flow: None, unavailable })
 }
 
 /// The plot of the session's results view on the model's display data at animation `frame`,
@@ -246,6 +289,23 @@ pub fn plot(session: &Session, base: &DisplayMesh, frame: Option<u64>, prepared:
     let (view, result, current) = shown(session)?;
     let nodes = result.nodes();
     let pick = pick(view, result, frame);
+    let amplitude = amplitude(result, frame);
+    let contour = prepared.contour.as_ref().map(|c| {
+        let Some(factor) = amplitude.filter(|_| !c.field.is_thermal()) else { return c.clone() };
+        // A magnitude remains nonnegative when a mode swings through its negative shape.
+        let factor = if matches!(c.field, Field::Displacement | Field::VonMises) { factor.abs() } else { factor };
+        if factor == 1.0 {
+            return c.clone();
+        }
+        let mut c = c.as_ref().clone();
+        for v in &mut c.values {
+            *v *= factor;
+        }
+        if let Some((min, max)) = range(nodes, &c.values) {
+            (c.min, c.max) = (min, max);
+        }
+        Arc::new(c)
+    });
     // The shown scale multiplies the shape as the display units show it.
     let unit = fieldcraft_engine::results::deformation_unit(result, session.units());
     let factor = if view.deformed { prepared.scale * unit * swing(result, frame) } else { 0.0 };
@@ -265,9 +325,11 @@ pub fn plot(session: &Session, base: &DisplayMesh, frame: Option<u64>, prepared:
         stale: !current,
         scale: prepared.scale,
         display,
-        contour: prepared.contour.clone(),
+        contour,
         flow: prepared.flow.clone(),
         pick,
+        amplitude,
+        unavailable: prepared.unavailable,
         units: session.units().clone(),
     })
 }
@@ -602,6 +664,7 @@ pub(crate) mod tests {
         // Animate on but Deformed off, and not a fluid step: nothing to animate, so it stays still.
         let mut still = view.clone();
         still.deformed = false;
+        still.contour = None;
         assert_eq!(frame(&still, result, PERIOD * 0.25), None);
         assert!((swing(result, Some(FRAMES / 4)) - 1.0).abs() < 1e-12);
         assert!((swing(result, Some(3 * FRAMES / 4)) + 1.0).abs() < 1e-12);
@@ -616,6 +679,44 @@ pub(crate) mod tests {
         assert_eq!(swing(bend, Some(0)), 0.0);
         assert!((swing(bend, Some(FRAMES / 2)) - 1.0).abs() < 1e-12);
         assert_eq!(swing(bend, None), 1.0);
+    }
+
+    #[test]
+    fn animated_mode_components_reverse_but_magnitudes_and_temperatures_do_not() {
+        let mut s = solved_cantilever();
+        s.execute("results.modes", &json!({"mode": 1})).unwrap();
+        s.execute("results.animate", &json!({})).unwrap();
+        let base = DisplayMesh::from_model(&s.model);
+        for field in ["displacement", "displacement_z"] {
+            s.execute("results.contour", &json!({"field": field})).unwrap();
+            let positive = plot_at(&s, &base, Some(FRAMES / 4)).unwrap();
+            let negative = plot_at(&s, &base, Some(3 * FRAMES / 4)).unwrap();
+            let (a, b) = (positive.contour.unwrap(), negative.contour.unwrap());
+            assert_eq!(a.bands, b.bands, "fixed scale through both halves of a mode");
+            for (a, b) in a.values.iter().zip(&b.values) {
+                assert_eq!(*a, if field == "displacement" { *b } else { -*b });
+            }
+            assert_eq!((a.min, a.max), if field == "displacement" { (b.min, b.max) } else { ((b.max.0, -b.max.1), (b.min.0, -b.min.1)) });
+        }
+        // Absolute temperatures are not a proportional displacement/stress field. Even in
+        // a coupled linear step, animating the mechanical display must not cool 35 °C to 0 °C.
+        s.execute("results.contour", &json!({"step": "Load", "field": "von_mises"})).unwrap();
+        s.execute("results.animate", &json!({})).unwrap();
+        let mut prepared = prepare(&s, &base, Pick::default(), &[]).unwrap();
+        let values = vec![35.0; shown(&s).unwrap().1.nodes().len()];
+        prepared.contour =
+            Some(Arc::new(Contour { field: Field::Temperature, bands: Bands::new(20.0, 50.0, 6), min: (1, 35.0), max: (1, 35.0), values }));
+        let p = plot(&s, &base, Some(0), &prepared).unwrap();
+        assert!(Arc::ptr_eq(p.contour.as_ref().unwrap(), prepared.contour.as_ref().unwrap()));
+        let mut view = shown(&s).unwrap().0.clone();
+        for step in ["Load", "Modes"] {
+            let result = s.latest_result(step).unwrap().0;
+            view.contour = Some(Field::Temperature);
+            view.deformed = true;
+            assert_eq!(frame(&view, result, PERIOD * 0.25), Some(FRAMES / 4), "geometry still moves under an invariant contour");
+            view.deformed = false;
+            assert_eq!(frame(&view, result, PERIOD * 0.25), None, "an invariant contour alone does not animate");
+        }
     }
 
     #[test]

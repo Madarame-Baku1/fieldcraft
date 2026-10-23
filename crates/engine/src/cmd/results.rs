@@ -44,7 +44,7 @@ pub const MODES: CommandSpec = CommandSpec {
 pub const ANIMATE: CommandSpec = CommandSpec {
     id: "results.animate",
     label: "Animate",
-    params: r#"{"on": true} — animates the result over time: a mode swings through its positive and negative shape, a static step grows from undeformed to deformed, an explicit or fluid step plays its frames in order"#,
+    params: r#"{"on": true} — animates shape and contours: a mode swings through positive and negative amplitudes, a linear static result interpolates a proportional load from zero to full and back with a fixed legend; absolute temperatures are unchanged. Nonlinear steps play saved displacements (intermediate stress/contact fields were not saved); explicit or fluid steps play their recorded fields in order"#,
     form: Some(super::forms::ANIMATE),
     kind: CommandKind::Session,
     requires: &[Requirement::Result],
@@ -54,7 +54,7 @@ pub const ANIMATE: CommandSpec = CommandSpec {
 pub const FRAME: CommandSpec = CommandSpec {
     id: "results.frame",
     label: "Field Frame",
-    params: r#"{"step": "Impact", "frame": 3, "time": 0.002} — shows a field frame of a solved explicit or fluid step, by index from 0 or the frame nearest a time (neither: the last), or of a nonlinear static step (one per converged increment, `time` its load factor; the deformed shape follows it, its contours show the final state); the deformed shape and contours follow it"#,
+    params: r#"{"step": "Impact", "frame": 3, "time": 0.002} — shows a field frame of a solved explicit or fluid step, by index from 0 or the frame nearest a time (neither: the last), or of a nonlinear static step (one per converged increment, `time` its load factor). The shape and recorded contours follow the frame; nonlinear intermediate stress/contact fields were not saved and are unavailable (final-state fields remain available at the complete final frame)"#,
     form: Some(super::forms::FRAME),
     kind: CommandKind::Session,
     requires: &[Requirement::Result],
