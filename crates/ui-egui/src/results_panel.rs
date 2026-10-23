@@ -78,6 +78,7 @@ struct Legend {
     frame: Rect,
     title: String,
     lines: Vec<(String, Color32)>,
+    band_height: f32,
 }
 
 const LEGEND_LINE: f32 = 16.0;
@@ -141,7 +142,7 @@ fn frame_text(increments: bool, k: usize, n: usize, at: f64, time_unit: Option<&
 }
 
 /// The legend's text and frame: top left (below the selection bar when they would meet), as wide
-/// as its longest line and as tall as its lines and bands.
+/// as its longest line. All bands fit above navigation; short plots thin their tick labels.
 fn legend_layout(plot: &Plot, painter: &egui::Painter, rect: Rect, bar: Option<Rect>, t: &Tokens) -> Legend {
     let mut lines: Vec<(String, Color32)> = Vec::new();
     let title = title(plot);
@@ -167,7 +168,7 @@ fn legend_layout(plot: &Plot, painter: &egui::Painter, rect: Rect, bar: Option<R
     let origin = rect.left_top() + vec2(12.0, 12.0);
     let font = FontId::proportional(12.0);
     let line_h = LEGEND_LINE;
-    let bands = plot.contour.as_ref().map_or(0, |l| swatches(&l.bands)) as f32;
+    let bands = plot.contour.as_ref().map(|l| &l.bands);
     // As wide as its longest line (and the extremes' lines under the swatches).
     let extremes = extreme_lines(plot).into_iter().flatten().map(|(text, _)| text);
     let widest = lines
@@ -179,13 +180,21 @@ fn legend_layout(plot: &Plot, painter: &egui::Painter, rect: Rect, bar: Option<R
     let title_w = painter.layout_no_wrap(title.clone(), FontId::proportional(14.0), t.overlay_text).size().x;
     let width = (widest.max(title_w) + 20.0).max(170.0);
     // Padding and title, the lines, then the swatches with the range lines under them.
-    let height = 36.0 + line_h * lines.len() as f32 + if bands > 0.0 { 16.0 + bands * SWATCH.y + 2.0 * line_h } else { 0.0 };
+    let fixed_height = 36.0 + line_h * lines.len() as f32 + if bands.is_some() { 16.0 + 2.0 * line_h } else { 0.0 };
+    let height = fixed_height + bands.map_or(0.0, |b| swatches(b) as f32 * SWATCH.y);
     let mut frame = Rect::from_min_size(origin, vec2(width, height));
     // A viewport too narrow for the legend beside the selection bar puts it below the bar (#559).
     if let Some(b) = bar.filter(|b| b.expand(LEGEND_GAP).intersects(frame)) {
         frame = Rect::from_min_size(pos2(origin.x, b.bottom() + LEGEND_GAP), frame.size());
     }
-    Legend { frame, title, lines }
+    // Reserve the full-size title, metadata and clickable extremes before giving the bands
+    // their room. Keep the over-limit band full height so its true/clamped maxima stay legible.
+    let nav = crate::viewport::nav_bar_rect(rect);
+    let bottom = if frame.left() < nav.right() && frame.right() > nav.left() { nav.top() - LEGEND_GAP } else { rect.bottom() - 12.0 };
+    let over_height = bands.filter(|b| b.over).map_or(0.0, |_| SWATCH.y);
+    let band_height = bands.map_or(SWATCH.y, |b| ((bottom - frame.top() - fixed_height - over_height) / b.count.max(1) as f32).clamp(1.0, SWATCH.y));
+    frame.max.y = frame.top() + fixed_height + over_height + bands.map_or(0.0, |b| b.count as f32 * band_height);
+    Legend { frame, title, lines, band_height }
 }
 
 /// The legend's swatches: the bands, and the "over" band above a clamped maximum.
@@ -196,7 +205,7 @@ fn swatches(b: &fieldcraft_render::contour::Bands) -> u32 {
 /// The legend, top left under the view buttons. Returns the Max and Min lines' rects with their
 /// nodes.
 fn legend(plot: &Plot, painter: &egui::Painter, rect: Rect, bar: Option<Rect>, t: &Tokens) -> Vec<(Rect, u32)> {
-    let Legend { frame, title, lines } = legend_layout(plot, painter, rect, bar, t);
+    let Legend { frame, title, lines, band_height } = legend_layout(plot, painter, rect, bar, t);
     let origin = frame.min;
     let (font, line_h) = (FontId::proportional(12.0), LEGEND_LINE);
     painter.rect_filled(frame, 4.0, t.overlay);
@@ -216,24 +225,33 @@ fn legend(plot: &Plot, painter: &egui::Painter, rect: Rect, bar: Option<Rect>, t
     // over a clamped maximum, the "over" band runs up to the field's true maximum.
     let rows = swatches(&l.bands);
     let over = crate::theme::rgb(t.contour_over);
+    let swatch_top = y;
+    let swatch_bottom = y + l.bands.count as f32 * band_height + if l.bands.over { SWATCH.y } else { 0.0 };
+    let mut last_label = y;
     for k in (0..rows).rev() {
-        let row = (rows - 1 - k) as f32;
-        let r = Rect::from_min_size(pos2(origin.x + 10.0, y + row * SWATCH.y), SWATCH);
+        let h = if l.bands.is_over(k) { SWATCH.y } else { band_height };
+        let r = Rect::from_min_size(pos2(origin.x + 10.0, y), vec2(SWATCH.x, h));
         let c = fieldcraft_render::contour::bands_color(&stops, over, &l.bands, k);
         painter.rect_filled(r, 0.0, Color32::from_rgb(c.0, c.1, c.2));
         if k + 1 == rows {
             let top = if l.bands.is_over(k) { l.max.1 } else { l.bands.level(k + 1) };
             painter.text(pos2(r.right() + 6.0, r.top()), Align2::LEFT_CENTER, number_in(top, scale), font.clone(), t.overlay_text);
         }
-        painter.text(pos2(r.right() + 6.0, r.bottom()), Align2::LEFT_CENTER, number_in(l.bands.level(k), scale), font.clone(), t.overlay_text);
+        // Keep both end values and leave a readable gap between the remaining tick labels.
+        // The selected contour bands and their colours never change when the window shrinks.
+        if k == 0 || (r.bottom() - last_label >= SWATCH.y && swatch_bottom - r.bottom() >= SWATCH.y) {
+            painter.text(pos2(r.right() + 6.0, r.bottom()), Align2::LEFT_CENTER, number_in(l.bands.level(k), scale), font.clone(), t.overlay_text);
+            last_label = r.bottom();
+        }
+        y = r.bottom();
     }
     painter.rect_stroke(
-        Rect::from_min_size(pos2(origin.x + 10.0, y), vec2(SWATCH.x, SWATCH.y * rows as f32)),
+        Rect::from_min_max(pos2(origin.x + 10.0, swatch_top), pos2(origin.x + 10.0 + SWATCH.x, swatch_bottom)),
         0.0,
         Stroke::new(1.0, t.border),
         egui::StrokeKind::Outside,
     );
-    y += SWATCH.y * rows as f32 + 10.0;
+    y += 10.0;
     let mut out = Vec::new();
     for (i, (text, node)) in extremes.into_iter().enumerate() {
         let r = painter.text(pos2(origin.x + 10.0, y + line_h * i as f32), Align2::LEFT_TOP, text, font.clone(), t.text_dim);
@@ -1123,6 +1141,55 @@ fn reactions_table(ui: &mut egui::Ui, r: &Value, plot: &Plot, t: &Tokens) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The clickable extreme rows keep full-sized text inside the legend, even with a stale
+    /// warning and the extra over-limit swatch at the native minimum window size (#610).
+    #[test]
+    fn short_legends_keep_both_extreme_targets_readable() {
+        let mut app = ModelApp::new(fieldcraft_engine::Session::default());
+        app.run("file.sample", json!({"name": "cantilever"})).unwrap();
+        app.run("solve.run", json!({})).unwrap();
+        app.run("results.contour", json!({"field": "von_mises", "bands": 24, "range": {"min": 0, "max": 10}})).unwrap();
+        let mut plot = app.plot().unwrap().as_ref().clone();
+        let ctx = egui::Context::default();
+        let t = Tokens::get(true);
+        let view = Rect::from_min_size(pos2(250.0, 126.0), vec2(401.0, 406.0));
+        let bar = Some(Rect::from_min_size(pos2(347.0, 136.0), vec2(207.0, 31.0)));
+        for stale in [false, true] {
+            plot.stale = stale;
+            let mut output = ctx.run_ui(Default::default(), |ui| {
+                let painter = ui.painter_at(view);
+                let layout = legend_layout(&plot, &painter, view, bar, &t);
+                let targets = legend(&plot, &painter, view, bar, &t);
+                assert_eq!(targets.len(), 2);
+                assert!(layout.band_height < SWATCH.y);
+                for (target, node) in targets {
+                    assert!(layout.frame.contains_rect(target), "{target:?} outside {:?}", layout.frame);
+                    assert!(target.height() >= 12.0, "extremes retain their readable font");
+                    assert!(!target.intersects(crate::viewport::nav_bar_rect(view)));
+                    focus_node(&mut app, &plot, node);
+                    assert_eq!(app.cam.target, plot.extreme_position(node).unwrap());
+                    assert!(app.probe.is_some());
+                }
+            });
+            output.textures_delta.clear();
+            let mut ticks: Vec<_> = output
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(text) => text.galley.text().parse::<f64>().ok().map(|value| (text.pos.y, text.galley.size().y, value)),
+                    _ => None,
+                })
+                .collect();
+            ticks.sort_by(|a, b| a.0.total_cmp(&b.0));
+            assert!(ticks.iter().any(|t| t.2 == 10.0), "the clamped maximum stays labelled");
+            assert!(ticks.first().is_some_and(|t| t.2 > 150.0), "the true maximum stays labelled");
+            assert!(ticks.last().is_some_and(|t| t.2 == 0.0), "the lower end stays labelled");
+            for pair in ticks.windows(2) {
+                assert!(pair[0].0 + pair[0].1 <= pair[1].0, "numeric ticks overlap: {pair:?}");
+            }
+        }
+    }
 
     /// A label goes right of its point, left when right runs off, inside the top and bottom;
     /// one that would cover a placed label goes under it, or over it at the bottom edge.

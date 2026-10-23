@@ -715,7 +715,7 @@ const NAV: [(&str, &str, &str); 7] = [
     ("style", "ui.style", "Visual style and what is shown"),
 ];
 
-fn nav_bar_rect(rect: Rect) -> Rect {
+pub(crate) fn nav_bar_rect(rect: Rect) -> Rect {
     Rect::from_center_size(pos2(rect.center().x, rect.bottom() - 22.0), vec2(NAV.len() as f32 * 30.0 + 10.0, 30.0))
 }
 

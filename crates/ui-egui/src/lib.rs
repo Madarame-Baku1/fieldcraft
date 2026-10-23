@@ -3609,6 +3609,31 @@ mod tests {
         }
     }
 
+    /// #610: resizing a clamped 24-band plot keeps the complete legend clear of navigation.
+    #[test]
+    fn the_full_legend_fits_when_the_window_shrinks() {
+        let mut app = ModelApp::new(Session::default());
+        let ctx = egui::Context::default();
+        app.run("file.sample", json!({"name": "cantilever"})).unwrap();
+        app.run("solve.run", json!({})).unwrap();
+        app.run("results.contour", json!({"field": "von_mises", "bands": 24, "range": {"min": 0, "max": 10}})).unwrap();
+        for (w, h) in [(960.0, 600.0), (1400.0, 900.0), (960.0, 600.0)] {
+            for _ in 0..3 {
+                draw(&mut app, &ctx, w, h);
+            }
+            let legend = region(&app, "legend");
+            let view = region(&app, "viewport");
+            assert!(view.contains_rect(legend), "{w}×{h}: {legend:?} outside {view:?}");
+            for overlay in ["selection_bar", "nav_bar"] {
+                assert!(!legend.intersects(region(&app, overlay)), "{w}×{h}: legend covers {overlay}");
+            }
+            let plot = app.plot().unwrap();
+            let bands = plot.contour.as_ref().unwrap().bands;
+            assert_eq!(bands.count, 24);
+            assert!(bands.over, "the extra over-limit colour is retained");
+        }
+    }
+
     /// Every standard view frames the whole model: the cantilever's front view keeps both ends
     /// (#147), in orthographic and perspective.
     #[test]
