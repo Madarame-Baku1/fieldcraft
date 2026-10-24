@@ -51,7 +51,6 @@ use std::collections::BTreeMap;
 use fieldcraft_model::ElementKind;
 
 use crate::cdt::TetMesh;
-use crate::predicates::Point3;
 use crate::quality::{GateOptions, GateReport, Metric, Validity, element_quality, enclosed_volume, validity_gate_elements};
 use crate::surface::BoundarySurface;
 use crate::{Error, Result};
@@ -449,18 +448,8 @@ fn snap_to_geometry(cx: &mut TetComplex, ctx: &Context, guarded: bool) -> Result
             continue;
         }
         let star = cx.star(v)?;
-        let mut ok = cx.move_is_valid(v, &p, &star)?;
-        if ok && guarded {
-            let before = ops::worst(cx, &star)?;
-            cx.move_point(v, p)?;
-            let after = ops::worst(cx, &star)?;
-            if after < before.min(0.3) {
-                cx.move_point(v, Point3::try_from(x)?)?;
-                ok = false;
-            }
-        } else if ok {
-            cx.move_point(v, p)?;
-        }
+        let below_floor = guarded && smooth::star_quality(cx, v, p.coords(), &star)? < ops::worst(cx, &star)?.min(0.3);
+        let ok = !below_floor && cx.try_move(v, p)?;
         stuck += usize::from(!ok);
     }
     Ok(stuck)

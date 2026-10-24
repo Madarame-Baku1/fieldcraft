@@ -592,10 +592,102 @@ fn a_boundary_insertion_never_rings_a_kept_face() {
 #[test]
 fn a_move_never_turns_a_boundary_face_over() {
     let mut cx = cube();
-    let star = cx.star(1).unwrap();
     let to = |p: [f64; 3]| Point3::try_from(p).unwrap();
-    assert!(cx.move_is_valid(1, &to([1.1, 0.0, 0.0]), &star).unwrap());
-    assert!(!cx.move_is_valid(1, &to([3.0, 0.0, 0.0]), &star).unwrap());
+    let before = format!("{cx:?}");
+    assert!(!cx.try_move(1, to([3.0, 0.0, 0.0])).unwrap());
+    assert_eq!(format!("{cx:?}"), before);
+    assert!(cx.try_move(1, to([1.1, 0.0, 0.0])).unwrap());
+}
+
+#[test]
+fn checked_moves_record_only_commits_and_can_be_rolled_back() {
+    let mut cx = cube();
+    cx.index_skin(1.0).unwrap();
+    cx.journal.recording = true;
+    let before = format!("{cx:?}");
+    let mesh = format!("{:?}", cx.compact().unwrap());
+    let from = cx.point(1).unwrap();
+    assert!(!cx.try_move(1, from).unwrap());
+    assert!(cx.try_move(NONE, from).is_err());
+    assert_eq!(format!("{cx:?}"), before);
+
+    let mut unused = cx.clone();
+    let v = unused.add_point(Point3::try_from([2.0; 3]).unwrap(), VertexKind::Interior).unwrap();
+    let unchanged = format!("{unused:?}");
+    assert!(unused.try_move(v, Point3::try_from([2.1; 3]).unwrap()).is_err());
+    assert!(unused.try_move(v, unused.point(v).unwrap()).is_err());
+    assert_eq!(format!("{unused:?}"), unchanged);
+
+    let to = Point3::try_from([1.1, 0.0, 0.0]).unwrap();
+    assert!(cx.try_move(1, to).unwrap());
+    assert_eq!(cx.xyz(1).unwrap(), to.coords());
+    assert!(matches!(cx.journal.steps.as_slice(), [Step::Moved { v: 1, from: p }] if p.coords() == from.coords()));
+    cx.validate().unwrap();
+    cx.rollback(0).unwrap();
+    cx.validate().unwrap();
+    assert!(cx.journal.steps.is_empty() && cx.journal.recording);
+    assert_eq!(format!("{:?}", cx.compact().unwrap()), mesh);
+    let restored = format!("{cx:?}");
+    assert!(!cx.try_move(1, Point3::try_from([3.0, 0.0, 0.0]).unwrap()).unwrap());
+    assert_eq!(format!("{cx:?}"), restored);
+}
+
+/// A supplied partial star could miss the small tetrahedron on the other side of vertex 0.
+/// The committing API derives its own full star, even when the pieces meet only at the vertex.
+#[test]
+fn a_checked_move_cannot_omit_a_piece_of_the_star() {
+    let mut cx = complex_of(
+        &[[0.0; 3], [0.125, 0.0, 0.0], [0.0, 0.125, 0.0], [0.0, 0.0, 0.125], [-10.0, 0.0, 0.0], [0.0, -10.0, 0.0], [0.0, 0.0, -10.0]],
+        &[[0, 1, 2, 3], [0, 4, 5, 6]],
+        vec![VertexKind::Corner; 7],
+        |_| 0,
+    );
+    cx.journal.recording = true;
+    let p = Point3::try_from([0.0625; 3]).unwrap();
+    assert!(cx.move_keeps_star(0, &p, &[1]).unwrap());
+    let star = cx.star(0).unwrap();
+    assert!(!cx.move_keeps_star(0, &p, &star).unwrap());
+    let before = format!("{cx:?}");
+    assert!(!cx.try_move(0, p).unwrap());
+    assert_eq!(format!("{cx:?}"), before);
+}
+
+/// A snap may satisfy every geometric guard while reducing an already poor star's quality.
+/// Reject it before committing: moving back leaves spurious journal/index entries behind.
+#[test]
+fn a_rejected_snap_never_commits_or_journals() {
+    use super::geometry::BoundaryGeometry;
+    use super::refine::Context;
+    use crate::size::UniformSize;
+
+    struct Plane;
+    impl BoundaryGeometry for Plane {
+        fn project_face(&self, _: u32, p: [f64; 3]) -> Option<[f64; 3]> {
+            Some([p[0], p[1], 0.005])
+        }
+        fn project_curve(&self, _: [u32; 2], _: [f64; 3]) -> Option<[f64; 3]> {
+            None
+        }
+    }
+    let mut cx = complex_of(
+        &[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.25, 0.25, 0.01]],
+        &[[0, 1, 2, 3]],
+        vec![VertexKind::Corner, VertexKind::Corner, VertexKind::Corner, VertexKind::Face(0)],
+        |_| 0,
+    );
+    cx.index_skin(1.0).unwrap();
+    cx.journal.recording = true;
+    let star = cx.star(3).unwrap();
+    let p = Point3::try_from([0.25, 0.25, 0.005]).unwrap();
+    assert!(cx.move_keeps_star(3, &p, &star).unwrap());
+    assert!(cx.skin_allows(3, &p, &star).unwrap());
+    let vs = cx.tet(0).unwrap();
+    let trial = vs.map(|v| if v == 3 { p.coords() } else { cx.xyz(v).unwrap() });
+    assert!(measure::quality(&trial) < worst(&cx, &star).unwrap().min(0.3));
+    let before = format!("{cx:?}");
+    let ctx = Context { size: &UniformSize(1.0), geometry: &Plane, curve_faces: &[] };
+    assert_eq!(super::snap_to_geometry(&mut cx, &ctx, true).unwrap(), 1);
+    assert_eq!(format!("{cx:?}"), before);
 }
 
 /// With the skin indexed, a move or a change whose boundary faces would pass through another part
@@ -625,9 +717,14 @@ fn the_skin_never_passes_through_itself() {
     indexed.index_skin(1.0).unwrap();
     let to = |z: f64| Point3::try_from([0.0, 0.0, z]).unwrap();
     for (mut cx, skin) in [(plain, false), (indexed, true)] {
-        let star = cx.star(0).unwrap();
-        assert!(cx.move_is_valid(0, &to(0.05), &star).unwrap());
-        assert_eq!(cx.move_is_valid(0, &to(0.2), &star).unwrap(), !skin);
+        assert!(cx.clone().try_move(0, to(0.05)).unwrap());
+        let mut trial = cx.clone();
+        trial.journal.recording = true;
+        let before = format!("{trial:?}");
+        assert_eq!(trial.try_move(0, to(0.2)).unwrap(), !skin);
+        if skin {
+            assert_eq!(format!("{trial:?}"), before);
+        }
         // The same lift as a change: a new apex 10, the old one gone.
         let v = cx.add_point(to(0.2), VertexKind::Face(0)).unwrap();
         let mut change = Change { old: (0..4).collect(), ..Change::default() };

@@ -2,7 +2,7 @@
 //! tet4 order with neighbours, the boundary faces with their B-rep face tags, and the feature
 //! edges (subsegments) with their curve.
 //!
-//! Every change goes through [`TetComplex::replace`]: a set of tetrahedra is replaced by another
+//! Every topological change goes through [`TetComplex::replace`]: a set of tetrahedra is replaced by another
 //! set filling the same region. The replacement is checked before anything is changed — every new
 //! tetrahedron positive by the exact `orient3d` and admissible by FieldCraft's validity criterion, every face of the region's outside matched once,
 //! every new face either shared by two new tetrahedra, matched outside, or declared a new
@@ -816,15 +816,27 @@ impl TetComplex {
         Err(corrupt("dropping a vertex in use"))
     }
 
-    /// Move a vertex. The caller has checked that every tetrahedron around it stays positive
-    /// ([`Self::move_is_valid`]).
-    pub fn move_point(&mut self, v: u32, p: Point3) -> Result<()> {
-        let slot = self.pts.get_mut(v as usize).ok_or_else(|| corrupt("vertex id"))?;
-        let from = *slot;
-        *slot = p;
+    /// Move a used vertex only when its complete star stays positive and admissible, boundary
+    /// faces keep their turn bound, and the indexed skin is not crossed. A refusal or a no-op
+    /// changes nothing, including the journal and skin index. Invalid/unused ids are errors.
+    pub fn try_move(&mut self, v: u32, p: Point3) -> Result<bool> {
+        let from = self.point(v)?;
+        let star = self.star(v)?;
+        if from.coords() == p.coords() || !self.move_keeps_star(v, &p, &star)? || !self.skin_allows(v, &p, &star)? {
+            return Ok(false);
+        }
+        *self.pts.get_mut(v as usize).ok_or_else(|| corrupt("vertex id"))? = p;
+        self.skin_add_around(v)?;
         if self.journal.recording {
             self.journal.steps.push(Step::Moved { v, from });
         }
+        Ok(true)
+    }
+
+    /// Restore a recorded coordinate without rechecking a move against its displaced star.
+    /// Only rollback may bypass `try_move`; it restores the previously accepted mesh.
+    fn move_point(&mut self, v: u32, p: Point3) -> Result<()> {
+        *self.pts.get_mut(v as usize).ok_or_else(|| corrupt("vertex id"))? = p;
         self.skin_add_around(v)
     }
 
@@ -836,15 +848,9 @@ impl TetComplex {
         }
     }
 
-    /// Whether every tetrahedron of `star` (around `v`) stays positive and admissible with `v`
-    /// at `p`, every boundary face round `v` turns by at most 30° ([`BOUNDARY_TURN_COS`]), and
-    /// none passes through the rest of the skin ([`Self::skin_allows`]).
-    pub fn move_is_valid(&self, v: u32, p: &Point3, star: &[u32]) -> Result<bool> {
-        Ok(self.move_keeps_star(v, p, star)? && self.skin_allows(v, p, star)?)
-    }
-
-    /// [`Self::move_is_valid`] without the skin check: for a vertex moved in several steps,
-    /// whose final place alone is checked against the skin ([`Self::skin_allows`]).
+    /// Cheap trial predicate: whether `star` stays positive/admissible and its boundary faces
+    /// keep their turn bound. A search may omit the skin check until its final candidate, but
+    /// must commit through [`Self::try_move`], which checks the complete current star and skin.
     pub fn move_keeps_star(&self, v: u32, p: &Point3, star: &[u32]) -> Result<bool> {
         for &t in star {
             let vs = self.tet(t)?;
@@ -1434,10 +1440,7 @@ impl TetComplex {
                     }
                 }
                 Step::Moved { v, from } => {
-                    if let Some(s) = self.pts.get_mut(v as usize) {
-                        *s = from;
-                    }
-                    self.skin_add_around(v)?;
+                    self.move_point(v, from)?;
                 }
                 Step::Added { v } => {
                     if v as usize + 1 == self.pts.len() {

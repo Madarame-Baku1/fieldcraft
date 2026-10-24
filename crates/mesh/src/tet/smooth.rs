@@ -31,7 +31,7 @@ use super::refine::Context;
 const STEP: f64 = 1e-6; // unit-factors: relative to the edge's length
 
 /// The worst quality around `v` with `v` at `p` (the tetrahedra of `star`).
-fn star_quality(cx: &TetComplex, v: u32, p: P, star: &[u32]) -> Result<f64> {
+pub(super) fn star_quality(cx: &TetComplex, v: u32, p: P, star: &[u32]) -> Result<f64> {
     let mut q = f64::INFINITY;
     for &t in star {
         let vs = cx.tet(t)?;
@@ -112,8 +112,7 @@ fn try_move(cx: &mut TetComplex, ctx: &Context, v: u32, star: &[u32], f: Freedom
         if p.coords() == x || !cx.move_keeps_star(v, &p, star)? {
             continue;
         }
-        if star_quality(cx, v, p.coords(), star)? >= floor && cx.skin_allows(v, &p, star)? {
-            cx.move_point(v, p)?;
+        if star_quality(cx, v, p.coords(), star)? >= floor && cx.try_move(v, p)? {
             return Ok(true);
         }
     }
@@ -296,10 +295,7 @@ pub fn smooth_vertex(cx: &mut TetComplex, ctx: &Context, v: u32) -> Result<bool>
         }
     }
     match to {
-        Some(p) if cx.skin_allows(v, &p, &star)? => {
-            cx.move_point(v, p)?;
-            Ok(true)
-        }
+        Some(p) => cx.try_move(v, p),
         _ => Ok(false),
     }
 }
