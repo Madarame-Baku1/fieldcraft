@@ -1542,6 +1542,7 @@ dependencies = [
  "fieldcraft-model",
  "fieldcraft-parallel",
  "serde",
+ "serde_json",
  "thiserror 2.0.21",
 ]
 
@@ -1555,6 +1556,7 @@ dependencies = [
  "fieldcraft-model",
  "log",
  "pollster 1.0.1",
+ "serde_json",
  "wgpu",
 ]
 
