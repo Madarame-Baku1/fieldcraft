@@ -3,6 +3,9 @@ crates/decks/tests/abaqus/*.inp text eol=lf
 crates/decks/tests/lsdyna/*.k text eol=lf
 crates/decks/tests/golden/nastran/*.bdf text eol=lf
 
+# Persistent geometry names are byte-exact compatibility expectations, always LF.
+crates/geometry/tests/names/*.txt text eol=lf
+
 # Preserve signed payload/signature bytes without Git text normalization.
 crates/update/tests/data/SHA256SUMS.txt -text
 crates/update/tests/data/SHA256SUMS.txt.minisig -text
