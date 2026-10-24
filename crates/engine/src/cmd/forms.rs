@@ -1243,10 +1243,10 @@ const TOLERANCE: Field = positive("tolerance", "Chordal tolerance", D::Length)
     .help("Largest distance between the tessellation and the true curved surface. Smaller follows curves closer, with more elements.")
     .hint("1e-3 of the diagonal");
 const WELD: Field = range("weld", "Weld", D::None, 0.0, fieldcraft_mesh::surface::MAX_RELATIVE_WELD)
-    .help("Points closer than this fraction of the diagonal are merged when the surface is assembled.")
+    .help("Points closer than this fraction of the diagonal are merged when the surface is assembled. For a confirmed tiny seam, choose less than features to preserve; this does not repair inconsistent face orientation.")
     .hint("1e-9 of the diagonal");
 const WELD_DISTANCE: Field = positive("weld_distance", "Weld distance", D::Length)
-    .help("Points closer than this are merged when the surface is assembled.")
+    .help("Absolute distance for merging points when the surface is assembled; the larger of this and Weld times the diagonal is used. For a confirmed tiny seam, choose less than features to preserve. The default kernel tolerance does not cover every boolean retry displacement; welding does not repair inconsistent face orientation.")
     .hint("the surface's own");
 const FEATURE_ANGLE: Field = range("feature_angle", "Feature angle", D::Degree, 0.0, 180.0)
     .help("Edges where faces meet at more than this angle are kept as sharp features.")
