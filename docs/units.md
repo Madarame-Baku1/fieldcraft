@@ -86,6 +86,21 @@ confirmation.
   meshers run in millimetres inside the geometry frame (above). 3MF files are read in their declared unit
   through the table.
 
+### Fluid solver summaries
+
+`solve.fluid.max_speed` is the maximum across stored frames; `final_max_speed` is the last
+frame's maximum. Both use the display velocity unit, for CPU and GPU solves. `max_speed_time`
+is physical time in the display time unit, including ms in the millisecond presets.
+
+To compare the final value with the viewport, open the original `flow-past` sample, run
+`solve.fluid {"step":"Flow","backend":"gpu"}`, select
+`results.frame {"step":"Flow","frame":10}`, and set
+`results.contour {"step":"Flow","field":"velocity","range":"auto"}`. Save existing work
+before opening the sample. Its 184,320-cell laminar bracket flow stores eleven physical-time
+frames over 16 seconds. In its default mm-t-s-N-MPa display, both speeds are in mm/s and the
+last-frame contour maximum matches `final_max_speed`. The all-frame peak can differ from it.
+This checks result reporting; it does not establish steady convergence or exchanger accuracy.
+
 ## Where conversion never happens
 
 The model (`fieldcraft-model`), the solvers (`fieldcraft-solver`, `-fem`, `-explicit`, `-lbm`,

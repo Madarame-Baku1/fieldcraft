@@ -511,6 +511,8 @@ pub const REPLIES: &[(&str, &[(&str, Dim)])] = &[
             ("/velocity_scale", Dim::Velocity),
             ("/frames", Dim::Time),
             ("/max_speed", Dim::Velocity),
+            ("/final_max_speed", Dim::Velocity),
+            ("/max_speed_time", Dim::Time),
             ("/forces/*/final", Dim::Force),
             ("/forces/*/mean", Dim::Force),
             ("/temperature/min", Dim::Temperature),
@@ -933,6 +935,44 @@ mod tests {
         num("t", "T", Dim::Temperature),
         num("ratio", "Ratio", Dim::None),
     ];
+
+    #[test]
+    fn fluid_peak_and_final_speeds_and_peak_time_follow_display_units() {
+        let original = json!({
+            "step": "Flow", "steps": 24, "max_speed": 0.05, "final_max_speed": 0.01,
+            "max_speed_time": 0.125, "frames": [0.0, 0.125, 0.25]
+        });
+        for preset in Preset::ALL {
+            let display = DisplaySystem::new(preset);
+            let mut reply = original.clone();
+            convert_reply("solve.fluid", &mut reply, si(), &display).unwrap();
+            for (key, quantity) in [("max_speed", Quantity::Velocity), ("final_max_speed", Quantity::Velocity), ("max_speed_time", Quantity::Time)] {
+                let expected = display.express(quantity, original[key].as_f64().unwrap()).unwrap();
+                assert_eq!(reply[key].as_f64(), Some(expected), "{preset:?}: {key}: {reply}");
+            }
+            assert_eq!(reply["units"]["velocity"], display.symbol(Quantity::Velocity));
+            assert_eq!(reply["units"]["time"], display.symbol(Quantity::Time));
+            assert_eq!(reply["step"], original["step"]);
+            assert_eq!(reply["steps"], original["steps"]);
+            for (actual, time) in reply["frames"].as_array().unwrap().iter().zip([0.0, 0.125, 0.25]) {
+                assert_eq!(actual.as_f64(), Some(display.express(Quantity::Time, time).unwrap()));
+            }
+        }
+    }
+
+    #[test]
+    fn fluid_reply_conversion_preserves_zero_and_absent_values() {
+        let display = DisplaySystem::default();
+        let mut zero = json!({"max_speed": 0.0, "final_max_speed": 0.0, "max_speed_time": 0.0});
+        convert_reply("solve.fluid", &mut zero, si(), &display).unwrap();
+        for key in ["max_speed", "final_max_speed", "max_speed_time"] {
+            assert_eq!(zero[key], 0.0);
+        }
+        let estimate = json!({"step": "Flow", "estimate": true, "cells": 8});
+        let mut reply = estimate.clone();
+        convert_reply("solve.fluid", &mut reply, si(), &display).unwrap();
+        assert_eq!(reply, estimate);
+    }
 
     #[test]
     fn bare_numbers_are_in_the_input_system_and_units_override() {

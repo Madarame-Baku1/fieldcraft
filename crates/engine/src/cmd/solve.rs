@@ -1802,6 +1802,10 @@ pub(crate) mod tests {
         let r = s.execute("solve.fluid", &json!({})).unwrap();
         assert_eq!(r["step"], "Shear");
         assert_eq!(r["frames"].as_array().unwrap().len(), 5, "{r}");
+        s.execute("results.frame", &json!({"step": "Shear", "frame": 4})).unwrap();
+        let contour = s.execute("results.contour", &json!({"step": "Shear", "field": "velocity", "range": "auto"})).unwrap();
+        assert_eq!(r["final_max_speed"], contour["contour"]["range"]["max"]["value"], "{r}: {contour}");
+        assert_eq!(r["units"]["velocity"], "mm/s");
         assert!((r["tau"].as_f64().unwrap() - 1.0).abs() < 1e-3, "the automatic time step keeps τ ≤ 1: {r}");
         assert!(r["mass"]["relative_change"].as_f64().unwrap().abs() < 1e-12, "{r}");
         assert_eq!(s.journal.len(), journal, "solving does not change the model");
