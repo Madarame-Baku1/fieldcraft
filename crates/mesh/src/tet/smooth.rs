@@ -120,7 +120,7 @@ fn try_move(cx: &mut TetComplex, ctx: &Context, v: u32, star: &[u32], f: Freedom
 }
 
 /// The quality a smoothing move may not go below (sin 17.5°) unless the star was already worse.
-const ODT_FLOOR: f64 = 0.3;
+pub(super) const ODT_FLOOR: f64 = 0.3;
 
 /// One ODT pass over the vertices (ascending ids) that may move. Returns the number moved.
 pub fn odt_pass(cx: &mut TetComplex, ctx: &Context) -> Result<usize> {

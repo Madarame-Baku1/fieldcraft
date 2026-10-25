@@ -51,6 +51,7 @@ use std::collections::BTreeMap;
 use fieldcraft_model::ElementKind;
 
 use crate::cdt::TetMesh;
+use crate::predicates::{Point3, snap_to_domain};
 use crate::quality::{GateOptions, GateReport, Metric, Validity, element_quality, enclosed_volume, validity_gate_elements};
 use crate::surface::BoundarySurface;
 use crate::{Error, Result};
@@ -212,9 +213,12 @@ pub struct QualityReport {
     pub odt_moves: usize,
     /// Edges collapsed where the input was denser than the size field.
     pub collapsed: usize,
-    /// Boundary vertices that could not be moved onto their B-rep face or curve (the move would
-    /// have inverted a tetrahedron); they stay on the tessellation.
+    /// Boundary vertices that could not be moved all the way onto their B-rep face or curve (the
+    /// move would have inverted or spoilt a tetrahedron); they stay between the tessellation and
+    /// the geometry.
     pub unsnapped: usize,
+    /// The largest distance of an unsnapped vertex from its face or curve.
+    pub snap_gap: f64,
     pub improve: ImproveStats,
     /// The global size used.
     pub size: f64,
@@ -432,27 +436,97 @@ pub fn complex_from_cdt(surface: &BoundarySurface, cdt: &TetMesh, o: &QualityOpt
     Ok((cx, table))
 }
 
+/// Most sweeps of [`snap_to_geometry`] over the boundary vertices.
+const SNAP_SWEEPS: usize = 16;
+/// The fractions of its way to the geometry a vertex tries when the whole way is refused.
+const SNAP_STEPS: [f64; 3] = [0.5, 0.25, 0.125];
+/// A vertex this close to its projection, relative to its coordinates, is on its geometry
+/// (projecting again only moves it by rounding). Scaled by `1 + |x|`, as the projections' own
+/// round-off test in `geometry.rs` is: relative away from the origin, with a floor of this much
+/// model length near it, far below any part's tolerances.
+const ON_GEOMETRY: f64 = 1e-12; // unit-factors: relative to the coordinates' size
+
+/// What [`snap_to_geometry`] left off the geometry.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Snapped {
+    /// Vertices still off their B-rep face or curve.
+    off: usize,
+    /// The largest distance of one from its face or curve.
+    gap: f64,
+    /// Why the sweeps stopped while vertices were still moving, if they did.
+    stopped: Option<String>,
+}
+
 /// Move every face and curve vertex onto its B-rep face or curve where that keeps the
 /// tetrahedra around it positive (and, when `guarded`, their worst quality at least the smaller
-/// of what it was and sin 17.5°, so a finished mesh is not spoilt). Returns the vertices that
-/// could not move.
-fn snap_to_geometry(cx: &mut TetComplex, ctx: &Context, guarded: bool) -> Result<usize> {
-    let mut stuck = 0;
-    for v in 0..cx.point_count() as u32 {
-        if !cx.is_used(v) || !matches!(cx.kind(v), VertexKind::Face(_) | VertexKind::Curve(_)) {
+/// of what it was and sin 17.5°, so a finished mesh is not spoilt).
+///
+/// A vertex whose whole move is refused goes part of the way (half, a quarter, an eighth), and
+/// the sweeps repeat while anything moves: where refinement made elements smaller than the
+/// tessellation's chordal gap, the vertices of a facet are all off the surface by about as much,
+/// and no one of them can move alone without spoiling its star, but the layer moves out
+/// together, a step at a time (#674). Returns the vertices left off their geometry, and the
+/// largest distance of one from it.
+fn snap_to_geometry(cx: &mut TetComplex, ctx: &Context, guarded: bool) -> Result<Snapped> {
+    // Only the vertices a sweep did not put on their geometry go into the next one.
+    let mut off: Vec<u32> =
+        (0..cx.point_count() as u32).filter(|&v| cx.is_used(v) && matches!(cx.kind(v), VertexKind::Face(_) | VertexKind::Curve(_))).collect();
+    let mut capped = true;
+    for sweep in 0..SNAP_SWEEPS {
+        if snap_sweep(cx, ctx, guarded, &mut off, sweep == 0)? == 0 {
+            capped = false;
+            break;
+        }
+    }
+    let mut left = Snapped::default();
+    for &v in &off {
+        if let Some((_, gap, on)) = off_by(cx, ctx, v)?
+            && gap > on
+        {
+            left.off += 1;
+            left.gap = left.gap.max(gap);
+        }
+    }
+    if capped && left.off > 0 {
+        left.stopped = Some(format!("snapping to the geometry stopped after {SNAP_SWEEPS} sweeps with {} vertices still off it", left.off));
+    }
+    Ok(left)
+}
+
+/// Vertex `v`'s point on its face or curve, its distance from it, and the distance within which
+/// it is on it ([`ON_GEOMETRY`]).
+fn off_by(cx: &TetComplex, ctx: &Context, v: u32) -> Result<Option<(Point3, f64, f64)>> {
+    let x = cx.xyz(v)?;
+    Ok(ctx.place(cx.kind(v), x).map(|p| (p, measure::dist(p.coords(), x), ON_GEOMETRY * (1.0 + measure::norm(x)))))
+}
+
+/// One sweep of [`snap_to_geometry`] over the vertices `off` its geometry: moves each that is
+/// (the `first` sweep also by rounding) all the way or part of it, and keeps in `off` those it
+/// did not put on it. Returns how many moved.
+fn snap_sweep(cx: &mut TetComplex, ctx: &Context, guarded: bool, off: &mut Vec<u32>, first: bool) -> Result<usize> {
+    let (mut moved, mut still) = (0, Vec::new());
+    for &v in off.iter() {
+        let Some((p, gap, on)) = off_by(cx, ctx, v)? else { continue };
+        if gap <= if first { 0.0 } else { on } {
             continue;
         }
         let x = cx.xyz(v)?;
-        let Some(p) = ctx.place(cx.kind(v), x) else { continue };
-        if p.coords() == x {
-            continue;
-        }
         let star = cx.star(v)?;
-        let below_floor = guarded && smooth::star_quality(cx, v, p.coords(), &star)? < ops::worst(cx, &star)?.min(0.3);
-        let ok = !below_floor && cx.try_move(v, p)?;
-        stuck += usize::from(!ok);
+        let floor = if guarded { ops::worst(cx, &star)?.min(smooth::ODT_FLOOR) } else { f64::NEG_INFINITY };
+        let partial = SNAP_STEPS.iter().filter_map(|&s| Point3::try_from(measure::lerp(x, p.coords(), s).map(snap_to_domain)).ok());
+        let mut whole = false;
+        for (i, q) in std::iter::once(p).chain(partial).enumerate() {
+            if smooth::star_quality(cx, v, q.coords(), &star)? >= floor && cx.try_move(v, q)? {
+                (moved, whole) = (moved + 1, i == 0);
+                break;
+            }
+        }
+        if !whole {
+            still.push(v);
+        }
     }
-    Ok(stuck)
+    *off = still;
+    Ok(moved)
 }
 
 /// The volume enclosed by the boundary faces of a mesh ([`enclosed_volume`]).
@@ -541,7 +615,9 @@ pub fn quality_mesh(surface: &BoundarySurface, cdt: &TetMesh, analytic: Vec<Opti
     // tolerance of them).
     progress::check()?;
     progress::stage("Snapping to the geometry", None, "");
-    report.unsnapped = snap_to_geometry(&mut cx, &exact, true)?;
+    let snapped = snap_to_geometry(&mut cx, &exact, true)?;
+    (report.unsnapped, report.snap_gap) = (snapped.off, snapped.gap);
+    report.stopped.extend(snapped.stopped);
     let c = cx.compact()?;
     let boundary: Vec<TaggedFace> = c.boundary.iter().map(|&(tet, k, face)| TaggedFace { tet, opposite: k as u8, face }).collect();
     report.output = tet_quality_stats(&c.points, &c.tets)?;

@@ -83,7 +83,7 @@ mod templates;
 mod topo;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};

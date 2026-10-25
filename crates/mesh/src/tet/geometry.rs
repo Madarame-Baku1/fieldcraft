@@ -236,6 +236,36 @@ impl AnalyticSurface {
             AnalyticSurface::Torus { minor, .. } => minor.abs(),
         }
     }
+
+    /// The point of the spine of a tube (the curve the centre of a rolling ball follows) nearest
+    /// to `p`: a cylinder's axis point level with `p`, a torus's centre circle point in `p`'s
+    /// meridian plane. `None` for the other surfaces and on the axis.
+    fn spine(&self, p: P) -> Option<P> {
+        match *self {
+            AnalyticSurface::Cylinder { origin, axis, .. } => {
+                let a = unit(axis)?;
+                Some(add(origin, scale(a, dot(sub(p, origin), a))))
+            }
+            AnalyticSurface::Torus { center, axis, major, .. } => {
+                let a = unit(axis)?;
+                let d = sub(p, center);
+                let r = unit(sub(d, scale(a, dot(d, a))))?;
+                Some(add(center, scale(r, major)))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Where the tube `blend` (a fillet's cylinder or torus) touches `other` tangentially, nearest
+/// to `p`: the ball rolling along the tube touches `other` at the foot of its centre, so the
+/// contact is `other`'s closest point to the spine point near `p`. `None` unless that point lies
+/// on the tube too (to rounding): the two do not touch there.
+fn tangent_contact(blend: &AnalyticSurface, other: &AnalyticSurface, p: P) -> Option<P> {
+    let centre = blend.spine(p)?;
+    let q = other.project(centre)?;
+    let on = blend.project(q)?;
+    (measure::dist(on, q) <= ROUND_OFF * (1.0 + norm(q))).then_some(q)
 }
 
 /// sin 10°: faces meeting at a smaller angle are treated as tangent along their curve.
@@ -685,31 +715,44 @@ impl BoundaryGeometry for Tessellation {
     fn project_curve(&self, faces: [u32; 2], p: P) -> Option<P> {
         let (near, seg_len) = self.on_polyline(faces, p)?;
         let (Some(a), Some(b)) = (self.analytic(faces[0]), self.analytic(faces[1])) else { return Some(near) };
+        let tol = (0.5 * seg_len).max(2.0 * measure::dist(p, near));
+        // The exact point is found from `p` itself, so a point already on the curve stays where
+        // it is (starting from the polyline instead slides it along the curve towards the
+        // polyline's vertices a little on every call, #674); from the polyline's point when that
+        // one strays.
+        let near_enough = |q: Option<P>| q.filter(|q| measure::dist(*q, near) <= tol);
+        let exact = |from: &dyn Fn(P) -> Option<P>| Some(near_enough(from(p)).or_else(|| near_enough(from(near))).unwrap_or(near));
+        // A crease of the tessellation inside one face whose exact surface is known (a tube
+        // tessellated with few facets round it): the point belongs on that surface.
         if faces[0] == faces[1] {
-            return Some(near);
+            return exact(&|x| a.project(x));
         }
         // Faces meeting tangentially (a blend's edge) define their curve badly: alternating
-        // projections crawl along it. There the polyline lies on both faces to the
-        // tessellation's accuracy and is kept.
+        // projections crawl along it. Where one is a fillet's tube the curve is where the
+        // rolling ball touches the other face (#674); otherwise the polyline lies on both faces
+        // to the tessellation's accuracy and is kept.
         let (Some(na), Some(nb)) = (a.normal_at(near), b.normal_at(near)) else { return Some(near) };
         if norm(cross(na, nb)) < TRANSVERSAL_SIN {
-            return Some(near);
+            return exact(&|x| tangent_contact(a, b, x).or_else(|| tangent_contact(b, a, x)));
         }
-        let mut q = near;
-        for _ in 0..40 {
-            let Some(qa) = a.project(q) else { return Some(near) };
-            let Some(qb) = b.project(qa) else { return Some(near) };
-            let step = measure::dist(qb, q);
-            q = qb;
-            if step <= 1e-13 * (1.0 + norm(q)) {
-                break;
-            }
-        }
-        // Both surfaces must agree at the result, and it must stay near the polyline.
-        let gap = a.project(q).map_or(f64::INFINITY, |qa| measure::dist(qa, q));
-        let tol = (0.5 * seg_len).max(2.0 * measure::dist(p, near));
-        if gap <= ROUND_OFF * (1.0 + norm(q)) && measure::dist(q, near) <= tol { Some(q) } else { Some(near) }
+        exact(&|x| intersection(a, b, x))
     }
+}
+
+/// The point where the transversal surfaces `a` and `b` meet near `p`, by alternating
+/// projections; `None` unless both agree there.
+fn intersection(a: &AnalyticSurface, b: &AnalyticSurface, p: P) -> Option<P> {
+    let mut q = p;
+    for _ in 0..40 {
+        let qb = b.project(a.project(q)?)?;
+        let step = measure::dist(qb, q);
+        q = qb;
+        if step <= 1e-13 * (1.0 + norm(q)) {
+            break;
+        }
+    }
+    let gap = measure::dist(a.project(q)?, q);
+    (gap <= ROUND_OFF * (1.0 + norm(q))).then_some(q)
 }
 
 impl Tessellation {

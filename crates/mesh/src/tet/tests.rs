@@ -370,6 +370,41 @@ mod pipeline {
         }
     }
 
+    /// Refined far below its tessellation's facets (8 facets round, sag 0.23, elements 0.5), a
+    /// cylinder's boundary nodes lie on the exact cylinder and caps, mid-side nodes included:
+    /// the nodes refinement adds on a facet move out together (#674).
+    #[test]
+    fn nodes_added_below_the_facet_size_lie_on_the_exact_faces() {
+        let (r, h) = (3.0, 1.5);
+        let s = crate::octree::tests::cylinder_surface(r, h, 8);
+        let cdt = tetrahedralize(&s, &CdtOptions::default()).unwrap();
+        let analytic = vec![
+            Some(AnalyticSurface::Plane { normal: [0.0, 0.0, -1.0], point: [0.0; 3] }),
+            Some(AnalyticSurface::Plane { normal: [0.0, 0.0, 1.0], point: [0.0, 0.0, h] }),
+            Some(AnalyticSurface::Cylinder { origin: [0.0; 3], axis: [0.0, 0.0, 1.0], radius: r }),
+        ];
+        let o = QualityOptions { size: Some(0.5), order: Order::Quadratic, ..QualityOptions::default() };
+        let m = quality_mesh(&s, &cdt, analytic, &o).unwrap();
+        assert_eq!((m.report.unsnapped, m.report.snap_gap), (0, 0.0), "{:?}", m.report);
+        let mut side = 0;
+        for b in &m.boundary {
+            let e = &m.elements[b.tet as usize];
+            let k = b.opposite as usize;
+            let mids = crate::quality::jacobian::TET_EDGES.iter().enumerate().filter(|(_, (i, j))| *i != k && *j != k);
+            for i in (0..4).filter(|&i| i != k).chain(mids.map(|(n, _)| 4 + n)) {
+                let q = m.points[e[i] as usize];
+                let gap = match b.face {
+                    0 => q[2].abs(),
+                    1 => (q[2] - h).abs(),
+                    _ => (q[0].hypot(q[1]) - r).abs(),
+                };
+                assert!(gap < 1e-9, "node {i} of {e:?} at {q:?} is {gap} off face {}; report {:?}", b.face, m.report);
+                side += usize::from(b.face == 2);
+            }
+        }
+        assert!(side > 500, "{side}");
+    }
+
     #[test]
     fn caps_stop_the_stage_without_panicking() {
         let s = box_surface();
@@ -704,8 +739,43 @@ fn a_rejected_snap_never_commits_or_journals() {
     assert!(measure::quality(&trial) < worst(&cx, &star).unwrap().min(0.3));
     let before = format!("{cx:?}");
     let ctx = Context { size: &UniformSize(1.0), geometry: &Plane, curve_faces: &[] };
-    assert_eq!(super::snap_to_geometry(&mut cx, &ctx, true).unwrap(), 1);
+    assert_eq!(super::snap_to_geometry(&mut cx, &ctx, true).unwrap().off, 1);
     assert_eq!(format!("{cx:?}"), before);
+}
+
+/// Sweeps that still move vertices when they run out say so in the report's reasons, as refine
+/// and improve do. Here the face is the vertex's mirror image through its tetrahedron's base, so
+/// the whole move and half of it (onto the base) are refused and every sweep moves it a quarter of
+/// the way: it halves its height each time and is still off after the last.
+#[test]
+fn snapping_reports_running_out_of_sweeps() {
+    use super::geometry::BoundaryGeometry;
+    use super::refine::Context;
+    use crate::size::UniformSize;
+
+    struct Mirror;
+    impl BoundaryGeometry for Mirror {
+        fn project_face(&self, _: u32, p: [f64; 3]) -> Option<[f64; 3]> {
+            Some([p[0], p[1], -p[2]])
+        }
+        fn project_curve(&self, _: [u32; 2], _: [f64; 3]) -> Option<[f64; 3]> {
+            None
+        }
+    }
+    let mut cx = complex_of(
+        &[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.25, 0.25, 0.5]],
+        &[[0, 1, 2, 3]],
+        vec![VertexKind::Corner, VertexKind::Corner, VertexKind::Corner, VertexKind::Face(0)],
+        |_| 0,
+    );
+    cx.index_skin(1.0).unwrap();
+    let ctx = Context { size: &UniformSize(1.0), geometry: &Mirror, curve_faces: &[] };
+    let snapped = super::snap_to_geometry(&mut cx, &ctx, false).unwrap();
+    assert_eq!(snapped.off, 1);
+    assert!(snapped.stopped.as_ref().is_some_and(|s| s.contains(&format!("after {} sweeps", super::SNAP_SWEEPS))));
+    let z = 0.5 * 0.5_f64.powi(super::SNAP_SWEEPS as i32);
+    assert!((cx.xyz(3).unwrap()[2] - z).abs() < 1e-9 * z, "{:?}", cx.xyz(3));
+    assert!((snapped.gap - 2.0 * z).abs() < 1e-9 * z, "{snapped:?}");
 }
 
 /// With the skin indexed, a move or a change whose boundary faces would pass through another part
