@@ -587,6 +587,117 @@ fn detached_tets(tets: &[[u32; 4]], count: &BTreeMap<[u32; 3], u32>) -> Vec<u32>
         .collect()
 }
 
+/// Where the mesh is joined to itself by less than a face (#671): the boundary edges that are not
+/// in exactly two boundary faces, and the vertices round which the tetrahedra fall into groups
+/// joined by no face holding the vertex, or the boundary faces into more than one fan. A group
+/// of tetrahedra that share faces with each other but meet the rest only at an edge or a vertex
+/// shows here, where [`detached_tets`] sees only a single tetrahedron. The boundary surface the
+/// mesher starts from is a manifold ([`BoundarySurface`] refuses an edge or a vertex that joins
+/// separate sheets), so a valid mesh has none.
+fn pinches(points: usize, tets: &[[u32; 4]]) -> (Vec<[u32; 2]>, Vec<u32>) {
+    // Every face with its tetrahedron, grouped by its sorted vertices.
+    let mut faces: Vec<([u32; 3], u32)> = Vec::with_capacity(tets.len() * 4);
+    for (t, vs) in tets.iter().enumerate() {
+        for k in 0..4 {
+            faces.push((sorted3(face_toward(*vs, k)), t as u32));
+        }
+    }
+    faces.sort_unstable();
+    // Union-find over (tetrahedron, corner) slots, t * 4 + j, joined through the faces that hold
+    // the corner's vertex; and over (boundary face, corner) slots, joined through boundary edges.
+    let slot = |t: u32, v: u32| tets.get(t as usize).and_then(|c| c.iter().position(|&x| x == v)).map(|j| t as usize * 4 + j);
+    let mut star = Sets::new(tets.len() * 4);
+    let mut skin: Vec<[u32; 3]> = Vec::new();
+    for run in faces.chunk_by(|a, b| a.0 == b.0) {
+        match run {
+            [(f, _)] => skin.push(*f),
+            [(f, t1), (_, t2)] => {
+                for v in *f {
+                    if let (Some(a), Some(b)) = (slot(*t1, v), slot(*t2, v)) {
+                        star.join(a, b);
+                    }
+                }
+            }
+            // A face held by more than two: the fold check reports it.
+            _ => {}
+        }
+    }
+    let mut edges: Vec<([u32; 2], usize)> = Vec::with_capacity(skin.len() * 3);
+    for (i, f) in skin.iter().enumerate() {
+        for (a, b) in [(f[0], f[1]), (f[1], f[2]), (f[0], f[2])] {
+            edges.push(([a, b], i));
+        }
+    }
+    edges.sort_unstable();
+    let mut fans = Sets::new(skin.len() * 3);
+    let corner = |i: usize, v: u32| skin.get(i).and_then(|f| f.iter().position(|&x| x == v)).map(|j| i * 3 + j);
+    let mut bad_edges = Vec::new();
+    for run in edges.chunk_by(|a, b| a.0 == b.0) {
+        match run {
+            [(e, i), (_, j)] => {
+                for v in *e {
+                    if let (Some(a), Some(b)) = (corner(*i, v), corner(*j, v)) {
+                        fans.join(a, b);
+                    }
+                }
+            }
+            [(e, _), ..] => bad_edges.push(*e),
+            _ => {}
+        }
+    }
+    // A vertex is pinched when its slots have more than one root, in either structure.
+    let mut pinched = vec![false; points];
+    let star_roots = tets.iter().enumerate().flat_map(|(t, vs)| vs.iter().enumerate().map(move |(j, &v)| (v, t * 4 + j)));
+    mark_split(&mut pinched, star_roots.map(|(v, s)| (v, star.root(s))));
+    let fan_roots = skin.iter().enumerate().flat_map(|(i, f)| f.iter().enumerate().map(move |(j, &v)| (v, i * 3 + j)));
+    mark_split(&mut pinched, fan_roots.map(|(v, s)| (v, fans.root(s))));
+    let bad_vertices = pinched.iter().enumerate().filter(|(_, x)| **x).map(|(v, _)| v as u32).collect();
+    (bad_edges, bad_vertices)
+}
+
+/// Mark the vertices whose (vertex, root) pairs name more than one root.
+fn mark_split(pinched: &mut [bool], roots: impl Iterator<Item = (u32, usize)>) {
+    let mut first = vec![usize::MAX; pinched.len()];
+    for (v, r) in roots {
+        if let (Some(f), Some(x)) = (first.get_mut(v as usize), pinched.get_mut(v as usize)) {
+            *x |= *f != usize::MAX && *f != r;
+            *f = r;
+        }
+    }
+}
+
+/// A union-find over `n` items (path halving; the smaller root wins, so roots are deterministic).
+struct Sets(Vec<usize>);
+
+impl Sets {
+    fn new(n: usize) -> Sets {
+        Sets((0..n).collect())
+    }
+
+    fn root(&mut self, mut i: usize) -> usize {
+        while let Some(&p) = self.0.get(i) {
+            if p == i {
+                break;
+            }
+            let grand = self.0.get(p).copied().unwrap_or(p);
+            if let Some(slot) = self.0.get_mut(i) {
+                *slot = grand;
+            }
+            i = grand;
+        }
+        i
+    }
+
+    fn join(&mut self, a: usize, b: usize) {
+        let (ra, rb) = (self.root(a), self.root(b));
+        if ra != rb
+            && let Some(slot) = self.0.get_mut(ra.max(rb))
+        {
+            *slot = ra.min(rb);
+        }
+    }
+}
+
 /// The constrained Delaunay tetrahedralization itself as a [`QualityMesh`] (no quality stage),
 /// through the same validity gate: every tetrahedron admissible, the volume equal to what its
 /// boundary encloses.
@@ -605,7 +716,8 @@ pub fn raw_mesh(surface: &BoundarySurface, cdt: &TetMesh) -> Result<QualityMesh>
 }
 
 /// The validity gate of a linear mesh: every tetrahedron admissible, joined to the others by a
-/// face (when there are several), no face held by more than two, the faces listed as `boundary`
+/// face (when there are several), no face held by more than two, no part of the mesh joined to
+/// the rest by an edge or a vertex alone ([`pinches`]), the faces listed as `boundary`
 /// exactly those held by one, and the volume equal to what the boundary encloses within 1e-9
 /// (no overlap, no gap).
 pub fn linear_gate(points: &[[f64; 3]], tets: &[[u32; 4]], boundary: &[TaggedFace], boundary_volume: f64) -> Result<GateReport> {
@@ -647,12 +759,29 @@ pub fn linear_gate(points: &[[f64; 3]], tets: &[[u32; 4]], boundary: &[TaggedFac
         )));
     }
     let detached = detached_tets(tets, &count);
+    drop(count);
     if !detached.is_empty() {
         let list = detached.iter().take(10).map(u32::to_string).collect::<Vec<_>>().join(", ");
         return Err(Error::Failed(format!(
             "mesh validity gate: {} tetrahedra share no face with the rest of the mesh ({list}): held by vertices alone, they would make the stiffness singular",
             detached.len()
         )));
+    }
+    let (edges, vertices) = pinches(points.len(), tets);
+    if let Some(&[a, b]) = edges.first() {
+        let (pa, pb) = (points.get(a as usize).copied().unwrap_or_default(), points.get(b as usize).copied().unwrap_or_default());
+        return Err(Error::failed(crate::message![
+            format!("mesh validity gate: {} boundary edges are not in exactly two boundary faces (the first, {a}–{b}, near ", edges.len()),
+            crate::message::point([(pa[0] + pb[0]) / 2.0, (pa[1] + pb[1]) / 2.0, (pa[2] + pb[2]) / 2.0]),
+            "): the mesh is joined to itself by an edge alone there, which would make the stiffness singular"
+        ]));
+    }
+    if let Some(&v) = vertices.first() {
+        return Err(Error::failed(crate::message![
+            format!("mesh validity gate: the mesh is pinched at {} vertices (the first, {v}, near ", vertices.len()),
+            crate::message::point(points.get(v as usize).copied().unwrap_or_default()),
+            "): tetrahedra joined to the rest by a vertex or an edge alone would make the stiffness singular"
+        ]));
     }
     let coords = |t: &[u32; 4]| -> Result<[[f64; 3]; 4]> {
         let p = |v: u32| points.get(v as usize).copied().ok_or_else(|| Error::Failed("gate: vertex id".into()));

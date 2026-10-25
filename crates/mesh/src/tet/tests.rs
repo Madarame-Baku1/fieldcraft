@@ -805,6 +805,51 @@ fn the_gate_refuses_a_detached_tetrahedron() {
     assert!(super::linear_gate(&p, &tets[..1], &faces_but(&tets[..1], &[]), v / 2.0).is_ok());
 }
 
+/// `tets` with each one turned positive (two corners swapped where its volume is negative).
+fn positive(p: &[[f64; 3]], tets: &[[u32; 4]]) -> Vec<[u32; 4]> {
+    tets.iter().map(|&t| if measure::volume6(&t.map(|v| p[v as usize])) > 0.0 { t } else { [t[1], t[0], t[2], t[3]] }).collect()
+}
+
+/// The validity gate refuses two tetrahedra that share a face with each other but meet the rest
+/// of the mesh at one edge alone (#671): neither is detached on its own, and the volume adds up,
+/// so only the pinched boundary shows it. The same pair meeting the body at one vertex is refused
+/// too.
+#[test]
+fn the_gate_refuses_tetrahedra_joined_by_an_edge_or_a_vertex() {
+    // The body: two tetrahedra on the face 0-1-2. The pair beyond the edge 1-2 (x + y > 1).
+    let p = [
+        [0.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [0.0, 0.0, -1.0],
+        [1.0, 1.0, 1.0],
+        [1.0, 1.0, -1.0],
+        [0.7, 0.7, -1.0],
+        [2.0, 0.0, 1.0],
+        [2.0, 0.0, -1.0],
+    ];
+    let body = [[0, 1, 2, 3], [0, 1, 2, 4]];
+    // The faces two tetrahedra hold.
+    let inner = [[0, 1, 2], [1, 2, 6], [1, 8, 9]];
+    let gate = |tets: &[[u32; 4]]| {
+        let boundary = faces_but(tets, &inner);
+        super::linear_gate(&p, tets, &boundary, super::boundary_volume(&p, tets, &boundary).unwrap())
+    };
+    let body = positive(&p, &body);
+    assert!(gate(&body).is_ok());
+    // Joined by the edge 1-2: the two share the face 1-2-6.
+    let edge = positive(&p, &[body[0], body[1], [1, 2, 5, 6], [1, 2, 6, 7]]);
+    let e = gate(&edge).unwrap_err().to_string();
+    assert!(e.contains("1 boundary edges are not in exactly two boundary faces (the first, 1–2,"), "{e}");
+    assert!(super::detached_tets(&edge, &super::face_use(&edge)).is_empty());
+    // Joined by the vertex 1: the two share the face 1-8-9.
+    let vertex = positive(&p, &[body[0], body[1], [1, 8, 9, 5], [1, 8, 9, 6]]);
+    let e = gate(&vertex).unwrap_err().to_string();
+    assert!(e.contains("the mesh is pinched at 1 vertices (the first, 1,"), "{e}");
+    assert!(super::detached_tets(&vertex, &super::face_use(&vertex)).is_empty());
+}
+
 /// The validity gate refuses a mesh folded over itself even when the fold's two layers add up to
 /// the volume the boundary encloses: a face held by three tetrahedra.
 #[test]
