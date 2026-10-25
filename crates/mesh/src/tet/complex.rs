@@ -1182,16 +1182,21 @@ impl TetComplex {
         if self.curve(vs[k], vs[l]).is_some() {
             return Ok(false);
         }
-        // Each neighbour gains a boundary face (both, when they are one tetrahedron); one left
-        // with every face on the boundary would float free of the mesh, joined to it by its
-        // vertices alone (a singular stiffness).
-        for m in [k, l] {
-            let n = ns[m];
-            let gained = if ns[k] == ns[l] { 2 } else { 1 };
-            let open = self.adj(n)?.iter().filter(|&&x| x == NONE).count();
-            if open + gained >= 4 {
-                return Ok(false);
-            }
+        // The two new boundary faces share the edge of the two other vertices, which must not be
+        // on the boundary already: its tetrahedra must close round it in one ring through `t`.
+        // Otherwise the edge would end up in four boundary faces, the tetrahedra on either side
+        // joined by that edge alone (a singular stiffness; #671). This also keeps a neighbour
+        // from floating free with every face on the boundary (#438): its other face on the edge
+        // would be on the boundary already. A ring of two (both neighbours one tetrahedron, with
+        // the cap's own vertices) is no mesh at all.
+        let (a, b) = (vs[i], vs[j]);
+        let ring = match self.edge_ring_at(t, a, b)? {
+            Some(ring) if ring.closed && ns[k] != ns[l] => ring.tets.len(),
+            _ => return Ok(false),
+        };
+        let held = self.vtets.get(a as usize).map_or(0, |l| l.iter().filter(|&&u| self.tet(u).is_ok_and(|x| x.contains(&b))).count());
+        if ring != held {
+            return Ok(false);
         }
         let raw = self.journal.recording.then(|| Box::new(self.snapshot(&[t, ns[k], ns[l]], &vs)));
         for m in [k, l] {

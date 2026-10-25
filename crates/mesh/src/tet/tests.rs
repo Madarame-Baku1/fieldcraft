@@ -534,6 +534,24 @@ fn deleting_a_cap_never_leaves_a_neighbour_floating() {
     cx.validate().unwrap();
 }
 
+/// A cap tetrahedron whose two other faces meet at an edge that is on the boundary already:
+/// deleting it would put that edge in four boundary faces, the groups of tetrahedra on either
+/// side joined by the edge alone (#671), so it stays. Each group has two tetrahedra, so neither
+/// neighbour would float on its own.
+#[test]
+fn deleting_a_cap_never_pinches_the_mesh_at_an_edge() {
+    // The cap 0-1-2-3: boundary faces 1-2-3 and 0-2-3, inner faces 0-1-2 and 0-1-3 over the
+    // edge 0-1. Beyond each inner face a pair of tetrahedra, open to each other round 0-1.
+    let p =
+        [[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.5, 0.5, 1.0], [0.5, 0.5, -1.0], [0.5, -0.3, -1.0], [0.5, -0.3, 1.0], [1.5, 0.1, -1.0], [1.5, 0.1, 1.0]];
+    let tets = [[0, 1, 2, 3], [0, 1, 3, 4], [1, 3, 4, 6], [0, 1, 2, 5], [1, 2, 5, 7]];
+    let mut cx = complex_of(&p, &tets, vec![VertexKind::Face(0); 8], |_| 0);
+    assert!(cx.edge_ring(0, 1).unwrap().is_some_and(|r| !r.closed));
+    assert!(!cx.delete_boundary_tet(0).unwrap(), "the cap was deleted, pinching the mesh at the edge 0-1");
+    assert_eq!(cx.live_tets().count(), 5);
+    cx.validate().unwrap();
+}
+
 /// A vertex inserted on a curved boundary face whose removed faces would ring a kept one: the
 /// improvement's insertion on the rounded box's fillet in the tet10 run on Linux (SolidCraft
 /// 0.18.1's tessellation). Vertex 10 tops a tetrahedron with three boundary faces; two of them
