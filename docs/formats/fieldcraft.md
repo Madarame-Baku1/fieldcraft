@@ -147,7 +147,7 @@ results without solving again (`results.contour`, `results.frame`, `results.slic
 `results.streamlines`, `solve.probe` and the rest work at once). Little-endian:
 
 ```
-"MCRSLT02"                     magic (the results encoding's version is 02)
+"MCRSLT03"                     magic (the results encoding's version is 03)
 u32 steps
 steps × { u64 length, step name (UTF-8),
           32 bytes: SHA-256 of the definition it was solved from,
@@ -158,8 +158,9 @@ steps × { u64 length, step name (UTF-8),
 The result is the solver's own, every number in SI and every bit kept: a static step's
 displacements, rotations, reactions, nodal, element and integration point stresses, shell and
 beam forces, reference points, contacts, and a nonlinear step's increments with a frame per
-converged increment; a frequency or buckling step's modes; a heat transfer step's temperature
-frames, fluxes and heat flows; an explicit step's field frames, histories, energies, contacts and
+converged increment (its displacements, reactions, nodal stresses and contact states); a
+frequency or buckling step's modes; a heat transfer step's temperature frames, fluxes and heat
+flows; an explicit step's field frames, histories, energies, contacts and
 eroded elements; a fluid step's lattice (origin, spacing and cells), its cell fields per frame
 (velocity, pressure, temperature), wall forces, heat and fan and porous zone histories, run
 statistics and steady-state monitors. It is written in a compact binary encoding

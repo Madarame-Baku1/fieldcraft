@@ -4,8 +4,10 @@
 //! ([`fieldcraft_render::contour`]); animation steps the deformation through a fixed number of
 //! frames per cycle: linear static/modal contours follow their interpolated load/amplitude,
 //! while explicit/fluid frames retain their recorded fields. Nonlinear increments retain
-//! displacement, with an explanation when intermediate stresses were not saved. A plot of a stale result (the model changed since the solve) is drawn the
-//! same way and marked. A fluid step draws the part as it is, with the engine's flow display
+//! displacement, stress and contact state, with an explanation on frames that kept no stress (the
+//! step's output requests none) or are past the step's field cap, which keep displacement only.
+//! A plot of a stale result (the model changed since the solve) is drawn the same way and marked.
+//! A fluid step draws the part as it is, with the engine's flow display
 //! ([`fieldcraft_engine::flow`]: a slice, the obstacles coloured and streamlines) through it.
 
 use std::sync::Arc;

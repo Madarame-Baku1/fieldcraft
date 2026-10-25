@@ -124,7 +124,8 @@ use fieldcraft_fem::quadrature::Rule;
 use fieldcraft_fem::{DofKind, DofSet, ElementType, PointStress, face, von_mises};
 use fieldcraft_model::fluid_zones::curve_value;
 use fieldcraft_model::{
-    ArcConstraint, ArcLength, BoundaryCondition, Extent, Hardening, Imperfection, Load, Model, NonlinearStatic, Plastic, Procedure, SectionKind, Step,
+    ArcConstraint, ArcLength, BoundaryCondition, Extent, Hardening, Imperfection, Load, Model, NonlinearStatic, OutputVariable, Plastic, Procedure,
+    SectionKind, Step,
 };
 use fieldcraft_parallel as parallel;
 use serde::Serialize;
@@ -219,7 +220,7 @@ pub struct CriticalPoint {
     pub negative_after: usize,
 }
 
-/// The displacements and reactions at the end of a converged increment.
+/// The displacements, reactions, stresses and contact state at the end of a converged increment.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Frame {
     pub load_factor: f64,
@@ -229,9 +230,31 @@ pub struct Frame {
     /// force), by index; nodes left out carry none. Sparse: only supported or prescribed nodes
     /// appear, so a frame costs little beyond its displacements.
     pub reaction: Vec<(usize, [f64; 3])>,
+    /// The stress at the increment's converged and committed state, averaged at the nodes as
+    /// [`StaticResult::stress`] is (Cauchy stresses), per node in [`StaticResult::nodes`] order;
+    /// empty when the step's output does not request stress or once the step's frames hold
+    /// [`MAX_FIELD_VALUES`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub stress: Vec<[f64; 6]>,
+    /// Each contact's state at the increment, as [`StaticResult::contacts`] (by name); empty
+    /// without contact or once the frames hold [`MAX_FIELD_VALUES`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contacts: Vec<ContactResult>,
 }
 
 impl Frame {
+    /// Whether the frame kept its stress (only with stress in the step's output, and not past
+    /// [`MAX_FIELD_VALUES`]).
+    pub fn has_stress(&self) -> bool {
+        !self.stress.is_empty()
+    }
+
+    /// Whether the frame kept its contact states (not past [`MAX_FIELD_VALUES`], and only in a
+    /// step with contact pairs).
+    pub fn has_contacts(&self) -> bool {
+        !self.contacts.is_empty()
+    }
+
     /// The reaction force at the node of index `i` (zero when it carries none).
     pub fn reaction_at(&self, i: usize) -> [f64; 3] {
         self.reaction.binary_search_by_key(&i, |(k, _)| *k).ok().and_then(|k| self.reaction.get(k)).map_or([0.0; 3], |(_, f)| *f)
@@ -261,6 +284,16 @@ impl History {
 /// Most values the frames of one step keep (3 per node per frame for the displacements, 4 per
 /// reacted node for the reactions).
 pub const MAX_FRAME_VALUES: usize = 30_000_000;
+
+/// Most values the frames of one step keep for their fields, apart from [`MAX_FRAME_VALUES`]
+/// (6 per node per frame for the stress when the step's output requests it,
+/// [`CONTACT_FRAME_VALUES`] per secondary node for each contact): past it the frames keep
+/// displacements and reactions only, as many as before.
+pub const MAX_FIELD_VALUES: usize = 30_000_000;
+
+/// The values a frame keeps per secondary node of a contact: pressure, multiplier, gap and
+/// status, and with friction the shear and slip vectors.
+const CONTACT_FRAME_VALUES: usize = 10;
 
 /// Line search: accept a step whose residual work is at most this fraction of the first.
 const LINE_SEARCH_ACCEPT: f64 = 0.8;
@@ -1381,7 +1414,7 @@ fn solve_on(model: &Model, step: &str, limits: &Limits, notes: Vec<String>) -> R
         .collect::<Result<Vec<_>>>()?;
     // The undeformed state first: an element that is bad before anything moves is an error in
     // the model, not a reason to cut increments back.
-    problem.evaluate(&vec![0.0; mesh.dofs()], 0.0, false, &committed, &[], &[], 0.0)?;
+    let undeformed = problem.evaluate(&vec![0.0; mesh.dofs()], 0.0, false, &committed, &[], &[], 0.0)?;
     let path_dependent = problem.materials.iter().any(MaterialModel::is_path_dependent);
     // Rotations (radians, their forces moments) are measured apart from translations.
     let rotation: Vec<bool> = (0..mesh.dofs()).map(|d| matches!(mesh.layout.locate(d), Some((_, DofKind::Rx | DofKind::Ry | DofKind::Rz)))).collect();
@@ -1413,27 +1446,53 @@ fn solve_on(model: &Model, step: &str, limits: &Limits, notes: Vec<String>) -> R
 
     let mut history = History::default();
     let (mut frame_values, mut frames_full) = (0usize, false);
+    let (mut field_values, mut fields_full) = (0usize, false);
     let values = 3 * mesh.labels.len();
-    let mut keep_frame = |history: &mut History, lambda: f64, u: &[f64], at: Option<&Evaluation>, warnings: &mut Vec<String>| {
+    // A frame keeps its stress only when the step's output asks for stress; the contact states
+    // are always kept, as the final ones are.
+    let frame_stress = step.output.contains(&OutputVariable::Stress);
+    let stress_values = if frame_stress { 6 * mesh.labels.len() } else { 0 };
+    let fields = stress_values + problem.contacts.iter().map(|c| CONTACT_FRAME_VALUES * c.nodes.len()).sum::<usize>();
+    // The state at the end of an increment (`at`, its converged evaluation, whose material
+    // history is the one committed); the undeformed frame has no reactions.
+    let mut keep_frame = |history: &mut History, lambda: f64, u: &[f64], at: &Evaluation, reacted: bool, warnings: &mut Vec<String>| -> Result<()> {
         if frames_full {
-            return;
+            return Ok(());
         }
-        let reaction: Vec<(usize, [f64; 3])> = at
-            .map(|e| {
-                let out_of_balance: Vec<f64> = e.internal.iter().zip(&e.external).map(|(a, b)| a - b).collect();
-                split(&red.reactions_of(&out_of_balance), &mesh).0.into_iter().enumerate().filter(|(_, f)| f.iter().any(|c| *c != 0.0)).collect()
-            })
-            .unwrap_or_default();
+        let reaction: Vec<(usize, [f64; 3])> = if reacted {
+            let out_of_balance: Vec<f64> = at.internal.iter().zip(&at.external).map(|(a, b)| a - b).collect();
+            split(&red.reactions_of(&out_of_balance), &mesh).0.into_iter().enumerate().filter(|(_, f)| f.iter().any(|c| *c != 0.0)).collect()
+        } else {
+            Vec::new()
+        };
         let these = values.saturating_add(reaction.len().saturating_mul(4));
         if frame_values.saturating_add(these) > MAX_FRAME_VALUES {
             warnings.push(format!("the frames stop at load factor {lambda}: the step keeps at most {MAX_FRAME_VALUES} values"));
             frames_full = true;
-            return;
+            return Ok(());
         }
         frame_values += these;
-        history.frames.push(Frame { load_factor: lambda, displacement: split(u, &mesh).0, reaction });
+        let displacement = split(u, &mesh).0;
+        if !fields_full && field_values.saturating_add(fields) > MAX_FIELD_VALUES {
+            warnings.push(format!(
+                "the frames keep their stress and contact fields up to the one before load factor {lambda}: the step keeps at most {MAX_FIELD_VALUES} field values"
+            ));
+            fields_full = true;
+        }
+        let (stress, contacts) = if fields_full {
+            (Vec::new(), Vec::new())
+        } else {
+            field_values += fields;
+            let augmentations = history.increments.iter().map(|i| i.augmentations).sum();
+            let contacts = problem.contacts.iter().zip(&at.contact).map(|(c, s)| c.result(&mesh, s, augmentations)).collect();
+            let stress = if frame_stress { stresses(&mesh, &problem, u, &displacement, lambda, &at.history)?.1 } else { Vec::new() };
+            (stress, contacts)
+        };
+        history.frames.push(Frame { load_factor: lambda, displacement, reaction, stress, contacts });
+        Ok(())
     };
-    keep_frame(&mut history, 0.0, &vec![0.0; mesh.dofs()], None, &mut warnings);
+    keep_frame(&mut history, 0.0, &vec![0.0; mesh.dofs()], &undeformed, false, &mut warnings)?;
+    drop(undeformed);
     let (q, lambda, last) = if let Some(arc) = &settings.arc_length {
         if problem.field.is_some() {
             return Err(Error::NotSupported(format!("temperatures in arc-length steps (step `{}`)", step.name)));
@@ -1511,7 +1570,7 @@ fn solve_on(model: &Model, step: &str, limits: &Limits, notes: Vec<String>) -> R
                     });
                     (t, lambda) = (target, target_lambda);
                     q = c.q;
-                    keep_frame(&mut history, lambda, &red.expand_scaled(&q, lambda), Some(&c.evaluation), &mut warnings);
+                    keep_frame(&mut history, lambda, &red.expand_scaled(&q, lambda), &c.evaluation, true, &mut warnings)?;
                     run.commit_increment(&q, lambda, &c.evaluation);
                     last = Some(c.evaluation);
                     fast = if count <= FAST_ITERATIONS { fast + 1 } else { 0 };
@@ -1611,11 +1670,53 @@ fn finish(
         .zip(point_motion.iter().zip(&point_reaction))
         .map(|(p, (d, r))| PointResult { name: p.name.clone(), label: p.label, displacement: *d, reaction: *r })
         .collect();
+    let (elements, stress) = stresses(mesh, problem, &u, &displacement, lambda, committed)?;
+    let von_mises = stress.iter().map(von_mises).collect();
+    let scale = crate::system::balance_scale(&applied_total, &reaction_total, &reaction);
+    let ground = mesh.discrete.ground_force(&u, mesh);
+    let imbalance = (0..3).map(|c| (applied_total[c] + reaction_total[c] + ground[c]).abs()).fold(0.0, f64::max);
+    if scale > 0.0 && imbalance > crate::system::BALANCE_TOLERANCE * scale {
+        warnings.push(format!("loads and reactions differ by {imbalance:.3e} (relative {:.1e})", imbalance / scale));
+    }
+    Ok(StaticResult {
+        step: step.name.clone(),
+        nodes: mesh.labels.clone(),
+        displacement,
+        rotation,
+        reaction,
+        reaction_moment,
+        stress,
+        von_mises,
+        elements,
+        shells: Vec::new(),
+        beams: Vec::new(),
+        reference_points,
+        applied_total,
+        reaction_total,
+        stats: Stats { dofs: mesh.dofs(), equations: red.neq(), factor_entries, lanczos_vectors: 0 },
+        warnings,
+        temperature: None,
+        nonlinear: Some(history),
+        contacts,
+    })
+}
+
+/// The stresses at the state `u`, λ with the material history `committed`: every element's at its
+/// integration points and extrapolated to its nodes (with the equivalent plastic strain of a
+/// plastic material), and their average at the mesh's nodes (`displacement` is `u` per node).
+fn stresses(
+    mesh: &Mesh,
+    problem: &Problem,
+    u: &[f64],
+    displacement: &[[f64; 3]],
+    lambda: f64,
+    committed: &[Vec<f64>],
+) -> Result<(Vec<ElementStress>, Vec<[f64; 6]>)> {
     #[allow(clippy::type_complexity)]
     let all_points = parallel::map_grained(mesh.elements.len(), GRAIN, |i| -> Result<(Vec<PointStress>, Vec<f64>, &'static ElementType, Rule)> {
         let el = mesh.elements.get(i).ok_or_else(|| Error::Internal("element index".into()))?;
         let at = |err| Error::element(el.label, err);
-        let ue = problem.element_vector(i, &u);
+        let ue = problem.element_vector(i, u);
         let kernel = el.kernel()?;
         let history = committed.get(i).map(Vec::as_slice).unwrap_or_default();
         let material = problem.materials.get(i).ok_or_else(|| Error::Internal("element material".into()))?;
@@ -1661,34 +1762,7 @@ fn finish(
         elements.push(ElementStress { label: el.label, kind: el.kind, points, nodal, plastic_strain });
     }
     let stress: Vec<[f64; 6]> = sum.iter().zip(&count).map(|(s, c)| s.map(|v| if *c > 0 { v / f64::from(*c) } else { 0.0 })).collect();
-    let von_mises = stress.iter().map(von_mises).collect();
-    let scale = crate::system::balance_scale(&applied_total, &reaction_total, &reaction);
-    let ground = mesh.discrete.ground_force(&u, mesh);
-    let imbalance = (0..3).map(|c| (applied_total[c] + reaction_total[c] + ground[c]).abs()).fold(0.0, f64::max);
-    if scale > 0.0 && imbalance > crate::system::BALANCE_TOLERANCE * scale {
-        warnings.push(format!("loads and reactions differ by {imbalance:.3e} (relative {:.1e})", imbalance / scale));
-    }
-    Ok(StaticResult {
-        step: step.name.clone(),
-        nodes: mesh.labels.clone(),
-        displacement,
-        rotation,
-        reaction,
-        reaction_moment,
-        stress,
-        von_mises,
-        elements,
-        shells: Vec::new(),
-        beams: Vec::new(),
-        reference_points,
-        applied_total,
-        reaction_total,
-        stats: Stats { dofs: mesh.dofs(), equations: red.neq(), factor_entries, lanczos_vectors: 0 },
-        warnings,
-        temperature: None,
-        nonlinear: Some(history),
-        contacts,
-    })
+    Ok((elements, stress))
 }
 
 /// What one arc-length increment starts from: the tangent at the converged state, factored, and
@@ -1852,7 +1926,7 @@ fn arc_length(
     step: &Step,
     history: &mut History,
     warnings: &mut Vec<String>,
-    keep_frame: &mut dyn FnMut(&mut History, f64, &[f64], Option<&Evaluation>, &mut Vec<String>),
+    keep_frame: &mut dyn FnMut(&mut History, f64, &[f64], &Evaluation, bool, &mut Vec<String>) -> Result<()>,
 ) -> Result<(Vec<f64>, f64, Option<Evaluation>)> {
     let settings = run.settings;
     let red = run.problem.red;
@@ -1908,7 +1982,7 @@ fn arc_length(
                 (q, lambda) = (q1, lambda1);
                 run.committed.clone_from(&evaluation.history);
                 let u = red.expand_scaled(&q, lambda);
-                keep_frame(history, lambda, &u, Some(&evaluation), warnings);
+                keep_frame(history, lambda, &u, &evaluation, true, warnings)?;
                 start = run.arc_start(&mut evaluation, &q, lambda, false).map_err(fatal)?;
                 let negative = start.factor.inertia().negative;
                 history.increments.push(Increment {

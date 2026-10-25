@@ -5,7 +5,7 @@
 //! Little-endian:
 //!
 //! ```text
-//! "MCRSLT02"                     magic, 8 bytes (the results encoding's version is 02)
+//! "MCRSLT03"                     magic, 8 bytes (the results encoding's version is 03)
 //! u32 steps
 //! steps × { u64 length, step name (UTF-8),
 //!           32 bytes: SHA-256 of the definition it was solved from ([`definition_hash`]),
@@ -15,7 +15,8 @@
 //!
 //! The result is what the solver reported, every number in SI: a static step's displacements,
 //! rotations, reactions, stresses (nodal, element and integration point, shells and beams),
-//! reference points, contacts and nonlinear increments with their frames; a frequency or
+//! reference points, contacts and nonlinear increments with their frames (displacements,
+//! reactions, nodal stresses and contact states); a frequency or
 //! buckling step's modes; a heat transfer step's temperature frames, fluxes and heat flows; an
 //! explicit step's field frames, histories, energies, contacts and erosion; a fluid step's grid
 //! (origin, spacing, cells), cell fields per frame (velocity, pressure, temperature), wall
@@ -38,8 +39,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{Error, Geometry, MAX_FILE_BYTES, Result, codec, invalid};
 
-/// The magic bytes the part starts with (the `01` is the results encoding's version).
-pub const MAGIC: &[u8; 8] = b"MCRSLT02";
+/// The magic bytes the part starts with (the `03` is the results encoding's version).
+pub const MAGIC: &[u8; 8] = b"MCRSLT03";
 
 /// The part's name.
 pub const PART: &str = "results.bin";
@@ -320,13 +321,14 @@ pub fn check(r: &Solved) -> std::result::Result<(), String> {
             )?;
             if let Some(h) = &s.nonlinear {
                 for f in &h.frames {
-                    lengths(n, &[("a frame's displacement", f.displacement.len(), false)])?;
+                    lengths(n, &[("a frame's displacement", f.displacement.len(), false), ("a frame's stress", f.stress.len(), true)])?;
                     if !f.reaction.windows(2).all(|w| matches!(w, [a, b] if a.0 < b.0)) || f.reaction.iter().any(|(i, _)| *i >= n) {
                         return Err("a frame's reactions are not at ascending nodes of the result".into());
                     }
                 }
             }
-            for c in &s.contacts {
+            let frame_contacts = s.nonlinear.iter().flat_map(|h| &h.frames).flat_map(|f| &f.contacts);
+            for c in s.contacts.iter().chain(frame_contacts) {
                 if !ascending(&c.nodes) {
                     return Err(format!("contact `{}`'s nodes do not ascend", c.name));
                 }

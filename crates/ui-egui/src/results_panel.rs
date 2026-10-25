@@ -167,7 +167,7 @@ fn legend_layout(plot: &Plot, painter: &egui::Painter, rect: Rect, bar: Option<R
     }
     if plot.unavailable {
         lines.push(("Field not saved at this increment".into(), t.warm));
-        lines.push(("Stress/contact: final state only".into(), t.warm));
+        lines.push(("No stress output, or past the step's field cap".into(), t.warm));
     }
     if let Some(l) = plot.contour.as_ref().filter(|_| plot.view.range_min.is_some() || plot.view.range_max.is_some()) {
         let scale = l.max.1.abs().max(l.min.1.abs());
@@ -564,7 +564,7 @@ fn deformation_rows(plot: &Plot, ui: &mut egui::Ui, run: &mut Vec<(&'static str,
     if ui
         .checkbox(&mut animate, "")
         .on_hover_text(
-            "Animate shape and contours. Linear static results interpolate a proportional load; nonlinear steps play saved displacements (intermediate stresses were not saved), explicit steps play saved fields.",
+            "Animate shape and contours. Linear static results interpolate a proportional load; nonlinear steps play their converged increments with their own stresses, explicit steps play saved fields.",
         )
         .changed()
     {
@@ -1161,8 +1161,10 @@ mod tests {
     use super::*;
     use crate::results;
 
+    /// #205: nonlinear playback colours each increment by its own stress; a frame without
+    /// its own stress (no stress output, or past the step's field cap) says so in the legend.
     #[test]
-    fn nonlinear_playback_explains_missing_increment_stress() {
+    fn nonlinear_playback_shows_increment_stress() {
         let mut app = ModelApp::new(fieldcraft_engine::Session::default());
         app.run("file.sample", json!({"name": "cantilever"})).unwrap();
         app.run("model.section.edit", json!({"name": "Beam", "set": "beam", "material": "Steel", "kind": {"type": "solid"}, "formulation": {}}))
@@ -1170,28 +1172,31 @@ mod tests {
         app.run("model.step.create", json!({"name": "Increments", "procedure": {"type": "nonlinear_static", "nonlinear_geometry": false, "initial_increment": 0.25}, "boundary_conditions": ["Clamp"], "loads": ["Push"]})).unwrap();
         app.run("solve.nonlinear", json!({"step": "Increments"})).unwrap();
         app.run("results.contour", json!({"field": "von_mises"})).unwrap();
+        let final_max = app.plot().unwrap().contour.as_ref().unwrap().max.1;
         app.run("results.animate", json!({})).unwrap();
         app.now = 0.0;
         let plot = app.plot().unwrap();
-        assert!(plot.unavailable && plot.contour.is_none() && plot.amplitude.is_none());
+        assert!(!plot.unavailable && plot.contour.is_some() && plot.amplitude.is_none());
         assert_eq!(title(&plot), "Von Mises stress [MPa]");
-        app.probe_node(plot.result.nodes()[0]).unwrap();
-        assert!(app.probe.as_ref().unwrap().rows.contains(&("Probe values".into(), "Solved final state".into())));
-        let ctx = egui::Context::default();
-        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
-            let legend = legend_layout(&plot, &ui.ctx().debug_painter(), Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0)), None, &Tokens::dark());
-            assert!(legend.lines.iter().any(|(line, _)| line == "Field not saved at this increment"));
-        });
-        out.textures_delta.clear();
         app.run("results.deformed", json!({"show": false})).unwrap();
         app.now = results::PERIOD * (results::FRAMES - 1) as f64 / results::FRAMES as f64;
         let final_frame = app.plot().unwrap();
         assert_ne!(plot.pick.frame, final_frame.pick.frame, "recorded nonlinear increments keep playing without deformation");
         assert!(final_frame.contour.is_some() && !final_frame.unavailable && final_frame.amplitude.is_none());
         app.run("results.animate", json!({"on": false})).unwrap();
-        assert!(app.plot().unwrap().contour.is_some(), "the complete final result remains available");
-        app.run("results.frame", json!({"frame": 0})).unwrap();
-        assert!(app.plot().unwrap().unavailable, "manual increment selection is equally honest");
+        app.run("results.frame", json!({"frame": 1})).unwrap();
+        let first = app.plot().unwrap();
+        let max = first.contour.as_ref().unwrap().max.1;
+        assert!(!first.unavailable && max > 0.0 && max < 0.5 * final_max, "a quarter of the load: {max} of {final_max}");
+        let mut capped = first.as_ref().clone();
+        capped.unavailable = true;
+        let ctx = egui::Context::default();
+        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let legend =
+                legend_layout(&capped, &ui.ctx().debug_painter(), Rect::from_min_size(Pos2::ZERO, vec2(1280.0, 800.0)), None, &Tokens::dark());
+            assert!(legend.lines.iter().any(|(line, _)| line == "Field not saved at this increment"));
+        });
+        out.textures_delta.clear();
     }
 
     /// The clickable extreme rows keep full-sized text inside the legend, even with a stale

@@ -550,28 +550,35 @@ pub fn displacements(r: &StepResult, pick: Pick) -> Result<&[[f64; 3]]> {
 /// the element connectivity an explicit frame's element stresses are averaged over.
 pub fn field_values(model: &Model, r: &StepResult, field: Field, pick: Pick) -> Result<Vec<f64>> {
     let unavailable = || EngineError::Params(format!("{} is not available for step `{}`", field.label(), r.step()));
+    // A nonlinear static step's frame keeps its own stress (when the step's output requests
+    // stress) and contact state, as long as the step's frames had room for them
+    // (nonlinear::MAX_FIELD_VALUES); without the field asked for only the
+    // complete final frame may use the final solved fields. A frame cap may truncate the
+    // history, so its last saved frame alone is not proof of the final state.
+    let mut frame_fields: Option<&fieldcraft_solver::nonlinear::Frame> = None;
     if (field.is_stress() || field.is_contact())
         && let Kind::Static(s) = r.kind()
         && let (Some(k), Some(h)) = (pick.frame, &s.nonlinear)
     {
-        // Nonlinear frames hold displacements/reactions, not the path-dependent material
-        // and contact state. Only the complete final frame can use the final solved fields.
-        // A frame cap may truncate the history, so its last saved frame alone is not proof.
-        let final_frame = k.checked_add(1) == Some(h.frames.len())
-            && h.increments.iter().filter(|i| i.converged).count().checked_add(1) == Some(h.frames.len())
-            && h.frames.get(k).is_some_and(|f| f.displacement == s.displacement);
-        if !final_frame {
+        frame_fields = h.frames.get(k).filter(|f| if field.is_stress() { f.has_stress() } else { f.has_contacts() });
+        let final_frame = || {
+            k.checked_add(1) == Some(h.frames.len())
+                && h.increments.iter().filter(|i| i.converged).count().checked_add(1) == Some(h.frames.len())
+                && h.frames.get(k).is_some_and(|f| f.displacement == s.displacement)
+        };
+        if frame_fields.is_none() && !final_frame() {
             return Err(EngineError::Params(format!(
-                "{} was not saved at nonlinear increment {k} of step `{}`; only final-state stress/contact fields are available",
+                "{} was not saved at nonlinear increment {k} of step `{}` (frames keep stress only when the step's output requests stress, and stress and contact fields only up to {} values); only final-state stress/contact fields are available",
                 field.label(),
-                s.step
+                s.step,
+                fieldcraft_solver::nonlinear::MAX_FIELD_VALUES
             )));
         }
     }
     let component = |f: fn(&[f64; 3]) -> f64| -> Result<Vec<f64>> { Ok(displacements(r, pick)?.iter().map(f).collect()) };
     let stresses = || -> Result<std::borrow::Cow<'_, [[f64; 6]]>> {
         match r.kind() {
-            Kind::Static(s) => Ok(std::borrow::Cow::Borrowed(s.stress.as_slice())),
+            Kind::Static(s) => Ok(std::borrow::Cow::Borrowed(frame_fields.map_or(s.stress.as_slice(), |f| f.stress.as_slice()))),
             Kind::Frequency(_) | Kind::Fluid(_) | Kind::Heat(_) => Err(unavailable()),
             Kind::Explicit(e) => {
                 let f = frame(e, pick)?;
@@ -608,7 +615,7 @@ pub fn field_values(model: &Model, r: &StepResult, field: Field, pick: Pick) -> 
             _ => Err(unavailable()),
         },
         Field::ContactPressure | Field::ContactGap | Field::ContactStatus | Field::ContactShear | Field::ContactSlip => match r.kind() {
-            Kind::Static(s) if !s.contacts.is_empty() => Ok(contact_values(s, field)),
+            Kind::Static(s) if !s.contacts.is_empty() => Ok(contact_values(&s.nodes, frame_fields.map_or(&s.contacts, |f| &f.contacts), field)),
             _ => Err(unavailable()),
         },
         Field::VonMises => each(&fieldcraft_fem::von_mises),
@@ -624,17 +631,18 @@ pub fn field_values(model: &Model, r: &StepResult, field: Field, pick: Pick) -> 
     }
 }
 
-/// A contact field at every node of a static result: the largest pressure, shear, slip or status
-/// code, or the smallest gap, over the contacts a node is a secondary node of; off them 0
-/// pressure and shear, and no gap, status or slip (NaN).
-fn contact_values(s: &StaticResult, field: Field) -> Vec<f64> {
+/// A contact field at every node of a static result (`nodes`, from `contacts`, the final state's
+/// or a nonlinear frame's): the largest pressure, shear, slip or status code, or the smallest
+/// gap, over the contacts a node is a secondary node of; off them 0 pressure and shear, and no
+/// gap, status or slip (NaN).
+fn contact_values(nodes: &[u32], contacts: &[fieldcraft_solver::contact::ContactResult], field: Field) -> Vec<f64> {
     use fieldcraft_solver::contact::Status;
     let zero = matches!(field, Field::ContactPressure | Field::ContactShear);
-    let mut out = vec![if zero { 0.0 } else { f64::NAN }; s.nodes.len()];
+    let mut out = vec![if zero { 0.0 } else { f64::NAN }; nodes.len()];
     let larger = |v: &mut f64, x: f64| *v = if v.is_nan() { x } else { v.max(x) };
-    for c in &s.contacts {
+    for c in contacts {
         for (k, label) in c.nodes.iter().enumerate() {
-            let Some(v) = s.nodes.binary_search(label).ok().and_then(|i| out.get_mut(i)) else { continue };
+            let Some(v) = nodes.binary_search(label).ok().and_then(|i| out.get_mut(i)) else { continue };
             match field {
                 Field::ContactPressure => larger(v, c.pressure.get(k).copied().unwrap_or(0.0)),
                 Field::ContactShear => larger(v, c.shear.get(k).map_or(0.0, |t| magnitude(*t))),
@@ -851,8 +859,91 @@ mod tests {
     use crate::cmd::solve::tests::cantilever;
     use serde_json::json;
 
+    /// #205: each frame of a nonlinear static step shows its own stress and contact fields. Two
+    /// linear elastic blocks (ν = 0, small strain) squeezed by a prescribed travel ramped with the
+    /// load factor λ: uniaxial strain, so σ_zz = −10 λ everywhere and the contact pressure is
+    /// 10 λ at every secondary node (E = 1000, 1 % strain at λ = 1).
     #[test]
-    fn nonlinear_increment_fields_do_not_borrow_final_stress() {
+    fn nonlinear_frames_show_their_own_fields() {
+        let mut s = Session::default();
+        crate::cmd::solve::tests::pressed_blocks(&mut s);
+        s.run_script(&json!([
+            {"command": "model.step.create", "params": {"name": "Thirds", "procedure": {"type": "nonlinear_static", "nonlinear_geometry": false,
+                "initial_increment": 1.0 / 3.0, "max_increment": 1.0 / 3.0}, "boundary_conditions": ["base", "push"], "loads": []}},
+            {"command": "solve.nonlinear", "params": {"step": "Thirds"}}
+        ]))
+        .unwrap();
+        let r = s.result("Thirds").unwrap();
+        let Kind::Static(st) = r.kind() else { panic!() };
+        let h = st.nonlinear.as_ref().unwrap();
+        assert_eq!(h.frames.len(), 4, "λ 0, 1/3, 2/3, 1");
+        let at = |field, k| field_values(&s.model, r, field, Pick { mode: 1, frame: Some(k) }).unwrap();
+        let largest = |v: Vec<f64>| v.into_iter().filter(|x| x.is_finite()).fold(f64::NEG_INFINITY, f64::max);
+        // Stored in SI: 10 MPa at λ = 1.
+        let full = 10.0e6;
+        for (k, f) in h.frames.iter().enumerate() {
+            let lambda = f.load_factor;
+            // The augmented Lagrangian leaves a penetration within its (absolute) tolerance,
+            // which softens the interface a little: an error of the same size at every frame.
+            for zz in at(Field::StressZz, k) {
+                assert!((zz + full * lambda).abs() < 1e-3 * full, "frame {k} (λ {lambda}): σzz {zz}");
+            }
+            let pressure = largest(at(Field::ContactPressure, k));
+            assert!((pressure - full * lambda).abs() < 1e-3 * full, "frame {k} (λ {lambda}): {pressure}");
+            if k > 0 {
+                assert_eq!(largest(at(Field::ContactStatus, k)), 1.0, "frame {k}: closed");
+            }
+        }
+        // Frame 1 is its own state, not the final one; the last frame is the final state.
+        let final_vm = field_values(&s.model, r, Field::VonMises, Pick { mode: 1, frame: None }).unwrap();
+        assert_ne!(at(Field::VonMises, 1), final_vm);
+        assert_eq!(at(Field::VonMises, 3), final_vm);
+        assert_eq!(at(Field::ContactPressure, 3), field_values(&s.model, r, Field::ContactPressure, Pick { mode: 1, frame: None }).unwrap());
+        // The display follows the frame.
+        s.execute("results.contour", &json!({"step": "Thirds", "field": "contact_pressure"})).unwrap();
+        let reply = s.execute("results.frame", &json!({"frame": 1})).unwrap();
+        assert!(reply.get("contour_unavailable").is_none(), "{reply}");
+        let max = reply["contour"]["range"]["max"]["value"].as_f64().unwrap();
+        assert!((max - 10.0 / 3.0).abs() < 1e-2, "{reply}");
+    }
+
+    /// A step whose output requests no stress keeps no per-frame stress (#205 review: the frames'
+    /// size follows the step's `output`): stress contours are refused before the final frame with
+    /// the reason, while every frame keeps its own contact state and the final frame the final
+    /// stress.
+    #[test]
+    fn frames_keep_stress_only_when_the_output_requests_it() {
+        let mut s = Session::default();
+        crate::cmd::solve::tests::pressed_blocks(&mut s);
+        s.run_script(&json!([
+            {"command": "model.step.create", "params": {"name": "Thirds", "procedure": {"type": "nonlinear_static", "nonlinear_geometry": false,
+                "initial_increment": 1.0 / 3.0, "max_increment": 1.0 / 3.0}, "output": ["displacement", "reaction_force"],
+                "boundary_conditions": ["base", "push"], "loads": []}},
+            {"command": "solve.nonlinear", "params": {"step": "Thirds"}}
+        ]))
+        .unwrap();
+        let r = s.result("Thirds").unwrap();
+        let Kind::Static(st) = r.kind() else { panic!() };
+        let h = st.nonlinear.as_ref().unwrap();
+        assert_eq!(h.frames.len(), 4, "λ 0, 1/3, 2/3, 1");
+        assert!(h.frames.iter().all(|f| !f.has_stress() && f.contacts.len() == st.contacts.len()), "contact states without stresses");
+        assert!(!st.stress.is_empty(), "the final stress is kept as before");
+        let at = |field, k| field_values(&s.model, r, field, Pick { mode: 1, frame: Some(k) });
+        let e = at(Field::VonMises, 1).unwrap_err().to_string();
+        assert!(e.contains("not saved at nonlinear increment 1") && e.contains("output requests stress"), "{e}");
+        assert_eq!(at(Field::VonMises, 3).unwrap(), field_values(&s.model, r, Field::VonMises, Pick { mode: 1, frame: None }).unwrap());
+        let pressure = at(Field::ContactPressure, 1).unwrap().into_iter().filter(|x| x.is_finite()).fold(f64::NEG_INFINITY, f64::max);
+        assert!((pressure - 10.0e6 / 3.0).abs() < 1e-2 * 10.0e6, "{pressure}");
+        // results.xy plots the contact fields over the path, not the stresses.
+        let plottable = crate::cmd::xy::plottable(r);
+        assert!(plottable.contains(&Field::ContactPressure) && !plottable.iter().any(|f| f.is_stress()), "{plottable:?}");
+    }
+
+    /// Frames past the step's field cap keep displacements only: their stress and contact
+    /// contours are refused with the reason, never borrowed from the final state, while the
+    /// complete final frame keeps the final fields.
+    #[test]
+    fn frames_without_fields_do_not_borrow_final_stress() {
         let mut s = Session::default();
         cantilever(&mut s);
         s.run_script(&json!([
@@ -862,25 +953,30 @@ mod tests {
         ])).unwrap();
         let r = s.result("Large").unwrap();
         let Kind::Static(st) = r.kind() else { panic!() };
-        let last = st.nonlinear.as_ref().unwrap().frames.len() - 1;
-        for field in Field::ALL.into_iter().filter(|f| f.is_stress() || f.is_contact()) {
-            let e = field_values(&s.model, r, field, Pick { mode: 1, frame: Some(0) }).unwrap_err().to_string();
+        let mut bare = st.clone();
+        for f in &mut bare.nonlinear.as_mut().unwrap().frames {
+            f.stress.clear();
+            f.contacts.clear();
+        }
+        let last = bare.nonlinear.as_ref().unwrap().frames.len() - 1;
+        let bare = StepResult::Implicit(fieldcraft_solver::StepResult::Static(bare));
+        for field in Field::ALL.into_iter().filter(|f| f.is_stress()) {
+            let e = field_values(&s.model, &bare, field, Pick { mode: 1, frame: Some(0) }).unwrap_err().to_string();
             assert!(e.contains("not saved at nonlinear increment 0"), "{e}");
         }
-        assert!(field_values(&s.model, r, Field::Displacement, Pick { mode: 1, frame: Some(0) }).unwrap().iter().all(|v| *v == 0.0));
+        assert!(field_values(&s.model, &bare, Field::Displacement, Pick { mode: 1, frame: Some(0) }).unwrap().iter().all(|v| *v == 0.0));
         let final_values = field_values(&s.model, r, Field::VonMises, Pick { mode: 1, frame: None }).unwrap();
-        assert_eq!(field_values(&s.model, r, Field::VonMises, Pick { mode: 1, frame: Some(last) }).unwrap(), final_values);
-        let mut capped = st.clone();
+        assert_eq!(field_values(&s.model, &bare, Field::VonMises, Pick { mode: 1, frame: Some(last) }).unwrap(), final_values);
+        let Kind::Static(b) = bare.kind() else { panic!() };
+        let mut capped = b.clone();
         capped.nonlinear.as_mut().unwrap().frames.pop();
         let capped = StepResult::Implicit(fieldcraft_solver::StepResult::Static(capped));
         assert!(
             field_values(&s.model, &capped, Field::VonMises, Pick { mode: 1, frame: Some(last - 1) }).is_err(),
             "a truncated history's last frame is not the final state"
         );
-        s.execute("results.contour", &json!({"step": "Large", "field": "von_mises"})).unwrap();
-        let reply = s.execute("results.frame", &json!({"frame": 0})).unwrap();
-        assert!(reply["contour"].is_null());
-        assert!(reply["contour_unavailable"].as_str().unwrap().contains("not saved at nonlinear increment 0"));
+        // With its fields, frame 0 is the unloaded state.
+        assert!(field_values(&s.model, r, Field::VonMises, Pick { mode: 1, frame: Some(0) }).unwrap().iter().all(|v| *v == 0.0));
     }
 
     #[test]

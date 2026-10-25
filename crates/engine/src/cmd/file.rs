@@ -1336,7 +1336,11 @@ mod tests {
         let mut explicit = Session::default();
         crate::cmd::solve::tests::explicit_impact(&mut explicit);
         explicit.execute("solve.explicit", &json!({"step": "Impact"})).unwrap();
-        for (s, name) in [(&mut implicit, "cantilever"), (&mut fluid, "couette"), (&mut explicit, "impact")] {
+        // A nonlinear static step with contact: its frames keep stresses and contact states.
+        let mut contact = Session::default();
+        crate::cmd::solve::tests::pressed_blocks(&mut contact);
+        contact.execute("solve.nonlinear", &json!({"step": "Squeeze"})).unwrap();
+        for (s, name) in [(&mut implicit, "cantilever"), (&mut fluid, "couette"), (&mut explicit, "impact"), (&mut contact, "blocks")] {
             s.execute("file.save_as", &json!({"path": d.join(format!("{name}.fieldcraft"))})).unwrap();
         }
     }
@@ -1346,12 +1350,20 @@ mod tests {
     #[test]
     fn results_of_this_encoding_read_back() {
         let d = results_fixtures();
-        for (name, steps) in [("cantilever", &["Bend", "Modes"][..]), ("couette", &["Shear"]), ("impact", &["Impact"])] {
+        for (name, steps) in [("cantilever", &["Bend", "Modes"][..]), ("couette", &["Shear"]), ("impact", &["Impact"]), ("blocks", &["Squeeze"])] {
             let bytes = std::fs::read(d.join(format!("{name}.fieldcraft"))).unwrap();
             let file = fieldcraft_io::read(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
             assert!(file.results_note.is_none(), "{name}: {:?}", file.results_note);
             let read: Vec<&str> = file.results.iter().map(|r| r.result.step()).collect();
             assert_eq!(read, steps, "{name}");
+            for stored in &file.results {
+                if let fieldcraft_io::results::Solved::Implicit(fieldcraft_solver::StepResult::Static(r)) = &stored.result
+                    && let Some(h) = &r.nonlinear
+                {
+                    let fields = h.frames.iter().all(|f| f.has_stress() && f.contacts.len() == r.contacts.len());
+                    assert!(fields && !r.contacts.is_empty(), "{name}: every frame keeps its stress and contact state");
+                }
+            }
             let mut s = Session::default();
             s.execute("file.open", &json!({"path": d.join(format!("{name}.fieldcraft"))})).unwrap();
             assert_eq!(s.result_steps().count(), steps.len(), "{name}");

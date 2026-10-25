@@ -4,6 +4,7 @@
 //! (energies, momentum, constraint force, history nodes) against time. Read-only; with `path`
 //! the series is also written as a two-column CSV.
 
+use fieldcraft_solver::StaticResult;
 use serde_json::{Value, json};
 
 use super::opt;
@@ -125,7 +126,13 @@ fn node_label(y: &Value, key: &str) -> Result<u32> {
 pub fn plottable(r: &StepResult) -> Vec<Field> {
     let shapes = [Field::Displacement, Field::DisplacementX, Field::DisplacementY, Field::DisplacementZ];
     match r.kind() {
-        // Nonlinear frames hold displacements only; the other fields are the final state's.
+        // Nonlinear frames keep their stress (when the step's output requests it) and contact
+        // fields while the step had room for them: a field plots when every frame kept it.
+        Kind::Static(StaticResult { nonlinear: Some(h), .. }) => {
+            let stress = h.frames.iter().all(|f| f.has_stress());
+            let contact = h.frames.iter().all(|f| f.has_contacts());
+            shapes.into_iter().chain(Field::available(r).filter(|f| if f.is_stress() { stress } else { contact && f.is_contact() })).collect()
+        }
         Kind::Static(_) | Kind::Frequency(_) => shapes.to_vec(),
         Kind::Explicit(_) => Field::available(r).collect(),
         Kind::Heat(_) => vec![Field::Temperature],
@@ -579,8 +586,15 @@ mod tests {
         assert_eq!(lines.len(), x.len() + 1);
         assert_eq!(lines.last().unwrap().split(',').nth(1).unwrap().parse::<f64>().unwrap(), *y.last().unwrap());
         let _ = std::fs::remove_file(&path);
-        // Stresses are the final state's only; a linear step has one state.
-        assert!(s.execute("results.xy", &json!({"step": "Large", "y": {"field": "von_mises", "node": 11}})).is_err());
+        // Each frame keeps its own stress (#205): at this small load, the root's grows in
+        // proportion to the load factor from none.
+        let vm = values(&s.execute("results.xy", &json!({"step": "Large", "y": {"field": "von_mises", "node": 1}})).unwrap(), "y");
+        let end = *vm.last().unwrap();
+        assert!(vm[0] == 0.0 && end > 0.0 && vm.len() == x.len(), "{vm:?}");
+        for (l, v) in x.iter().zip(&vm) {
+            assert!((v - l * end).abs() < 1e-3 * end, "λ {l}: {v} against {}", l * end);
+        }
+        // A linear step has one state.
         assert!(s.execute("results.xy", &json!({"step": "Bend", "y": {"field": "displacement_z", "node": 11}})).is_err());
         assert!(s.execute("results.xy", &json!({"step": "Bend", "y": {"reaction": "root"}})).is_err());
         // The root's reaction balances the dead end load at every frame: proportional to λ.

@@ -44,7 +44,7 @@ pub const MODES: CommandSpec = CommandSpec {
 pub const ANIMATE: CommandSpec = CommandSpec {
     id: "results.animate",
     label: "Animate",
-    params: r#"{"on": true} — animates shape and contours: a mode swings through positive and negative amplitudes, a linear static result interpolates a proportional load from zero to full and back with a fixed legend; absolute temperatures are unchanged. Nonlinear steps play saved displacements (intermediate stress/contact fields were not saved); explicit or fluid steps play their recorded fields in order"#,
+    params: r#"{"on": true} — animates shape and contours: a mode swings through positive and negative amplitudes, a linear static result interpolates a proportional load from zero to full and back with a fixed legend; absolute temperatures are unchanged. Nonlinear steps play their converged increments, each with its own stress and contact fields; explicit or fluid steps play their recorded fields in order"#,
     form: Some(super::forms::ANIMATE),
     kind: CommandKind::Session,
     requires: &[Requirement::Result],
@@ -54,7 +54,7 @@ pub const ANIMATE: CommandSpec = CommandSpec {
 pub const FRAME: CommandSpec = CommandSpec {
     id: "results.frame",
     label: "Field Frame",
-    params: r#"{"step": "Impact", "frame": 3, "time": 0.002} — shows a field frame of a solved explicit or fluid step, by index from 0 or the frame nearest a time (neither: the last), or of a nonlinear static step (one per converged increment, `time` its load factor). The shape and recorded contours follow the frame; nonlinear intermediate stress/contact fields were not saved and are unavailable (final-state fields remain available at the complete final frame)"#,
+    params: r#"{"step": "Impact", "frame": 3, "time": 0.002} — shows a field frame of a solved explicit or fluid step, by index from 0 or the frame nearest a time (neither: the last), or of a nonlinear static step (one per converged increment, `time` its load factor). The shape and recorded contours follow the frame: a nonlinear frame's stresses and contact pressure, gap, status, shear and slip are those of its own converged increment (a frame keeps its stress only when the step's `output` requests stress, and frames past the step's field cap, 30 million values, keep displacements only, showing no stress or contact contours; the complete final frame always has the final fields)"#,
     form: Some(super::forms::FRAME),
     kind: CommandKind::Session,
     requires: &[Requirement::Result],
@@ -74,7 +74,7 @@ pub const REACTIONS: CommandSpec = CommandSpec {
 pub const EXPORT_VTU: CommandSpec = CommandSpec {
     id: "results.export.vtu",
     label: "Export VTU",
-    params: r#"{"step": "Load", "path": "out.vtu" | "out.pvd", "mode": 1, "frames": "all|last", "encoding": "ascii|binary"} — writes a solved step as VTK XML unstructured grids for ParaView: the mesh (points in node label order, cells in element label order, arrays `node_label` and `element_label`), the step's nodal fields as point data and per-element fields as cell data. Static: displacement, rotation (with shells or beams), reaction, stress (6 components in VTK order XX, YY, ZZ, XY, YZ, XZ), von_mises, temperature (coupled steps); nonlinear static: displacement per frame, the final fields on the last; frequency: mode_shape, with mode, frequency and eigenvalue as field data; explicit: displacement and velocity per frame, cell stress, plastic_strain, damage, eroded; heat: temperature per frame, heat_flux on the last. Point array `has_result` is 0 at nodes the step has no values for (written as 0, as are values that are not finite). A `.vtu` path writes one state (the last frame, or `mode`, default 1); a `.pvd` path writes every frame or mode (`frames: "last"` only the last) as `out_0000.vtu`, … beside it and the collection listing each with its time (load factor, mode number). `encoding` ascii (default) or binary (inline base64). Fluid steps are not supported yet. Replies {files, bytes, points, cells}"#,
+    params: r#"{"step": "Load", "path": "out.vtu" | "out.pvd", "mode": 1, "frames": "all|last", "encoding": "ascii|binary"} — writes a solved step as VTK XML unstructured grids for ParaView: the mesh (points in node label order, cells in element label order, arrays `node_label` and `element_label`), the step's nodal fields as point data and per-element fields as cell data. Static: displacement, rotation (with shells or beams), reaction, stress (6 components in VTK order XX, YY, ZZ, XY, YZ, XZ), von_mises, temperature (coupled steps); nonlinear static: displacement per frame, with stress and von_mises when the step's `output` requests stress, the final fields on the last; frequency: mode_shape, with mode, frequency and eigenvalue as field data; explicit: displacement and velocity per frame, cell stress, plastic_strain, damage, eroded; heat: temperature per frame, heat_flux on the last. Point array `has_result` is 0 at nodes the step has no values for (written as 0, as are values that are not finite). A `.vtu` path writes one state (the last frame, or `mode`, default 1); a `.pvd` path writes every frame or mode (`frames: "last"` only the last) as `out_0000.vtu`, … beside it and the collection listing each with its time (load factor, mode number). `encoding` ascii (default) or binary (inline base64). Fluid steps are not supported yet. Replies {files, bytes, points, cells}"#,
     form: Some(super::forms::EXPORT_VTU),
     kind: CommandKind::Session,
     requires: &[Requirement::Result],
@@ -935,24 +935,32 @@ fn vtu_fields(
     let time = match (r.kind(), state) {
         (Kind::Static(st), _) => {
             let frame = match (state, &st.nonlinear) {
-                (State::Frame(k), Some(h)) => h.frames.get(k).map(|f| (f.load_factor, f.displacement.as_slice(), k + 1 == h.frames.len())),
+                (State::Frame(k), Some(h)) => {
+                    h.frames.get(k).map(|f| (f.load_factor, f.displacement.as_slice(), k + 1 == h.frames.len(), f.stress.as_slice()))
+                }
                 _ => None,
             };
-            let (time, displacement, last) = frame.unwrap_or((0.0, st.displacement.as_slice(), true));
+            let (time, displacement, last, frame_stress) = frame.unwrap_or((0.0, st.displacement.as_slice(), true, &[]));
             add("displacement", point, 3, spread(nodes, &st.nodes, displacement), false);
             if last {
                 if !st.shells.is_empty() || !st.beams.is_empty() {
                     add("rotation", point, 3, spread(nodes, &st.nodes, &st.rotation), false);
                 }
                 add("reaction", point, 3, spread(nodes, &st.nodes, &st.reaction), false);
-                if !st.stress.is_empty() {
-                    let stress: Vec<[f64; 6]> = st.stress.iter().map(vtk_tensor).collect();
-                    add("stress", point, 6, spread(nodes, &st.nodes, &stress), false);
-                    add("von_mises", point, 1, spread(nodes, &st.nodes, &scalars(&st.von_mises)), false);
-                }
-                if let Some(t) = &st.temperature {
-                    add("temperature", point, 1, spread(nodes, &st.nodes, &scalars(t)), false);
-                }
+            }
+            // The final stress on the last state, a nonlinear frame's own before it (#205).
+            let (stress, von_mises) = if last {
+                (st.stress.as_slice(), std::borrow::Cow::Borrowed(st.von_mises.as_slice()))
+            } else {
+                (frame_stress, std::borrow::Cow::Owned(frame_stress.iter().map(fieldcraft_fem::von_mises).collect()))
+            };
+            if !stress.is_empty() {
+                let stress: Vec<[f64; 6]> = stress.iter().map(vtk_tensor).collect();
+                add("stress", point, 6, spread(nodes, &st.nodes, &stress), false);
+                add("von_mises", point, 1, spread(nodes, &st.nodes, &scalars(&von_mises)), false);
+            }
+            if let Some(t) = st.temperature.as_ref().filter(|_| last) {
+                add("temperature", point, 1, spread(nodes, &st.nodes, &scalars(t)), false);
             }
             if st.nonlinear.is_some() {
                 data.push(("load_factor", time));
@@ -1327,7 +1335,12 @@ mod tests {
         assert_eq!(reply["files"].as_array().unwrap().len(), h.frames.len() + 1);
         let first = std::fs::read_to_string(dir.join("large_0000.vtu")).unwrap();
         let last = std::fs::read_to_string(dir.join(format!("large_{:04}.vtu", h.frames.len() - 1))).unwrap();
-        assert!(first.contains("Name=\"displacement\"") && !first.contains("Name=\"stress\""), "final stresses on the last frame only");
+        assert!(first.contains("Name=\"displacement\"") && !first.contains("Name=\"reaction\""), "the final fields on the last frame only");
+        // Each frame's own stress (#205): none unloaded, the frame's at an increment.
+        assert!(vtu_array(&first, "von_mises").iter().all(|v| *v == 0.0));
+        let second = std::fs::read_to_string(dir.join("large_0001.vtu")).unwrap();
+        let largest = |xml: &str| vtu_array(xml, "von_mises").into_iter().fold(0.0, f64::max);
+        assert!(largest(&second) > 0.0 && largest(&second) < largest(&last), "{} of {}", largest(&second), largest(&last));
         assert!(last.contains("Name=\"stress\"") && last.contains("Name=\"von_mises\""));
         assert_eq!(vtu_array(&last, "load_factor"), [h.frames.last().unwrap().load_factor]);
 
