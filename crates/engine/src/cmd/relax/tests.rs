@@ -70,6 +70,15 @@ fn check_on_geometry(before: &Model, after: &Model) {
     }
 }
 
+/// The region's smallest scaled Jacobian is no worse after a guarded relaxation: each kept step
+/// may give up round-off ([`relax::ROUND_OFF`], #612): at most two steps (Laplacian and
+/// optimisation) per node moved and sweep.
+fn no_worse(r: &Value) -> bool {
+    let at = |k: &str| r[k]["min_scaled_jacobian"].as_f64().unwrap();
+    let steps = (2 * r["moved"].as_u64().unwrap() * r["iterations"].as_u64().unwrap()) as f64;
+    at("after") >= at("before") - relax::ROUND_OFF * steps
+}
+
 fn invalid(s: &mut Session) -> u64 {
     s.execute("mesh.quality", &json!({})).unwrap()["invalid"]["count"].as_u64().unwrap_or(0)
 }
@@ -131,7 +140,7 @@ fn tet10_relaxes_with_curved_mid_side_nodes_on_the_hole() {
     }
     let perturbed = s.model.clone();
     let r = s.execute("mesh.node.relax", &json!({"center": ON_HOLE, "radius": 4.0, "iterations": 8})).unwrap();
-    assert!(r["after"]["min_scaled_jacobian"].as_f64().unwrap() >= r["before"]["min_scaled_jacobian"].as_f64().unwrap(), "{r}");
+    assert!(no_worse(&r), "{r}");
     assert_eq!(r["after"]["invalid"], 0, "{r}");
     check_on_geometry(&mm(&perturbed), &mm(&s.model));
 }
@@ -176,7 +185,7 @@ fn a_kept_field_is_applied_again_after_a_remesh() {
     assert!(r["summary"].as_str().unwrap().contains("Spike"));
     let worst = s.execute("mesh.quality", &json!({})).unwrap()["metrics"]["scaled_jacobian"]["worst"].as_u64().unwrap();
     let r = s.execute("mesh.node.relax", &json!({"around_element": worst})).unwrap();
-    assert!(r["after"]["min_scaled_jacobian"].as_f64() >= r["before"]["min_scaled_jacobian"].as_f64(), "{r}");
+    assert!(no_worse(&r), "{r}");
 }
 
 #[test]

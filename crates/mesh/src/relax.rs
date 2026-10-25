@@ -24,7 +24,8 @@
 //! [`crate::quality::element_quality`]; a solid is valid when its certified Jacobian check is,
 //! a shell when its normal keeps its side. So no move inverts an element, and none makes the
 //! worst element around a node worse, and none makes an element's edge ratio exceed the
-//! region's largest before the relaxation.
+//! region's largest before the relaxation, by more than round-off ([`ROUND_OFF`]: compared
+//! exactly, the guards made the result jump under a 1-ulp change of its input).
 //!
 //! **Constraints** ([`Freedom`]): an interior node moves freely; a node on a geometry face moves
 //! in the face's parameters and is evaluated back on it ([`Constraints::slide_face`]); a node on a
@@ -42,6 +43,10 @@ use crate::{Error, Result};
 
 /// Qualities this close are equal.
 const SAME_QUALITY: f64 = 1e-9; // unit-factors: a difference of qualities
+/// Qualities this close, and edge ratios and moves this close relative to their size, differ by
+/// round-off alone (unlike [`SAME_QUALITY`], the gain a step must make): every guard allows it, so
+/// a 1-ulp change of the input does not flip a decision (#612).
+pub const ROUND_OFF: f64 = 1e-12; // unit-factors: a difference of qualities, or a relative one
 /// The difference step in an element's parameters.
 const STEP: f64 = 1e-3; // unit-factors: a step in an element's parameters
 
@@ -397,7 +402,7 @@ impl State<'_> {
         for &i in self.around.get(&n)? {
             let Some(e) = self.elems.get(i) else { continue };
             let (q, _) = measure(e, &self.coords(e));
-            if best.is_none_or(|(_, b)| q < b) {
+            if best.is_none_or(|(_, b)| q < b - ROUND_OFF) {
                 best = Some((i, q));
             }
         }
@@ -432,16 +437,20 @@ impl State<'_> {
     }
 
     /// Try moving `n` by `d` (under its freedom): kept when no valid element around it becomes
-    /// invalid and its worst quality does not drop (rises by more than `gain`).
-    fn attempt(&mut self, n: u32, freedom: Freedom, d: P, before: &(f64, Vec<bool>), gain: f64) -> bool {
+    /// invalid and its worst quality does not drop (rises by more than `gain`), within
+    /// [`ROUND_OFF`]; `h` is the length of the element edges at `n` ([`Self::local_length`]).
+    fn attempt(&mut self, n: u32, freedom: Freedom, d: P, before: &(f64, Vec<bool>), gain: f64, h: f64) -> bool {
         let p = self.at(n);
         let Some(q) = self.moved(freedom, p, d) else { return false };
-        if dist(p, q) == 0.0 {
+        // A move of round-off size is none: whether it happens must not decide another sweep.
+        if dist(p, q) <= ROUND_OFF * h {
             return false;
         }
         let undo = self.place(n, q);
         let (worst, valid) = self.local(n);
-        let ok = worst >= before.0 + gain && before.1.iter().zip(&valid).all(|(was, is)| !was || *is) && self.local_ratio(n) <= self.ratio_cap;
+        let ok = worst >= before.0 + gain - ROUND_OFF
+            && before.1.iter().zip(&valid).all(|(was, is)| !was || *is)
+            && self.local_ratio(n) <= self.ratio_cap * (1.0 + ROUND_OFF);
         if !ok {
             self.restore(undo);
         }
@@ -469,9 +478,10 @@ impl State<'_> {
         if !nb.is_empty() {
             let centroid = scale(nb.iter().fold([0.0; 3], |s, &m| add(s, self.at(m))), 1.0 / nb.len() as f64);
             let before = self.local(n);
+            let h = self.local_length(n);
             let mut d = scale(sub(centroid, p), w);
             for _ in 0..4 {
-                if self.attempt(n, freedom, d, &before, 0.0) {
+                if self.attempt(n, freedom, d, &before, 0.0, h) {
                     moved = true;
                     break;
                 }
@@ -511,7 +521,7 @@ impl State<'_> {
         let before = self.local(n);
         let mut step = 0.25 * w * h;
         for _ in 0..5 {
-            if self.attempt(n, freedom, scale(grad, step / g), &before, SAME_QUALITY) {
+            if self.attempt(n, freedom, scale(grad, step / g), &before, SAME_QUALITY, h) {
                 return true;
             }
             step *= 0.5;

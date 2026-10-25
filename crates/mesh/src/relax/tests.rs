@@ -601,3 +601,38 @@ fn hostile_move_parameters_are_refused() {
     let near = |r: f64| moving::nearest_within(&[[-1e300, 0.0, 0.0]], &BTreeMap::from([(1, [1e300, 0.0, 0.0])]), r);
     assert!(near(1e-300).is_empty() && near(1.0).is_empty());
 }
+
+/// `m` through millimetres → metres → millimetres: 1 ulp off for some coordinates (#612).
+fn round_trip(m: &Model) -> Model {
+    let mut out = m.clone();
+    for (n, p) in m.nodes() {
+        out.set_node(*n, p.xyz.map(|x| (x * 1e-3) * 1e3)).unwrap();
+    }
+    out
+}
+
+/// The largest distance between the nodes of `a` and `b`.
+fn largest_difference(a: &Model, b: &Model) -> f64 {
+    a.nodes().iter().map(|(n, p)| dist(p.xyz, b.node(*n).unwrap().xyz)).fold(0.0, f64::max)
+}
+
+/// A 1-ulp change of the input (millimetres through metres and back) moves the guarded
+/// relaxation's result by round-off, not by a different path (#612: the guards compared
+/// qualities exactly, and a step kept on one side of a tie and halved on the other moved nodes by
+/// up to 9e-2 here, a fraction of an edge of 0.17–0.26). The differences left are a few hundred
+/// ulps of the coordinates (≤ 3e-10 seen); 1e-8 is far below any real path change.
+#[test]
+fn guarded_relaxation_is_stable_under_round_off() {
+    for (n, amount) in [(6, 0.03), (8, 0.06)] {
+        let (original, m) = distorted_annulus(n, amount);
+        let b = round_trip(&m);
+        assert!(m.nodes().iter().any(|(l, p)| b.node(*l).unwrap().xyz != p.xyz), "the round trip changes some coordinates");
+        let geo = Geo { model: original.clone() };
+        let all: BTreeSet<u32> = m.nodes().keys().copied().collect();
+        let w = uniform_weights(&m, &all, 1.0).unwrap();
+        let (ra, rb) = (relax(&m, &w, 5, &geo).unwrap(), relax(&b, &w, 5, &geo).unwrap());
+        assert!(ra.moved > 0 && ra.after.min_quality > ra.before.min_quality + 0.1, "{:?} → {:?}", ra.before, ra.after);
+        let d = largest_difference(&applied(&m, &ra), &applied(&b, &rb));
+        assert!(d < 1e-8, "n {n}: a 1-ulp input change moved a node by {d:e}");
+    }
+}
