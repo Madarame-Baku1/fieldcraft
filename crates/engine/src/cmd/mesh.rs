@@ -138,7 +138,7 @@ pub const SURFACE_CHECK: CommandSpec = CommandSpec {
 pub const TET_GENERATE: CommandSpec = CommandSpec {
     id: "mesh.tet.generate",
     label: "Generate Tet Mesh",
-    params: r#"{"body": "Body1" (default: every body of the open design) or "surface": 0 (an imported surface), "tolerance": 0.05 (chordal tolerance of the tessellation, a length; default 1e-3 of the body's bounding-box diagonal), "weld": 1e-9 (fraction of the bounding-box diagonal, 0 or 1e-15..=1e-3), "weld_distance": length (default the surface's own: twice the kernel linear tolerance for a design body, 0 for an imported surface; the larger of this and weld times the diagonal is used), "feature_angle": 45 (degrees), optional "size": length (target edge length; default a twentieth of the bounding-box diagonal), "order": "linear" | "quadratic" (tet4 or tet10; quadratic mid-edge nodes lie on the B-rep faces), "quality": true (false: the raw constrained Delaunay tetrahedralization), "quality_target": 40 (degrees: tetrahedra whose smallest dihedral-angle sine is at least sin of this are left alone by improvement, 5..=60), "curvature_angle": 22.5 (degrees per element along curved boundary, 0 for none, at most 90), "grading": 0.3 (largest size change per unit length, 0.05..=2; default the model's growth rate, mesh.size.growth), "max_passes": 20 (improvement passes, 0..=200), "max_points": 1000000 (1..=20000000), "max_steiner": 50000 (0..=10000000), "max_tets": 5000000 (1..=50000000) — the constrained Delaunay tetrahedralization of the welded boundary (every boundary triangle a union of tet faces), refined to the size field with its boundary vertices on the B-rep faces, smoothed and improved (Delaunay refinement, ODT smoothing, Klingner–Shewchuk improvement), with a quality report. Replaces the mesh of each body it meshes (its elements and the nodes only they use; other bodies' meshes stay; the reply's `replaced`, `stale_sets` and `results_cleared` say what went), adds the elements and their nodes (labels after the largest existing ones), tags the elements with the body and each boundary element face with its geometry face, and fails, changing nothing, if a surface is invalid or a mesh does not pass the validity gate. An open-edge failure suggests mesh.surface.check and an explicit weld_distance or weld only for a confirmed small seam: keep it below features to preserve; the default does not cover every boolean retry displacement, and welding does not repair inconsistent face orientation. Edge seeds (mesh.seed.edge) divide their edges at the seeded nodes, and the size field grades from them; size controls (mesh.size.set) refine it, graded at the model's growth rate (mesh.size.growth) unless `grading` is given. Reports the totals and, under `bodies`, each body's counts, size, quality report and `seeds` (per seeded edge, the mesh edges along it)"#,
+    params: r#"{"body": "Body1" (default: every body of the open design) or "surface": 0 (an imported surface), "tolerance": 0.05 (chordal tolerance of the tessellation, a length; default 1e-3 of the body's bounding-box diagonal), "weld": 1e-9 (fraction of the bounding-box diagonal, 0 or 1e-15..=1e-3), "weld_distance": length (default the surface's own: twice the kernel linear tolerance for a design body, 0 for an imported surface; the larger of this and weld times the diagonal is used), "feature_angle": 45 (degrees), optional "size": length (target edge length; default a twentieth of the bounding-box diagonal), "order": "linear" | "quadratic" (tet4 or tet10; quadratic mid-edge nodes lie on the B-rep faces), "quality": true (false: the raw constrained Delaunay tetrahedralization), "quality_target": 40 (degrees: tetrahedra whose smallest dihedral-angle sine is at least sin of this are left alone by improvement, 5..=60), "curvature_angle": 22.5 (degrees per element along curved boundary, 0 for none, at most 90), "grading": 0.3 (largest size change per unit length, 0.05..=2; default the model's growth rate, mesh.size.growth), "max_passes": 20 (improvement passes, 0..=200), "max_points": 1000000 (1..=20000000), "max_steiner": 50000 (0..=10000000), "max_tets": 5000000 (1..=50000000) — the constrained Delaunay tetrahedralization of the welded boundary (every boundary triangle a union of tet faces), refined to the size field with its boundary vertices on the B-rep faces, smoothed and improved (Delaunay refinement, ODT smoothing, Klingner–Shewchuk improvement), with a quality report. Replaces the mesh of each body it meshes (its elements and the nodes only they use; other bodies' meshes stay; the reply's `replaced`, `stale_sets` and `results_cleared` say what went), adds the elements and their nodes (labels after the largest existing ones), tags the elements with the body and each boundary element face with its geometry face, and fails, changing nothing, if a surface is invalid or a mesh does not pass the validity gate. An open-edge failure suggests mesh.surface.check and an explicit weld_distance or weld only for a confirmed small seam: keep it below features to preserve; the default does not cover every boolean retry displacement, and welding does not repair inconsistent face orientation. Edge seeds (mesh.seed.edge) divide their edges at the seeded nodes, and the size field grades from them; size controls (mesh.size.set) refine it, graded at the model's growth rate (mesh.size.growth) unless `grading` is given. Reports the totals and, under `bodies`, each body's counts, size, quality report (its `unsnapped` counts the boundary nodes left off their exact face or curve, where moving one would spoil an element, and `snap_gap` is the furthest of them) and `seeds` (per seeded edge, the mesh edges along it)"#,
     form: Some(super::forms::TET),
     kind: CommandKind::Model,
     requires: &[Requirement::Geometry],
@@ -382,6 +382,8 @@ fn tet_generate(s: &mut Session, p: &Value) -> Result<Value> {
                 "odt_moves": r.odt_moves,
                 "improvement": {"passes": r.improve.passes, "smoothed": r.improve.smoothed, "topological": r.improve.topological, "inserted": r.improve.inserted},
                 "straightened": r.straightened,
+                "unsnapped": r.unsnapped,
+                "snap_gap": r.snap_gap,
                 "stopped": r.stopped,
             },
             "seeds": r.seeds.iter().map(|(name, count, edges)| json!({"edge": name, "count": count, "mesh_edges": edges})).collect::<Vec<_>>(),
@@ -1331,6 +1333,7 @@ mod tests {
         assert!(q["mesh"]["min_dihedral"].as_f64().unwrap() > 15.0, "{r}");
         assert!(q["mesh"]["max_dihedral"].as_f64().unwrap() < 165.0, "{r}");
         assert!(q["cdt"]["slivers"].as_u64().unwrap() > 0, "{r}");
+        assert_eq!((&q["unsnapped"], &q["snap_gap"]), (&json!(0), &json!(0.0)), "every boundary node is on its face or curve: {r}");
         // The mesh fills what its boundary encloses, which is the plate within the chordal error.
         let (volume, boundary) = (r["volume"].as_f64().unwrap(), r["boundary_volume"].as_f64().unwrap());
         assert!((volume - boundary).abs() <= 1e-9 * boundary, "{r}");
@@ -1530,5 +1533,67 @@ mod tests {
             assert!(edges.len() >= 5 && edges.iter().all(|e| names.iter().any(|n| n == e)), "{face}: {edges:?}");
         }
         assert_eq!(meshed, 2, "the top and bottom faces are flat and parallel to XY; the sides and hole are not");
+    }
+}
+
+/// #674: the nodes refinement adds on a small fillet and the bore below it lie on the exact
+/// torus and cylinder, not on the tessellation's facets (0.0155 and 0.0217 mm off at the 95th
+/// percentile before). Takes about half a minute in release.
+#[cfg(test)]
+mod boundary_on_the_geometry {
+    use serde_json::json;
+
+    use crate::Session;
+
+    #[test]
+    #[ignore = "heavy: cargo xtask test --heavy (CI heavy job)"]
+    fn refinement_below_the_facets_keeps_a_fillets_nodes_on_its_torus() {
+        let script = json!([
+            {"command": "solid.box", "params": {"corner": [0, 0, 0], "length": 30, "width": 30, "height": 10, "body_name": "Block"}},
+            {"command": "solid.cylinder", "params": {"diameter": 10, "height": 10, "base": [15, 15, 0], "axis": "Z", "operation": "cut", "targets": ["Block"]}},
+            {"command": "solid.fillet", "params": {"edges": [[20, 15, 10]], "radius": 0.3}}
+        ]);
+        let bytes = fieldcraft_geometry::script_design(&script.to_string()).unwrap();
+        let (_dir, path) = crate::tests::design_file(&bytes);
+        let mut s = Session::default();
+        s.execute("geometry.open", &json!({"path": path})).unwrap();
+        s.execute("mesh.size.set", &json!({"name": "Round", "size": 0.06, "sphere": {"center": [20.3, 15, 9.7], "radius": 1}})).unwrap();
+        let r = s.execute("mesh.tet.generate", &json!({"tolerance": 0.05, "size": 2, "order": "quadratic"})).unwrap();
+        let q = &r["bodies"][0]["quality"];
+        // In millimetres (the session's default display).
+        let (unsnapped, snap_gap) = (q["unsnapped"].as_u64().unwrap(), q["snap_gap"].as_f64().unwrap());
+        assert!(unsnapped < 50 && snap_gap < 0.02, "{q}");
+
+        // Every node of a boundary element face, mid-side nodes included, within 1 mm of the
+        // size control's centre: its distance from the torus (centre circle radius 5.3 at
+        // z = 9.7, tube 0.3) or the bore (radius 5).
+        let mut skin = std::collections::BTreeSet::new();
+        for f in s.model.skin_faces() {
+            skin.extend(s.model.face_nodes(f).unwrap());
+        }
+        let (mut torus, mut bore) = (Vec::new(), Vec::new());
+        for n in skin {
+            let p = crate::units::to_geometry_point(s.model.node(n).unwrap().xyz);
+            let rho = (p[0] - 15.0).hypot(p[1] - 15.0);
+            if (p[0] - 20.3).hypot(p[1] - 15.0).hypot(p[2] - 9.7) > 1.0 {
+                continue;
+            }
+            if p[2] > 9.7 - 1e-9 && (5.0 - 1e-9..5.3 + 1e-9).contains(&rho) {
+                torus.push(((rho - 5.3).hypot(p[2] - 9.7) - 0.3).abs());
+            } else if (rho - 5.0).abs() < 0.1 && p[2] < 9.7 + 1e-9 {
+                bore.push((rho - 5.0).abs());
+            }
+        }
+        // The 95th percentile separates before from after on both. The furthest node, one the
+        // snap could not move all the way without spoiling an element, is 0.0098 mm off the
+        // torus and 0.0179 mm off the bore (0.0178 and 0.0275 mm before), so each bound fails
+        // on the old mesh too.
+        for (name, mut d, most) in [("torus", torus, 0.012), ("bore", bore, 0.02)] {
+            d.sort_by(f64::total_cmp);
+            assert!(d.len() > 200, "{name}: {} nodes", d.len());
+            let (p95, max) = (d[d.len() * 95 / 100], d[d.len() - 1]);
+            assert!(p95 < 1e-9, "{name}: 95th percentile {p95} mm off");
+            assert!(max < most, "{name}: a node {max} mm off");
+        }
     }
 }
