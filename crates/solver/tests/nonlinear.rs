@@ -337,6 +337,56 @@ fn small_loads_and_small_kinematics_give_the_linear_solution() {
     }
 }
 
+/// Loads with their own load paths: a force held after the first half of the step while a
+/// pressure waits for it and then grows. Small kinematics and a linear material, so every frame
+/// is the linear solution of that frame's loads; the paths' points end increments. Load paths
+/// of follower pressures are refused by name.
+#[test]
+fn loads_follow_their_own_load_paths() {
+    let build = |push: f64, press: f64, paths: bool| {
+        let mut g = grid([6, 1, 2], ElementKind::Hex20, |q| [6.0 * q[0], q[1], q[2]]);
+        let step = NonlinearStatic { nonlinear_geometry: false, initial_increment: 0.2, max_increment: 0.2, ..NonlinearStatic::default() };
+        g.define(iso(1000.0, 0.3), None, full(), if paths { Procedure::NonlinearStatic(step.clone()) } else { Procedure::Static {} });
+        g.fixed("root", |q| near(q[0], 0.0));
+        g.face_set("tip", |q| near(q[0], 1.0));
+        g.load("push", Load::Force { target: Target::Set("tip".into()), vector: [0.0, 0.0, -push], distribution: Distribution::Total });
+        g.face_set("top", |q| near(q[2], 1.0));
+        g.load("press", Load::Pressure { set: "top".into(), magnitude: press });
+        if paths {
+            let mut s = g.model.step("Step").unwrap().clone();
+            let load_paths = [("push", vec![[0.0, 0.0], [0.5, 1.0], [1.0, 1.0]]), ("press", vec![[0.0, 0.0], [0.5, 0.0], [1.0, 1.0]])];
+            s.procedure =
+                Procedure::NonlinearStatic(NonlinearStatic { load_paths: load_paths.into_iter().map(|(n, p)| (n.to_string(), p)).collect(), ..step });
+            g.model.replace_step(s).unwrap();
+        }
+        g
+    };
+    // The linear solutions of each load alone (a tiny other one), superposed per frame.
+    let linear = |push: f64, press: f64| solve_static(&build(push, press, false).model, None, &Limits::default()).unwrap().displacement;
+    let (push, press) = (linear(1e-3, 1e-12), linear(1e-12, 1e-4));
+    let r = solve(&build(1e-3, 1e-4, true));
+    let h = r.nonlinear.as_ref().unwrap();
+    let factors: Vec<f64> = h.frames.iter().map(|f| f.load_factor).collect();
+    assert!(factors.iter().any(|f| (f - 0.5).abs() < 1e-12), "an increment ends at the paths' turn: {factors:?}");
+    let scale = push.iter().chain(&press).fold(0.0f64, |m, u| m.max(u[2].abs()));
+    for frame in &h.frames {
+        let t = frame.load_factor;
+        let (a, b) = ((2.0 * t).min(1.0), (2.0 * t - 1.0).max(0.0));
+        for ((u, p), q) in frame.displacement.iter().zip(&push).zip(&press) {
+            assert!((0..3).all(|k| (u[k] - a * p[k] - b * q[k]).abs() < 1e-6 * scale), "at {t}: {u:?} vs {a} {p:?} + {b} {q:?}");
+        }
+    }
+    // A follower pressure (nonlinear geometry) takes no path of its own.
+    let mut g = build(1e-3, 1e-4, true);
+    let mut s = g.model.step("Step").unwrap().clone();
+    if let Procedure::NonlinearStatic(n) = &mut s.procedure {
+        n.nonlinear_geometry = true;
+    }
+    g.model.replace_step(s).unwrap();
+    let err = solve_nonlinear(&g.model, Some("Step"), &Limits::default()).unwrap_err().to_string();
+    assert!(err.contains("follower pressure") && err.contains("`press`"), "{err}");
+}
+
 /// Hostile and impossible input: the step's controls are refused when defined; an element
 /// that inverts makes the step cut back and stop at the minimum increment with the element
 /// named; the caps stop a step; unsupported elements and loads are refused by name.

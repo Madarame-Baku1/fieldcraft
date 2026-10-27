@@ -60,6 +60,7 @@ fn with_run<T>(model: &Model, f: impl FnOnce(&mut Run<'_>) -> T) -> T {
         mesh: &mesh,
         red: &red,
         dead: loads(model, &resolved, &mesh, step, &red.active).unwrap(),
+        scheduled: Vec::new(),
         followers: Vec::new(),
         springs: None,
         finite: false,

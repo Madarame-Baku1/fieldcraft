@@ -5,7 +5,9 @@
 //! gravity, body forces; pressure too without nonlinear geometry) are λ times their values, a
 //! follower pressure λ p on the deformed faces, and every prescribed displacement λ times its
 //! value (u = T_f q + λ T_p u_p, the constraint elimination of the linear solver,
-//! [`crate::constraints`]).
+//! [`crate::constraints`]). λ follows the step fraction t, or the step's load path λ(t). A load
+//! with its own load path (`NonlinearStatic::load_paths`) is λ_i(t) times its value instead,
+//! while the rest ramp with λ = t: a preload held while a service load grows is one step.
 //!
 //! **Newton–Raphson** with the full consistent tangent, refactored every iteration (Bathe
 //! 2014, §8.4; M. A. Crisfield, *Non-linear Finite Element Analysis of Solids and Structures*,
@@ -120,6 +122,7 @@ use fieldcraft_fem::finite::{Kinematics, Temperature};
 use fieldcraft_fem::plane::Theory;
 use fieldcraft_fem::quadrature::Rule;
 use fieldcraft_fem::{DofKind, DofSet, ElementType, PointStress, face, von_mises};
+use fieldcraft_model::fluid_zones::curve_value;
 use fieldcraft_model::{
     ArcConstraint, ArcLength, BoundaryCondition, Extent, Hardening, Imperfection, Load, Model, NonlinearStatic, Plastic, Procedure, SectionKind, Step,
 };
@@ -299,6 +302,8 @@ struct Problem<'a> {
     red: &'a Reduction,
     /// Dead loads at λ = 1.
     dead: Vec<f64>,
+    /// The dead loads with their own load path: their nonzero forces at factor 1.
+    scheduled: Vec<Scheduled>,
     followers: Vec<Follower>,
     /// Springs (linear along their fixed directions), on the pattern.
     springs: Option<Csr>,
@@ -318,6 +323,13 @@ struct Problem<'a> {
     graph: NodeGraph,
     /// The contact pairs ([`crate::contact`]).
     contacts: Vec<Interface>,
+}
+
+/// A dead load with its own load path: the path and its nonzero forces at factor 1, by degree
+/// of freedom.
+struct Scheduled {
+    path: Vec<[f64; 2]>,
+    force: Vec<(usize, f64)>,
 }
 
 /// The internal and external forces at a state, and the tangent when asked for.
@@ -543,6 +555,15 @@ impl Problem<'_> {
             }
         }
         let mut external: Vec<f64> = self.dead.iter().map(|f| lambda * f).collect();
+        // With scheduled loads the step has no load path of its own, so λ is the step fraction.
+        for s in &self.scheduled {
+            let factor = curve_value(&s.path, lambda);
+            for (d, v) in &s.force {
+                if let Some(x) = external.get_mut(*d) {
+                    *x += factor * v;
+                }
+            }
+        }
         for f in &self.followers {
             let (force, kl) = self.follower(f, u, lambda)?;
             for (d, v) in f.dofs.iter().zip(&force) {
@@ -1163,6 +1184,39 @@ fn temperatures(model: &Model, resolved: &fieldcraft_model::Resolved, mesh: &Mes
     }
 }
 
+/// The loads with their own load path, each assembled alone, and `dead` (the step's dead
+/// loads) without them. Temperature and heat loads (their field ramps with the step) and
+/// follower pressures are refused with a load path.
+fn scheduled(
+    model: &Model,
+    resolved: &fieldcraft_model::Resolved,
+    mesh: &Mesh,
+    step: &Step,
+    settings: &NonlinearStatic,
+    mut dead: Step,
+    active: &[bool],
+) -> Result<(Vec<Scheduled>, Step)> {
+    let mut out = Vec::with_capacity(settings.load_paths.len());
+    let mut alone = step.clone();
+    for (name, path) in &settings.load_paths {
+        let load = model.load(name).ok_or_else(|| Error::Invalid(format!("load `{name}` is missing")))?;
+        let refused = match load {
+            Load::Temperature { .. } => Some("a temperature load (the step's temperature field ramps as a whole)"),
+            l if l.is_thermal() => Some("a heat load (the step's temperature field ramps as a whole)"),
+            Load::Pressure { .. } if settings.nonlinear_geometry => Some("a follower pressure"),
+            _ => None,
+        };
+        if let Some(what) = refused {
+            return Err(Error::NotSupported(format!("a load path of its own for {what} (load `{name}`, step `{}`)", step.name)));
+        }
+        dead.loads.remove(name);
+        alone.loads = std::iter::once(name.clone()).collect();
+        let force = loads(model, resolved, mesh, &alone, active)?.into_iter().enumerate().filter(|(_, v)| *v != 0.0).collect();
+        out.push(Scheduled { path: path.clone(), force });
+    }
+    Ok((out, dead))
+}
+
 /// The follower pressures of a step (with nonlinear geometry), and the step without them for
 /// the dead loads.
 fn followers(model: &Model, resolved: &fieldcraft_model::Resolved, mesh: &Mesh, step: &Step) -> Result<(Vec<Follower>, Step)> {
@@ -1265,6 +1319,7 @@ fn solve_on(model: &Model, step: &str, limits: &Limits, notes: Vec<String>) -> R
     }
     let (follower_loads, dead_step) =
         if settings.nonlinear_geometry { followers(model, &resolved, &mesh, step)? } else { (Vec::new(), step.clone()) };
+    let (scheduled, dead_step) = scheduled(model, &resolved, &mesh, step, settings, dead_step, &red.active)?;
     let dead = loads(model, &resolved, &mesh, &dead_step, &red.active)?;
     let field = temperatures(model, &resolved, &mesh, step, limits)?;
     let springs = if mesh.discrete.springs.iter().any(|s| !s.dashpot) {
@@ -1288,6 +1343,7 @@ fn solve_on(model: &Model, step: &str, limits: &Limits, notes: Vec<String>) -> R
         mesh: &mesh,
         red: &red,
         dead,
+        scheduled,
         followers: follower_loads,
         springs,
         finite: settings.nonlinear_geometry,
@@ -1437,7 +1493,9 @@ fn solve_on(model: &Model, step: &str, limits: &Limits, notes: Vec<String>) -> R
             }
             match solved {
                 Ok(c) => {
-                    previous = Some((c.q.iter().zip(&q).map(|(a, b)| a - b).collect(), change));
+                    // Loads with their own paths turn at their points independently: no
+                    // extrapolation across one.
+                    previous = (settings.load_paths.is_empty() || target != turn).then(|| (c.q.iter().zip(&q).map(|(a, b)| a - b).collect(), change));
                     // The increment's own Newton iterations size the next one (augmentations
                     // solve the same increment again).
                     let count = iterations.iter().filter(|i| i.augmentation == 0).count();
