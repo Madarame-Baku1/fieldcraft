@@ -57,7 +57,7 @@
 //!   loads alone, so the two agree. A plastic material's state depends on the path, so a deck
 //!   with nonlinear steps, a plastic material and more than one general step is refused, as is
 //!   a nonlinear step's load path (an amplitude on every load and boundary condition, not
-//!   written yet).
+//!   written yet) and a load's own load path (an amplitude on the load, not written yet).
 //!
 //! # Loads
 //!
@@ -343,13 +343,16 @@ fn check_expressible(model: &Model) -> Result<()> {
         }
     }
     for step in model.steps() {
-        if let Procedure::NonlinearStatic(n) = &step.procedure
-            && n.load_path.is_some()
-        {
-            bad.insert(format!(
-                "step `{}`: a load path (it would be an amplitude on every load and boundary condition of the step; not written yet)",
-                step.name
-            ));
+        if let Procedure::NonlinearStatic(n) = &step.procedure {
+            if n.load_path.is_some() {
+                bad.insert(format!(
+                    "step `{}`: a load path (it would be an amplitude on every load and boundary condition of the step; not written yet)",
+                    step.name
+                ));
+            }
+            if let Some(load) = n.load_paths.keys().next() {
+                bad.insert(format!("step `{}`: load `{load}`'s own load path (it would be an amplitude on the load; not written yet)", step.name));
+            }
         }
     }
     let general = model.steps().iter().filter(|s| matches!(s.procedure, Procedure::Static {} | Procedure::NonlinearStatic(_))).count();

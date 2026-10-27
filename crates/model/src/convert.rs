@@ -389,6 +389,7 @@ impl Quantities for Step {
                     tolerances: _,
                     line_search: _,
                     load_path: _,
+                    load_paths: _,
                     imperfection,
                     arc_length,
                 } = n;

@@ -775,6 +775,10 @@ fn nonlinear_static_steps() {
         .map(|l| l.split_whitespace().map(|v| v.parse().unwrap()).collect())
         .collect();
     assert_eq!(curve, [vec![0.0, 0.0], vec![0.5, 1.0], vec![1.0, -1.0]], "{deck}");
+    // A load's own load path is not written yet.
+    let own = NonlinearStatic { load_paths: [("tip_load".to_string(), vec![[0.0, 0.0], [1.0, 1.0]])].into(), ..controls.clone() };
+    m.replace_step(step("Bend", Procedure::NonlinearStatic(own), &["clamp"], &["tip_load"])).unwrap();
+    unsupported(&m, "step `Bend`: load `tip_load`'s own load path");
 
     m.replace_step(step("Bend", Procedure::NonlinearStatic(NonlinearStatic { nonlinear_geometry: false, ..controls }), &["clamp"], &["tip_load"]))
         .unwrap();

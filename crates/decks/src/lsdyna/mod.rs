@@ -37,8 +37,8 @@
 //!   solver with a stiffness reformation every iteration (`ilimit` 1, full Newton) and its
 //!   iteration cap as `maxref`, and `*CONTROL_IMPLICIT_AUTO` with its minimum and maximum
 //!   increments (its increment cap and tolerances have no LS-DYNA counterpart and are left to
-//!   LS-DYNA's defaults; a step without nonlinear geometry and hyperelastic materials in nonlinear
-//!   steps are refused); boundary conditions
+//!   LS-DYNA's defaults; a step without nonlinear geometry, hyperelastic materials in nonlinear
+//!   steps and loads with their own load paths are refused); boundary conditions
 //!   as `*BOUNDARY_SPC_*_ID` (named) and `*BOUNDARY_PRESCRIBED_MOTION_*_ID` for non-zero
 //!   displacements, a symmetry plane not normal to X, Y or Z as `*BOUNDARY_SPC_*_ID` in a
 //!   `*DEFINE_COORDINATE_SYSTEM` whose x axis is the plane's normal; forces, moments and tractions as `*LOAD_NODE_SET`/`_POINT` from the
@@ -308,6 +308,9 @@ fn plan<'a>(model: &'a Model, r: &Resolved) -> Result<Plan<'a>> {
             refused.insert(format!("step `{}`: explicit dynamic steps (this writer writes implicit analyses so far)", step.name));
         }
         if let Procedure::NonlinearStatic(n) = &step.procedure {
+            if let Some(load) = n.load_paths.keys().next() {
+                refused.insert(format!("step `{}`: load `{load}`'s own load path (a load curve per load; not written yet)", step.name));
+            }
             if !n.nonlinear_geometry {
                 refused.insert(format!(
                     "step `{}`: a nonlinear step without nonlinear geometry (LS-DYNA's nonlinear implicit analysis always follows the deformed shape)",

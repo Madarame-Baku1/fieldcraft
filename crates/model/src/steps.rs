@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::fluid_zones::curve_value;
 use crate::{Error, Friction, Model, Result, check_name, context, finite, positive, require};
 
 /// Most steps in a model.
@@ -506,6 +507,13 @@ pub struct NonlinearStatic {
     /// them (cyclic loading). Increments end at every point of the path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub load_path: Option<Vec<[f64; 2]>>,
+    /// Load paths of single loads, by load name: each named load of the step is its own
+    /// factor times its value, piecewise linear through its `[fraction, factor]` points like
+    /// `load_path`, while the other loads and the prescribed displacements ramp from 0 to 1. A
+    /// load held while another one grows (a preload, then a service load) is one step: the
+    /// held load's path rises to 1 and stays, the other's waits at 0 and then rises.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub load_paths: BTreeMap<String, Vec<[f64; 2]>>,
     /// A geometric imperfection: the mode shape of a buckling step, scaled, added to the node
     /// coordinates before this step is solved (the step and its results are on that geometry).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -570,6 +578,9 @@ pub struct Imperfection {
 /// Most points of a nonlinear step's load path.
 pub const MAX_LOAD_PATH_POINTS: usize = 1000;
 
+/// Most loads with their own load path in one nonlinear step.
+pub const MAX_LOAD_PATHS: usize = 100;
+
 /// Load fractions this close to each other (relatively, or absolutely near 0) are the same.
 const SAME_FRACTION: f64 = 1e-12; // unit-factors: a load fraction
 
@@ -607,6 +618,7 @@ impl Default for NonlinearStatic {
             tolerances: Tolerances::default(),
             line_search: false,
             load_path: None,
+            load_paths: BTreeMap::new(),
             imperfection: None,
             arc_length: None,
         }
@@ -630,7 +642,7 @@ impl NonlinearStatic {
                     return Err(Error::Invalid(format!("a displacement limit is a nonzero number, got {}", l.displacement)));
                 }
             }
-            if self.load_path.is_some() {
+            if self.load_path.is_some() || !self.load_paths.is_empty() {
                 return Err(Error::Invalid("an arc-length step finds its own load factor; it takes no load path".into()));
             }
         }
@@ -662,40 +674,56 @@ impl NonlinearStatic {
             }
         }
         if let Some(path) = &self.load_path {
-            if !(2..=MAX_LOAD_PATH_POINTS).contains(&path.len()) {
-                return Err(Error::Invalid(format!("a load path has 2 to {MAX_LOAD_PATH_POINTS} points, got {}", path.len())));
-            }
-            if path.first() != Some(&[0.0, 0.0]) || path.last().map(|p| p[0]) != Some(1.0) {
-                return Err(Error::Invalid("a load path starts at [0, 0] (the unloaded start of the step) and ends at fraction 1".into()));
-            }
-            if path.iter().flatten().any(|v| !v.is_finite()) {
-                return Err(Error::Invalid("the points of a load path must be finite".into()));
-            }
-            if path.windows(2).any(|w| w.get(1).map(|b| b[0]) <= w.first().map(|a| a[0])) {
-                return Err(Error::Invalid("the fractions of a load path must increase".into()));
-            }
+            validate_load_path(path)?;
+        }
+        if self.load_paths.len() > MAX_LOAD_PATHS {
+            return Err(Error::Limit(format!("a step gives at most {MAX_LOAD_PATHS} loads their own load path, got {}", self.load_paths.len())));
+        }
+        if self.load_path.is_some() && !self.load_paths.is_empty() {
+            return Err(Error::Invalid(
+                "a step takes either one load path for everything or load paths of single loads, not both (give every load its own path)".into(),
+            ));
+        }
+        for (name, path) in &self.load_paths {
+            validate_load_path(path).map_err(|e| context("the load path of load", name, e))?;
         }
         Ok(())
     }
 
     /// The load factor at step fraction `t` (in [0, 1]).
     pub fn load_factor(&self, t: f64) -> f64 {
-        let Some(path) = &self.load_path else { return t };
-        for w in path.windows(2) {
-            if let [[t0, f0], [t1, f1]] = *w
-                && t <= t1
-            {
-                return if t1 > t0 { f0 + (f1 - f0) * ((t - t0) / (t1 - t0)).clamp(0.0, 1.0) } else { f1 };
-            }
-        }
-        path.last().map_or(t, |p| p[1])
+        self.load_path.as_deref().map_or(t, |path| curve_value(path, t))
     }
 
-    /// The first point of the load path after fraction `t` (1 without a path), where an
+    /// The first point of the load paths after fraction `t` (1 without a path), where an
     /// increment from `t` must end.
     pub fn next_turn(&self, t: f64) -> f64 {
-        self.load_path.as_ref().and_then(|path| path.iter().map(|p| p[0]).find(|f| *f > t * (1.0 + SAME_FRACTION) + SAME_FRACTION)).unwrap_or(1.0)
+        self.load_path
+            .iter()
+            .chain(self.load_paths.values())
+            .flatten()
+            .map(|p| p[0])
+            .filter(|f| *f > t * (1.0 + SAME_FRACTION) + SAME_FRACTION)
+            .fold(1.0, f64::min)
     }
+}
+
+/// A load path: 2 to [`MAX_LOAD_PATH_POINTS`] finite points with increasing fractions, from
+/// `[0, 0]` to fraction 1.
+fn validate_load_path(path: &[[f64; 2]]) -> Result<()> {
+    if !(2..=MAX_LOAD_PATH_POINTS).contains(&path.len()) {
+        return Err(Error::Invalid(format!("a load path has 2 to {MAX_LOAD_PATH_POINTS} points, got {}", path.len())));
+    }
+    if path.first() != Some(&[0.0, 0.0]) || path.last().map(|p| p[0]) != Some(1.0) {
+        return Err(Error::Invalid("a load path starts at [0, 0] (the unloaded start of the step) and ends at fraction 1".into()));
+    }
+    if path.iter().flatten().any(|v| !v.is_finite()) {
+        return Err(Error::Invalid("the points of a load path must be finite".into()));
+    }
+    if path.windows(2).any(|w| w.get(1).map(|b| b[0]) <= w.first().map(|a| a[0])) {
+        return Err(Error::Invalid("the fractions of a load path must increase".into()));
+    }
+    Ok(())
 }
 
 /// Most time increments of a transient heat transfer step.
@@ -1335,6 +1363,11 @@ impl Model {
         for l in &step.loads {
             require(&self.loads, "load", l).map_err(|e| context("step", &step.name, e))?;
         }
+        if let Procedure::NonlinearStatic(n) = &step.procedure
+            && let Some(name) = n.load_paths.keys().find(|l| !step.loads.contains(*l))
+        {
+            return Err(context("step", &step.name, Error::Invalid(format!("load `{name}` has a load path but the step does not list it"))));
+        }
         Ok(())
     }
 
@@ -1380,7 +1413,12 @@ impl Model {
     /// Make a load active or inactive in a step.
     pub fn set_load_active(&mut self, step: &str, name: &str, active: bool) -> Result<()> {
         require(&self.loads, "load", name)?;
-        switch(&mut self.step_mut(step)?.loads, name, active);
+        let step = self.step_mut(step)?;
+        switch(&mut step.loads, name, active);
+        // A load the step no longer lists takes its own load path with it.
+        if !active && let Procedure::NonlinearStatic(n) = &mut step.procedure {
+            n.load_paths.remove(name);
+        }
         Ok(())
     }
 }
@@ -1537,7 +1575,56 @@ mod tests {
             vec![[0.0, 0.0]; MAX_LOAD_PATH_POINTS + 1],
         ] {
             assert!(Procedure::NonlinearStatic(NonlinearStatic { load_path: Some(path.clone()), ..base.clone() }).validate().is_err(), "{path:?}");
+            let single = NonlinearStatic { load_paths: BTreeMap::from([("q".to_string(), path.clone())]), ..base.clone() };
+            assert!(Procedure::NonlinearStatic(single).validate().is_err(), "{path:?}");
         }
+    }
+
+    /// Load paths of single loads: a held preload and a shear that waits for it; increments end
+    /// at every load's points.
+    #[test]
+    fn load_paths_of_single_loads() {
+        let held = vec![[0.0, 0.0], [0.4, 1.0], [1.0, 1.0]];
+        let later = vec![[0.0, 0.0], [0.4, 0.0], [0.7, 0.5], [1.0, 1.0]];
+        let n = NonlinearStatic {
+            load_paths: BTreeMap::from([("p".to_string(), held.clone()), ("q".to_string(), later.clone())]),
+            ..NonlinearStatic::default()
+        };
+        assert!(Procedure::NonlinearStatic(n.clone()).validate().is_ok());
+        for (t, p, q) in [(0.0, 0.0, 0.0), (0.2, 0.5, 0.0), (0.4, 1.0, 0.0), (0.85, 1.0, 0.75), (1.0, 1.0, 1.0)] {
+            let got = (curve_value(&held, t), curve_value(&later, t));
+            assert!((got.0 - p).abs() < 1e-15 && (got.1 - q).abs() < 1e-15, "{t}: {got:?}");
+        }
+        assert_eq!((n.next_turn(0.0), n.next_turn(0.4), n.next_turn(0.5), n.next_turn(0.7)), (0.4, 0.7, 0.7, 1.0));
+        // Not with one path for the whole step, nor with arc-length control, nor too many.
+        let both = NonlinearStatic { load_path: Some(held.clone()), ..n.clone() };
+        let arc = NonlinearStatic { arc_length: Some(ArcLength::default()), ..n.clone() };
+        let many = NonlinearStatic { load_paths: (0..=MAX_LOAD_PATHS).map(|i| (format!("l{i}"), held.clone())).collect(), ..n.clone() };
+        for bad in [both, arc, many] {
+            assert!(Procedure::NonlinearStatic(bad).validate().is_err());
+        }
+        // The JSON form, and its absence when no load has a path.
+        let json = serde_json::to_value(Procedure::NonlinearStatic(n.clone())).unwrap();
+        assert_eq!(json["load_paths"]["q"][2], serde_json::json!([0.7, 0.5]));
+        let plain = serde_json::to_value(Procedure::NonlinearStatic(NonlinearStatic::default())).unwrap();
+        assert!(plain.get("load_paths").is_none());
+    }
+
+    /// A load path names a load of its step; switching the load off drops its path.
+    #[test]
+    fn load_paths_name_loads_of_their_step() {
+        let mut m = Model::default();
+        m.add_set("s", Set { nodes: vec![1], ..Set::default() }).unwrap();
+        m.add_load("q", crate::Load::Pressure { set: "s".into(), magnitude: 1.0 }).unwrap();
+        let path = vec![[0.0, 0.0], [1.0, 1.0]];
+        let n = NonlinearStatic { load_paths: BTreeMap::from([("q".to_string(), path)]), ..NonlinearStatic::default() };
+        assert!(m.add_step(Step::new("Bad", Procedure::NonlinearStatic(n.clone())), None).is_err());
+        let mut step = Step::new("Go", Procedure::NonlinearStatic(n));
+        step.loads.insert("q".into());
+        m.add_step(step, None).unwrap();
+        m.set_load_active("Go", "q", false).unwrap();
+        let Some(Procedure::NonlinearStatic(n)) = m.step("Go").map(|s| &s.procedure) else { panic!("step") };
+        assert!(n.load_paths.is_empty());
     }
 
     #[test]

@@ -826,6 +826,9 @@ fn nonlinear_plastic_steps_and_what_is_refused() {
     let path = NonlinearStatic { load_path: Some(vec![[0.0, 0.0], [0.5, 1.0], [1.0, 0.0]]), ..NonlinearStatic::default() };
     m.replace_step(step("Bend", Procedure::NonlinearStatic(path), &["clamp"], &["end"])).unwrap();
     assert!(unsupported(&m).contains("step `Bend`: a load path"));
+    let own = NonlinearStatic { load_paths: [("end".to_string(), vec![[0.0, 0.0], [1.0, 1.0]])].into(), ..NonlinearStatic::default() };
+    m.replace_step(step("Bend", Procedure::NonlinearStatic(own), &["clamp"], &["end"])).unwrap();
+    assert!(unsupported(&m).contains("step `Bend`: load `end`'s own load path"));
     m.replace_step(step("Bend", Procedure::NonlinearStatic(NonlinearStatic::default()), &["clamp"], &["end"])).unwrap();
     m.add_step(step("Again", Procedure::NonlinearStatic(NonlinearStatic::default()), &["clamp"], &["end"]), None).unwrap();
     assert!(unsupported(&m).contains("plastic material `Steel` in a deck of 2 general steps"));

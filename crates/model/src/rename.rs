@@ -207,6 +207,12 @@ impl Model {
                     if active.remove(from) {
                         active.insert(to.to_string());
                     }
+                    if kind == Kind::Load
+                        && let Procedure::NonlinearStatic(n) = &mut step.procedure
+                        && let Some(path) = n.load_paths.remove(from)
+                    {
+                        n.load_paths.insert(to.to_string(), path);
+                    }
                 }
             }
             Kind::Step => {
@@ -330,6 +336,16 @@ mod tests {
         m.rename(Kind::Step, "go", "Load").unwrap();
         let step = m.steps().iter().find(|s| s.name == "Load").unwrap();
         assert!(step.boundary_conditions.contains("clamp") && step.loads.contains("push") && step.loads.contains("p"));
+        // A load's own load path follows its name.
+        let mut ramp = step.clone();
+        ramp.name = "Ramp".into();
+        let path = vec![[0.0, 0.0], [1.0, 1.0]];
+        let n = crate::NonlinearStatic { load_paths: BTreeMap::from([("push".to_string(), path.clone())]), ..Default::default() };
+        ramp.procedure = Procedure::NonlinearStatic(n);
+        m.add_step(ramp, None).unwrap();
+        m.rename(Kind::Load, "push", "shove").unwrap();
+        let Some(Procedure::NonlinearStatic(n)) = m.step("Ramp").map(|s| &s.procedure) else { panic!("step") };
+        assert_eq!(n.load_paths, BTreeMap::from([("shove".to_string(), path)]));
 
         m.rename(Kind::Datum, "d", "Mid").unwrap();
         assert_eq!(m.datum_users("Mid"), ["partition `half`"]);
