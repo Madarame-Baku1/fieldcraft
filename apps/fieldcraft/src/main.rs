@@ -57,8 +57,8 @@ const WORK_AREA_RESERVE: f32 = 80.0;
 /// in its work area (#601): as large as the monitor leaves after the reserve (never below the
 /// minimum), centred across the monitor and at its top, so the system's cascade cannot push its
 /// bottom under the taskbar. `None` when the default fits or the monitor's size is unknown. The
-/// position is the monitor's own (winit gives no monitor origin): the primary monitor's, where a
-/// first window opens.
+/// position is from the monitor's own top-left (winit gives no monitor origin), which is right
+/// because the first window opens centred on the primary monitor (`NativeOptions::centered`).
 fn fitted_window(monitor: egui::Vec2) -> Option<egui::Rect> {
     if !(monitor.is_finite() && monitor.min_elem() > 0.0) {
         return None;
@@ -299,6 +299,11 @@ fn main() -> eframe::Result {
             .with_fullsize_content_view(true)
             .with_titlebar_shown(false)
             .with_title_shown(false),
+        // The first window opens centred on the primary monitor, placed before it exists: the
+        // system's own placement can put it past the work area (Windows cascades each new window,
+        // and at 125 % a few cascades put the bottom of a 1400 × 900 window under the taskbar,
+        // #632), and the fit above needs to know which monitor the window is on.
+        centered: true,
         depth_buffer: DEPTH_BITS,
         multisampling: MSAA,
         ..Default::default()
