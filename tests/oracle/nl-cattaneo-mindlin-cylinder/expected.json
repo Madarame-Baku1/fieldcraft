@@ -1,0 +1,115 @@
+{
+ "title": "Cattaneo–Mindlin partial slip: a cylinder pressed on a flat, then sheared (implicit mortar contact with friction, plane strain)",
+ "kind": "theory",
+ "source": "C. Cattaneo, Sul contatto di due corpi elastici: distribuzione locale degli sforzi, Rend. Accad. Naz. Lincei 27:342–348, 434–436, 474–478, 1938; R. D. Mindlin, Compliance of elastic bodies in contact, J. Appl. Mech. 16:259–268, 1949; K. L. Johnson, Contact Mechanics, Cambridge University Press 1985, §7.2 (two-dimensional contact of cylinders under a tangential force below μP): stick zone |x| < c = a √(1 − Q/(μP)), q(x) = μp₀ √(1 − x²/a²) − μp₀ (c/a) √(1 − x²/c²) inside it and μp(x) in the slip zones c ≤ |x| ≤ a",
+ "slow": true,
+ "quantities": [
+  {
+   "id": "slip_fraction_50",
+   "quantity": "the share of the closed secondary nodes that slip, 1 − c/a (Q = 0.5 μP)",
+   "measure": {
+    "from": "shear50",
+    "pointer": "/contacts/0/slipping_nodes",
+    "over": {
+     "from": "shear50",
+     "pointer": "/contacts/0/closed_nodes"
+    }
+   },
+   "value": 0.2928932188134524,
+   "tolerance": {
+    "absolute": 0.03
+   },
+   "reason": "the stick zone |x| < c = a √(1 − Q/(μP)) = 0.7071 a (Johnson 1985, §7.2); the contact closes over 39 nodes h = a/20 apart, so one node more or less at an edge of the stick zone moves the share by 0.026"
+  },
+  {
+   "id": "centre_traction_50",
+   "quantity": "the shear over the pressure at the centre of contact, q(0)/p(0) (Q = 0.5 μP)",
+   "measure": {
+    "command": "solve.probe",
+    "params": {
+     "step": "Shear50",
+     "nodes": [
+      31
+     ]
+    },
+    "pointer": "/nodes/0/contact/0/shear/0",
+    "scale": -1.0,
+    "over": {
+     "command": "solve.probe",
+     "params": {
+      "step": "Shear50",
+      "nodes": [
+       31
+      ]
+     },
+     "pointer": "/nodes/0/contact/0/pressure"
+    }
+   },
+   "value": 0.08786796564403572,
+   "tolerance": {
+    "relative": 0.05
+   },
+   "reason": "q = μp₀ (√(1 − x²/a²) − (c/a) √(1 − x²/c²)) in the stick zone, so q(0)/p(0) = μ(1 − c/a) at the secondary node at x = 0 (node 31); the bodies are a few half-widths deep, not half-planes, which shifts the stick zone towards the leading edge and puts the centre 3% above the closed form on every mesh (README)"
+  },
+  {
+   "id": "slip_fraction_75",
+   "quantity": "the share of the closed secondary nodes that slip, 1 − c/a (Q = 0.75 μP)",
+   "measure": {
+    "from": "shear75",
+    "pointer": "/contacts/0/slipping_nodes",
+    "over": {
+     "from": "shear75",
+     "pointer": "/contacts/0/closed_nodes"
+    }
+   },
+   "value": 0.5,
+   "tolerance": {
+    "absolute": 0.03
+   },
+   "reason": "the stick zone |x| < c = a √(1 − Q/(μP)) = 0.5000 a (Johnson 1985, §7.2); the contact closes over 39 nodes h = a/20 apart, so one node more or less at an edge of the stick zone moves the share by 0.026"
+  },
+  {
+   "id": "centre_traction_75",
+   "quantity": "the shear over the pressure at the centre of contact, q(0)/p(0) (Q = 0.75 μP)",
+   "measure": {
+    "command": "solve.probe",
+    "params": {
+     "step": "Shear75",
+     "nodes": [
+      31
+     ]
+    },
+    "pointer": "/nodes/0/contact/0/shear/0",
+    "scale": -1.0,
+    "over": {
+     "command": "solve.probe",
+     "params": {
+      "step": "Shear75",
+      "nodes": [
+       31
+      ]
+     },
+     "pointer": "/nodes/0/contact/0/pressure"
+    }
+   },
+   "value": 0.15,
+   "tolerance": {
+    "relative": 0.05
+   },
+   "reason": "q = μp₀ (√(1 − x²/a²) − (c/a) √(1 − x²/c²)) in the stick zone, so q(0)/p(0) = μ(1 − c/a) at the secondary node at x = 0 (node 31); the bodies are a few half-widths deep, not half-planes, which shifts the stick zone towards the leading edge and puts the centre 3% above the closed form on every mesh (README)"
+  },
+  {
+   "id": "peak_pressure_75",
+   "quantity": "the largest contact pressure p₀ under the shear (Q = 0.75 μP)",
+   "measure": {
+    "from": "shear75",
+    "pointer": "/contacts/0/max_pressure/value"
+   },
+   "value": 2884.6153846153848,
+   "tolerance": {
+    "relative": 0.02
+   },
+   "reason": "two bodies of one material: the shear does not change the pressure, which stays Hertz's p₀ = 2P/(πa) (Johnson 1985, §7.2); as in nl-hertz-cylinder-plane-strain"
+  }
+ ]
+}
